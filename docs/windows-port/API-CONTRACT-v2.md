@@ -159,9 +159,9 @@ App state, picker results, and project-detection candidates may add:
   },
   "platformInfo": {
     "shortcutModifier": "Ctrl",
-    "dataDir": "C:\\Users\\alice\\AppData\\Local\\LocalOps",
-    "logsDir": "C:\\Users\\alice\\AppData\\Local\\LocalOps\\logs",
-    "consoleLogPath": "C:\\Users\\alice\\AppData\\Local\\LocalOps\\logs\\console.log",
+    "dataDir": "C:\\Users\\example\\AppData\\Local\\LocalOps",
+    "logsDir": "C:\\Users\\example\\AppData\\Local\\LocalOps\\logs",
+    "consoleLogPath": "C:\\Users\\example\\AppData\\Local\\LocalOps\\logs\\console.log",
     "launchInstruction": "Run the Windows source launcher.",
     "lifecycleNotice": "Process control is unavailable in this phase."
   },
@@ -225,7 +225,7 @@ subject to the existing Host, content-type, and bounded-body checks.
 {
   "sourcePath": "D:\\Transfer\\config.json",
   "pathMappings": [
-    {"sourceRoot": "/Users/alice/Projects", "targetRoot": "D:\\Projects"}
+    {"sourceRoot": "/Volumes/Workspace/Projects", "targetRoot": "D:\\Projects"}
   ]
 }
 ```

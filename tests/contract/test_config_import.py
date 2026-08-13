@@ -89,7 +89,7 @@ class ConfigImportContractTests(unittest.TestCase):
         self.source = self.root / "macos-config.json"
         self.records = self.root / "imports"
         self.mappings = [{
-            "sourceRoot": "/Users/alice/Projects",
+            "sourceRoot": "/Volumes/Workspace/Projects",
             "targetRoot": r"D:\Projects",
         }]
         self.source_data = {
@@ -99,7 +99,7 @@ class ConfigImportContractTests(unittest.TestCase):
                     "id": "deadbeef",
                     "name": "Legacy",
                     "kind": "service",
-                    "cwd": "/Users/alice/Projects/legacy app",
+                    "cwd": "/Volumes/Workspace/Projects/legacy app",
                     "port": 3000,
                     "command": "python3 app.py",
                     "commandSpec": {
@@ -122,7 +122,7 @@ class ConfigImportContractTests(unittest.TestCase):
                     "id": "cafebabe",
                     "name": "Ready",
                     "kind": "service",
-                    "cwd": "/Users/alice/Projects/ready",
+                    "cwd": "/Volumes/Workspace/Projects/ready",
                     "command": "python.exe -m http.server 8000",
                     "commandSpec": _direct_spec(),
                 },
@@ -136,7 +136,7 @@ class ConfigImportContractTests(unittest.TestCase):
                 {
                     "id": "feedface",
                     "name": "Conflict",
-                    "cwd": "/Users/alice/Projects/conflict",
+                    "cwd": "/Volumes/Workspace/Projects/conflict",
                     "command": "python.exe -m http.server 8000",
                     "commandSpec": _direct_spec(),
                 },
@@ -683,7 +683,7 @@ class ConfigImportContractTests(unittest.TestCase):
             with self.subTest(target_root=target_root), \
                     self.assertRaises(ConfigImportError) as raised:
                 self._preview(mappings=[{
-                    "sourceRoot": "/Users/alice/Projects",
+                    "sourceRoot": "/Volumes/Workspace/Projects",
                     "targetRoot": target_root,
                 }])
             self.assertEqual(raised.exception.code, "INVALID_PATH")

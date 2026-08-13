@@ -116,7 +116,7 @@ class WindowsServerTests(unittest.TestCase):
         self.assertEqual(updated["importStatus"], "blocked")
 
     def test_config_import_http_preview_commit_and_rollback(self):
-        source_root = "/Users/alice/Projects"
+        source_root = "/Volumes/Workspace/Projects"
         target_root = self.harness.temp_dir.name
         mapped_cwd = os.path.join(target_root, "demo")
         os.mkdir(mapped_cwd)

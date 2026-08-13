@@ -34,7 +34,7 @@
 
 ### Changed
 
-- Windows 浏览器界面现在完全按后端 platform/capabilities 呈现操作，并移除客户端 POSIX quote、`/Users/...` 路径推断和外部进程控制入口；生命周期仍保持禁用。
+- Windows 浏览器界面现在完全按后端 platform/capabilities 呈现操作，并移除客户端 POSIX quote、macOS home-path 推断和外部进程控制入口；生命周期仍保持禁用。
 - 默认将配置/图标移至 `~/Library/Application Support/总控台`，日志移至 `~/Library/Logs/总控台`。新目标不存在时仅首次复制旧 `data/`，不删除原文件。
 - `config.json.bak` 现保留修改前的上一份良好配置，而不是与主配置相同的副本。
 - 运行目录权限收紧为 `0700`，配置、图标和日志文件为 `0600`。

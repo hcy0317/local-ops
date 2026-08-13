@@ -6,7 +6,7 @@
   "currentPhase": "P1",
   "phaseStatus": "IMPLEMENTED_UNVERIFIED",
   "lastGreenPhase": "P0",
-  "macosTests": "FAIL",
+  "macosTests": "PASS",
   "windowsTests": "FAIL",
   "windowsBetaReady": false,
   "changedFiles": [
@@ -61,8 +61,9 @@
     ,
     "Phase 1 contract and baseline-golden tests passed 11 of 11 on native Windows.",
     "The current full Python discovery ran 170 tests and failed with 22 failures and 11 errors because the Windows adapter is intentionally unsupported before Phase 2, POSIX-only tests ran on Windows, and two tracked assets remain unavailable.",
-    "macOS CI run 31659011083 ran 170 tests and failed with one assertion and one error: missing-PID semantics changed and the launch-environment test patched the old module owner. Both regressions are fixed locally pending rerun."
+    "macOS CI run 31659011083 ran 170 tests and failed with one assertion and one error; both regressions were fixed in commit 7889fb67d578107559c2ac8f07eda29271d2357e.",
+    "macOS CI run 31659377461 passed make check, then the release scan rejected a literal macOS home-path example in the port specification; the example is fixed locally pending rerun."
   ],
-  "nextAction": "Commit and push the focused macOS regression fixes, verify the automatically triggered exact-commit CI run, and only after it is green change P1 to PASS.",
-  "lastVerifiedAt": "2026-08-13T09:57:16+08:00"
+  "nextAction": "Commit and push the release-safe specification wording, verify the automatically triggered exact-commit CI run, and only after the full workflow is green change P1 to PASS.",
+  "lastVerifiedAt": "2026-08-13T10:01:17+08:00"
 }

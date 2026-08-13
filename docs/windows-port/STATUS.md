@@ -2,9 +2,9 @@
 
 ## Current result
 
-**P1 IMPLEMENTED_UNVERIFIED — the first macOS CI run found two regressions; focused fixes are green locally and awaiting an exact-commit rerun.**
+**P1 IMPLEMENTED_UNVERIFIED — macOS `make check` is green; one release-safe documentation fix is awaiting an exact-commit rerun.**
 
-Phase 1 extracted the platform boundary and passed its focused contract, golden, lint, and platform-leak checks. GitHub Actions is now active. macOS CI run `31659011083` ran the full 170-test suite and found one assertion failure plus one error: a missing PID surfaced the raw `ps` error, and a launch-environment test still patched the pre-extraction module owner. Both are fixed with focused adapter/test changes. Per the phase protocol, Phase 2–4 have not started.
+Phase 1 extracted the platform boundary and passed its focused contract, golden, lint, and platform-leak checks. macOS CI run `31659377461` passed the full `make check` gate, including all 170 Python tests. The workflow then stopped in release validation because the specification contained a literal macOS home-path example; the wording is now release-safe without weakening the scanner. Per the phase protocol, Phase 2–4 have not started.
 
 ## Phase 1 completed implementation
 

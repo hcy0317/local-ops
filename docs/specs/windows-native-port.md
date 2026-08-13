@@ -975,7 +975,7 @@ windows-checks
 - 使用 `os.kill(pid, 0)` 作为 Windows 存活探测；
 - 将 Windows SIGTERM 描述为优雅停止；
 - 复用 `shlex.quote` 构造 cmd/PowerShell 命令；
-- 自动把 `python3`、`bash` 或 `/Users/...` 字符串替换为 Windows 形式；
+- 自动把 `python3`、`bash` 或 macOS 用户目录字符串替换为 Windows 形式；
 - 用空扫描结果吞掉权限错误；
 - 用 chmod 结果声称 NTFS 隐私已经满足；
 - 要求管理员权限解决普通监控问题；

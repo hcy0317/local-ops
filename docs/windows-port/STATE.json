@@ -2,11 +2,14 @@
   "schemaVersion": 1,
   "task": "local-ops-windows-port",
   "baselineCommit": "a5c3adae1f1fa0bd9f0ac7b090ec422e285d0c0f",
-  "implementationCommit": "6ce2736e493dec795eae8df200487c1e4c54fef2",
-  "ciRun": "31684726400",
+  "implementationCommit": "c5a31a860cb0d82a4abfc63aaf7e30eedb55556d",
+  "ciRun": "31686699247",
   "branch": "windows-port/phases-1-4",
   "currentPhase": "P2",
   "phaseStatus": "IMPLEMENTED_UNVERIFIED",
+  "scopedTarget": "Windows 11 Phase 2",
+  "scopedTargetStatus": "PASS",
+  "windows10Status": "DEFERRED",
   "lastGreenPhase": "P1",
   "macosTests": "PASS",
   "windowsTests": "PASS",
@@ -38,12 +41,15 @@
     "localops/platform/windows.py",
     "requirements-windows.txt",
     "server.py",
+    "static/app.js",
+    "static/js/widgets.js",
     "tests/contract/__init__.py",
     "tests/contract/test_baseline_golden.py",
     "tests/contract/test_platform_contract.py",
     "tests/windows/__init__.py",
     "tests/windows/test_windows_platform.py",
     "tests/windows/test_windows_server.py",
+    "tests/test_frontend.py",
     "tests/test_server.py",
     "tools/build_release.py",
     "tools/check_platform_leaks.py",
@@ -65,24 +71,27 @@
     "P2-D002",
     "P2-D003",
     "P2-D004",
-    "P2-D005"
+    "P2-D005",
+    "P2-D006"
   ],
   "assumptions": [
-    "The current local environment can provide native Windows 11 non-admin evidence but cannot provide macOS or Windows 10 evidence."
+    "The current local environment provides native Windows 11 non-admin evidence; macOS evidence comes from CI and Windows 10 is deferred."
   ],
-  "knownBlockers": [
-    "No Windows 10 host or VM is available for the Phase 2 cross-version gate."
+  "knownBlockers": [],
+  "deferredGates": [
+    "Windows 10 non-admin validation remains required to close the original cross-version Phase 2 gate."
   ],
   "knownFailures": [
     "The native Windows project checker passed 9 checks and failed only the existing Bash and missing AppIcon.icns host checks.",
-    "The frontend contract passed 13 of 14; the existing partial checkout lacks the original console-app-icon.png blob."
+    "The frontend contract passed 15 of 16; the existing partial checkout lacks the original console-app-icon.png blob."
   ],
   "verifiedResults": [
-    "The Phase 2 Windows suite passed 15 of 15 tests and the shared contract suite passed 12 of 12.",
-    "The real Windows 11 non-admin source-process smoke passed and rejected a second writer.",
+    "The Phase 2 Windows suite passed 16 of 16 tests and the shared contract suite passed 12 of 12.",
+    "The exact-candidate Windows 11 non-admin source/browser flow passed monitoring, connection/degraded semantics, a configuration write/read/remove round-trip, disabled UI controls, and HTTP 409 control rejection while the server remained live.",
+    "The real Windows 11 non-admin source-process smoke rejected a second writer and preserved a protected configuration DACL.",
     "Ruff, compileall, the shared-core platform leak audit, git diff checks, Node port tests, and release/module checks passed.",
-    "CI run 31684726400 passed the Windows Python 3.12 adapter job and the macOS complete check/release/reproducibility job for implementation commit 6ce2736."
+    "CI run 31686699247 passed the Windows Python 3.12 adapter job and the macOS complete check/release job for implementation commit c5a31a8."
   ],
-  "nextAction": "Stop at IMPLEMENTED_UNVERIFIED until a real Windows 10 non-admin run closes the Phase 2 gate; do not start Phase 3.",
-  "lastVerifiedAt": "2026-08-13T17:03:52+08:00"
+  "nextAction": "Stop after the Windows 11 Phase 2 PASS. Keep Windows 10 deferred and Phase 3 untouched until separate user authorization.",
+  "lastVerifiedAt": "2026-08-13T17:29:05+08:00"
 }

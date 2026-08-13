@@ -203,10 +203,10 @@ python -m unittest discover -s tests -p 'test_*.py' -v
 python -m unittest discover -s tests/windows -p 'test_*.py' -v
 ```
 
-- Passed: 15
+- Passed: 16
 - Failed/errors/skipped: 0
-- Latest combined Windows-suite duration: 7.872 seconds
-- Covered: Local AppData, current SID, protected DACL, drive/UNC/equivalent/junction paths, Chinese and spaces, Named Mutex exclusion/recovery, current-process owner, IPv4/IPv6 listeners, listener failure, AccessDenied/NoSuchProcess races, mocked native picker, Windows exclusive socket, state capabilities, ACL read-only protection, and destructive API rejection without process/config side effects.
+- Latest combined Windows-suite duration: 10.888 seconds
+- Covered: Local AppData, current SID, protected DACL, drive/UNC/equivalent/junction paths, Chinese and spaces, Named Mutex exclusion/recovery, current-process owner, IPv4/IPv6 listeners, listener failure, AccessDenied/NoSuchProcess races, mocked native picker, Windows exclusive socket, state capabilities, ACL read-only protection, console-stop rejection, destructive API rejection without process/config side effects, and keep-alive body consumption after a disabled attach request.
 
 ### Shared contracts — PASS
 
@@ -227,12 +227,22 @@ python -m unittest discover -s tests/contract -p 'test_*.py' -v
 - A second process using the same data directory exited without becoming a writer; the first process remained live.
 - All lifecycle/control capability flags were false. The test terminated only the server process it created and removed the temporary directory.
 
+### Exact-candidate Windows 11 browser flow — PASS
+
+- Candidate: `c5a31a860cb0d82a4abfc63aaf7e30eedb55556d`.
+- A source process using an isolated Local AppData directory served `http://127.0.0.1:9609/` on Windows 11 non-admin. A real Chromium browser loaded the service-monitor view and rendered 22 current-user listener rows at the final capture.
+- Protected-process limitations remained an explicit degraded health notice while the independent connection indicator stayed green and read `已连接`.
+- Console restart and stop controls rendered disabled with `不可用` because `restart_console=false`.
+- A same-origin browser write added a unique watch keyword, `/api/state` returned it, and the browser removed it. The final configuration hash matched the pre-test hash.
+- External kill, managed start/stop/restart, external attach, console restart, and console stop all returned HTTP 409. The console process remained live and responsive after the probes.
+- The isolated configuration file retained a protected DACL containing only the current user, SYSTEM, and Administrators.
+
 ### Supporting checks
 
 - Node port helpers: 7/7 PASS.
 - Shared HTTP Host/Origin/session/Content-Type/CORS security tests: 6/6 PASS.
 - Release manifest and JavaScript binding tests: 6/6 PASS.
-- Frontend contract: 13/14; the only failure is the pre-existing unmaterialized `static/assets/console-app-icon.png` blob.
+- Frontend contract: 15/16; the only failure is the pre-existing unmaterialized `static/assets/console-app-icon.png` blob.
 - `ruff check`: PASS.
 - `python -m compileall`: PASS.
 - `python tools/check_platform_leaks.py`: PASS.
@@ -243,10 +253,11 @@ python -m unittest discover -s tests/contract -p 'test_*.py' -v
 
 | Check | Status | Reason |
 | --- | --- | --- |
-| Windows 10 x64 non-admin | NOT_RUN | No Windows 10 host/VM is available |
-| Windows Python 3.12 branch CI | PASS | Run `31684726400`, job `94398012579`, implementation commit `6ce2736` |
-| Current Phase 2 macOS regression/release CI | PASS | Run `31684726400`, job `94398012573`; `make check`, release verification, and reproducibility passed |
-| Windows lifecycle | SKIPPED | Intentionally disabled until Phase 4 |
+| Windows 11 x64 non-admin | PASS | Real source process, browser UI, config round-trip, DACL, monitoring, and fail-closed controls passed on exact candidate `c5a31a8` |
+| Windows 10 x64 non-admin | DEFERRED | Explicitly deferred until after the Windows 11 target is complete |
+| Windows Python 3.12 branch CI | PASS | Run `31686699247`, job `94404329291`, implementation commit `c5a31a8` |
+| Current Phase 2 macOS regression/release CI | PASS | Run `31686699247`, job `94404329372`; project checks, release build, and verification passed |
+| Windows Phase 2 control gate | PASS | Lifecycle remains disabled until Phase 4; adapter, HTTP, browser controls, and no-side-effect tests agree |
 | Windows package/clean VM | SKIPPED | Packaging belongs to Phase 5 |
 
-Phase 2 status is `IMPLEMENTED_UNVERIFIED`, not `PASS`; Phase 3 must remain untouched.
+The current Windows 11 Phase 2 target is `PASS`. The original cross-version Phase 2 gate is still `IMPLEMENTED_UNVERIFIED` because Windows 10 is deferred, not tested. Phase 3 remains untouched.

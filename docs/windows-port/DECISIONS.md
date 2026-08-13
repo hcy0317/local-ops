@@ -102,7 +102,7 @@
 
 - Status: Accepted
 - Phase: P2
-- Decision: Report observation and picker capabilities, but keep launch, managed stop, force stop, external kill, external attach, and console restart false. Reject their HTTP routes before scanning, persisting configuration, or invoking a control adapter.
+- Decision: Report observation and picker capabilities, but keep launch, managed stop, force stop, external kill, external attach, console restart, and console stop unavailable. Reject their HTTP routes before scanning, persisting configuration, invoking a control adapter, or shutting down the console; browser controls must follow the same capability state.
 - Reason: Phase 2 has no Windows runner, Job Object, generation token, or verified runtime identity. Adapter-only failure is too late for attach/create and running-card mutations that can write state first.
 - Consequence: Windows is useful for read-only monitoring without creating a hidden path into unfinished process control.
 
@@ -129,3 +129,11 @@
 - Decision: Query listener process details normally, but build Windows PPID ancestry only for observed current-user listeners and do not fetch every ancestor command line in Phase 2.
 - Reason: Full-machine `cmdline` enumeration took about five seconds on the real non-admin host and caused the first `/api/state` request to time out. SID-first filtering plus targeted PPID ancestry reduced repeated real state builds to under two seconds while preserving the required current-user service rows.
 - Consequence: Windows Phase 2 origin badges are best-effort and may be absent; macOS attribution behavior is unchanged.
+
+## P2-D006 — Keep connection truth separate from health notices
+
+- Status: Accepted
+- Phase: P2
+- Decision: Track loopback connection state independently from the shared status banner. Degraded scans, read-only protection, backup recovery, and schema notices may show the banner without changing the connection indicator.
+- Reason: A protected-process partial snapshot is a successful but degraded response. Treating any visible notice as a disconnect hides the distinction users need to decide whether data is stale or merely incomplete.
+- Consequence: Windows can truthfully display both `已连接` and a degraded notice; actual poll failures and console transitions still switch the connection indicator to disconnected.

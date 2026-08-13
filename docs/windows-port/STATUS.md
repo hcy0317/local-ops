@@ -2,11 +2,11 @@
 
 ## Current result
 
-**P2 IMPLEMENTED_UNVERIFIED — Windows 11 non-admin storage, single-instance, read-only monitoring, fail-closed HTTP capability tests, Windows Python 3.12 CI, and the complete macOS regression/release gate pass; Windows 10 is not verified.**
+**P2 WIN11 PASS / WIN10 DEFERRED — the exact candidate passed Windows 11 non-admin storage, single-instance, real-browser read-only monitoring, safe configuration writes, fail-closed UI/HTTP controls, Windows Python 3.12 CI, and the complete macOS regression/release gate.**
 
-Phase 2 adds the Windows adapter, pinned runtime dependencies, Local AppData/SID/DACL enforcement, a per-user/data-directory Named Mutex, `psutil` snapshots, a native picker, Windows exclusive socket binding, capability metadata, and route-level control rejection. The real source-process checks showed state builds under two seconds, visible current-user listeners, explicit degradation for protected processes, and rejection of a second writer. Phase 3–4 have not started.
+Phase 2 adds the Windows adapter, pinned runtime dependencies, Local AppData/SID/DACL enforcement, a per-user/data-directory Named Mutex, `psutil` snapshots, a native picker, Windows exclusive socket binding, capability metadata, and route-level control rejection. The final Windows 11 browser flow kept protected-process degradation separate from connection status, showed live listeners, completed a configuration add/read/remove round-trip, disabled console controls, and rejected all Phase 4 control routes without stopping the server. Phase 3–4 have not started.
 
-The remaining Phase 2 gate is environmental rather than an invitation to continue coding: run the candidate on Windows 10 non-admin. CI run `31684726400` passed both jobs for implementation commit `6ce2736e493dec795eae8df200487c1e4c54fef2`. Until the Windows 10 gate is green, `lastGreenPhase` remains P1 and Phase 3 must not begin.
+The user explicitly deferred Windows 10 until after Windows 11 works. This closes the current Windows 11 target but does not fabricate the original Win10/Win11 cross-version gate: machine state keeps the full-spec status open and `windowsBetaReady=false`. CI run `31686699247` passed both jobs for implementation commit `c5a31a860cb0d82a4abfc63aaf7e30eedb55556d`. Phase 3 must not begin without separate authorization.
 
 ## Phase 2 implemented scope
 
@@ -14,11 +14,12 @@ The remaining Phase 2 gate is environmental rather than an invitation to continu
 - Added exact Windows runtime pins: `psutil==7.2.2` and `pywin32==312`.
 - Added native owner matching in the shared core without changing macOS numeric UID behavior.
 - Added `platform` and `capabilities` to the state contract as an intentional additive Phase 2 API change.
-- Disabled Windows launch, managed stop, force stop, external kill, external attach, and console restart in both adapter capabilities and HTTP handlers.
+- Disabled Windows launch, managed stop, force stop, external kill, external attach, console restart, and console stop at capability, HTTP, and browser-control boundaries.
+- Separated connection state from degraded/configuration notices so a healthy HTTP connection is not mislabeled as disconnected.
 - Added Windows tests for roots/UNC/junctions, Chinese/spaces paths, DACL principals, mutex recovery, IPv4/IPv6, protected/racing processes, picker cancellation, exclusive address use, read-only ACL failure, and no-side-effect route rejection.
 - Added a direct Windows CI job using Python 3.12 without Make/Bash.
 
-Local evidence: 15/15 Windows tests, 12/12 shared contract tests, 6/6 HTTP security tests, 7/7 Node port tests, 6/6 release/module checks, Ruff, compileall, platform-leak audit, and diff checks pass. The frontend contract is 13/14 solely because the known partial checkout still lacks the original `console-app-icon.png`; the project checker remains 9/11 because native Windows lacks `/bin/bash` and the original `AppIcon.icns` is not materialized.
+Local evidence: 16/16 Windows tests, 12/12 shared contract tests, 6/6 HTTP security tests, 7/7 Node port tests, 6/6 release/module checks, Ruff, compileall, platform-leak audit, diff checks, and the exact-candidate Win11 browser flow pass. The frontend contract is 15/16 solely because the known partial checkout still lacks the original `console-app-icon.png`; the project checker remains 9/11 because native Windows lacks `/bin/bash` and the original `AppIcon.icns` is not materialized.
 
 ## Phase 1 result
 

@@ -2,9 +2,9 @@
 
 ## Current result
 
-**P1 IMPLEMENTED_UNVERIFIED — implementation is present and awaiting the required macOS CI regression result.**
+**P1 BLOCKED — implementation is present, but the fork has no registered GitHub Actions workflow to run the required macOS regression gate.**
 
-Phase 1 extracted the platform boundary and passed its focused contract, golden, lint, and platform-leak checks. It cannot be promoted to `PASS` because no local macOS runner is available and two original tracked macOS assets are still unmaterialized. The authorized branch push will trigger the existing `macos-15` workflow. Per the phase protocol, Phase 2–4 have not started.
+Phase 1 extracted the platform boundary and passed its focused contract, golden, lint, and platform-leak checks. Commit `3bd08e9c3b231c7fa2a282c4d6b2b382c2a4cf1a` was pushed to the phase branch, but the fork Actions API reports zero registered workflows and created no run. The workflow must be enabled in the fork before the `macos-15` gate can execute. Per the phase protocol, Phase 2–4 have not started.
 
 ## Phase 1 completed implementation
 

@@ -86,7 +86,7 @@ Covered contracts: port normalization, configured/actual port mapping, mismatch 
 | Environment / check | Status | Reason |
 | --- | --- | --- |
 | Current macOS authoritative suite (`make check`) | NOT_RUN | No macOS host is available in this phase environment |
-| Exact-commit GitHub Actions run | NOT_RUN | No workflow run exists in the fork for the baseline commit |
+| Exact-commit GitHub Actions run | NOT_RUN | Phase 1 commit was pushed, but the fork reports zero registered workflows and created no run |
 | Windows 10 x64 non-admin | NOT_RUN | Environment unavailable |
 | Windows 11 Python 3.12 | NOT_RUN | Local interpreter is Python 3.13.13 |
 | Clean Windows VM without Python | NOT_RUN | Environment unavailable; belongs to the packaging gate |
@@ -184,8 +184,9 @@ python -m unittest discover -s tests -p 'test_*.py' -v
 - Primary causes: the P1 Windows adapter intentionally rejects monitoring/lifecycle operations; macOS/POSIX tests assume Bash, POSIX modes, signals, process groups, and symlink privileges; two tracked asset blobs are unavailable.
 - Interpretation: this is valid Windows pre-P2 evidence, not a macOS regression result.
 
-### Required macOS Phase 1 suite — NOT_RUN / CI pending
+### Required macOS Phase 1 suite — NOT_RUN / gate blocker
 
-- No local macOS host is available; the authorized branch push will trigger the existing `macos-15` workflow.
+- No local macOS host is available.
+- Commit `3bd08e9c3b231c7fa2a282c4d6b2b382c2a4cf1a` was pushed successfully, but the fork Actions API reports zero registered workflows and created no run.
 - The two original tracked macOS asset blobs are not materialized locally.
-- P1 therefore remains `IMPLEMENTED_UNVERIFIED`; P2–4 were not started.
+- P1 therefore remains `BLOCKED`; P2–4 were not started.

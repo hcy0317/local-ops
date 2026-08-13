@@ -17,7 +17,7 @@
 
 ## Current task state
 
-- Status: Phase 1 platform extraction is implemented on `windows-port/phases-1-4` and is awaiting the required macOS CI regression result; Phase 2–4 have not started.
+- Status: Phase 1 platform extraction is implemented on `windows-port/phases-1-4` but blocked because the fork has no registered GitHub Actions workflows; Phase 2–4 have not started.
 - Source specification: `docs/specs/windows-native-port.md`.
 - Execution plan: `docs/windows-port/PLAN.md`.
 - Recovery source: `docs/windows-port/STATE.json`; obtain macOS test evidence before advancing beyond Phase 1.

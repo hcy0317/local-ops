@@ -111,6 +111,10 @@ def check_required_files() -> str:
         "requirements-dev.txt",
         "Makefile",
         "server.py",
+        "localops/platform/contracts.py",
+        "localops/platform/loader.py",
+        "localops/platform/macos.py",
+        "tools/check_platform_leaks.py",
         "start.command",
         "tests/test_server.py",
         "docs/screenshots/ops-launchpad.jpg",
@@ -212,8 +216,9 @@ def check_version() -> str:
 
 def check_python_syntax() -> str:
     paths = [ROOT / "server.py"]
-    paths.extend(sorted((ROOT / "tools").glob("*.py")))
-    paths.extend(sorted((ROOT / "tests").glob("test_*.py")))
+    paths.extend(sorted((ROOT / "localops").rglob("*.py")))
+    paths.extend(sorted((ROOT / "tools").rglob("*.py")))
+    paths.extend(sorted((ROOT / "tests").rglob("test_*.py")))
     for path in paths:
         try:
             source = path.read_text(encoding="utf-8")

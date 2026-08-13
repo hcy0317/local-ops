@@ -7,8 +7,6 @@
 API 契约与实现要点见 AGENTS.md。
 """
 
-import glob
-import fcntl
 import functools
 import errno
 import json
@@ -27,16 +25,24 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-import webbrowser
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from localops.platform.contracts import (
+    LaunchRequest,
+    PlatformScanError,
+    RuntimeIdentity,
+    ScanStatus,
+)
+from localops.platform.loader import load_platform
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_PATH = os.path.join(BASE_DIR, "VERSION")
 LEGACY_DATA_DIR = os.path.join(BASE_DIR, "data")
-DEFAULT_DATA_DIR = os.path.expanduser(
-    "~/Library/Application Support/总控台")
-DEFAULT_LOGS_DIR = os.path.expanduser("~/Library/Logs/总控台")
+PLATFORM = load_platform(BASE_DIR, __file__)
+PLATFORM_PATHS = PLATFORM.runtime_paths()
+DEFAULT_DATA_DIR = PLATFORM_PATHS.data_dir
+DEFAULT_LOGS_DIR = PLATFORM_PATHS.logs_dir
 
 
 def resolve_runtime_dir(name, default):
@@ -106,12 +112,33 @@ RUN_TOKEN_ARG_PREFIX = "console-run:"
 TASK_CANCELED_EXIT_CODE = 130
 
 SELF_PID = os.getpid()
-SELF_UID = os.getuid()
+SELF_PRINCIPAL = PLATFORM.current_principal()
+# Compatibility name used throughout the macOS domain model and existing tests.
+SELF_UID = SELF_PRINCIPAL.numeric_id
 ICON_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".ico")
 LOG = logging.getLogger("console")
 LOG_LOCK = threading.RLock()
 MANUAL_STOP_LOCK = threading.RLock()
 MANUAL_STOP_TOKENS = set()
+_PLATFORM_SCAN_STATE = threading.local()
+
+
+def _begin_platform_scan_cycle():
+    _PLATFORM_SCAN_STATE.issues = []
+
+
+def _record_platform_issues(status, issues):
+    current = getattr(_PLATFORM_SCAN_STATE, "issues", None)
+    if current is not None:
+        current.extend(issue for issue in issues if issue not in current)
+    if status is ScanStatus.FAILED:
+        raise PlatformScanError(issues)
+
+
+def _consume_platform_scan_issues():
+    issues = list(getattr(_PLATFORM_SCAN_STATE, "issues", []))
+    _PLATFORM_SCAN_STATE.issues = []
+    return issues
 
 
 def classify_task_exit(code):
@@ -536,50 +563,20 @@ class Config:
 
 
 def acquire_instance_lock(path=INSTANCE_LOCK_PATH):
-    """Acquire the per-project process lock and keep its file object alive.
-
-    Port fallback alone is not a single-instance guarantee: two servers on
-    :9600/:9601 would still update the same config.  flock ties exclusivity to
-    this data directory and is released automatically if the process crashes.
-    """
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    lock_file = os.fdopen(fd, "r+", encoding="ascii")
-    try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as e:
-        lock_file.close()
-        if e.errno in (errno.EACCES, errno.EAGAIN):
-            return None
-        raise
-    try:
-        os.fchmod(lock_file.fileno(), 0o600)
-        lock_file.seek(0)
-        lock_file.truncate()
-        lock_file.write("%d\n" % SELF_PID)
-        lock_file.flush()
-        os.fsync(lock_file.fileno())
-    except OSError:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        lock_file.close()
-        raise
-    return lock_file
+    """Acquire the native per-data-directory single-instance lock."""
+    return PLATFORM.acquire_instance_lock(path)
 
 
 def release_instance_lock(lock_file):
     if lock_file is None:
         return
-    try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-    finally:
-        lock_file.close()
+    lock_file.release()
 
 
 # ---------------------------------------------------------------- 子进程与解析
 
 def run_cmd(args, timeout=SUBPROCESS_TIMEOUT):
-    """运行命令并返回 stdout；任何异常/超时都返回空串，绝不上抛。"""
+    """Legacy test helper; production platform scans do not use it."""
     try:
         r = subprocess.run(args, capture_output=True, text=True,
                            errors="replace", timeout=timeout)
@@ -617,38 +614,10 @@ def _to_float(tok, default=0.0):
 
 
 def scan_listeners():
-    """lsof 监听快照 → {(pid, port): {bind_host, ...}}。
-
-    字典仍可像旧集合一样迭代/判断 ``(pid, port)``，同时保留监听地址，
-    供前端区分仅监听 ``::1`` 的服务（需通过 localhost 打开）。
-    """
-    out = run_cmd(["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"])
-    found = {}
-    for line in out.splitlines():
-        if not line or line.startswith("COMMAND"):
-            continue
-        parts = line.split()
-        if len(parts) < 9:
-            continue
-        try:
-            pid = int(parts[1])
-        except ValueError:
-            continue
-        # NAME 列形如 *:8791 / 127.0.0.1:8080 / [::1]:8765，末尾可能跟 "(LISTEN)"
-        port = None
-        bind_host = None
-        for tok in reversed(parts):
-            m = re.search(r":(\d+)$", tok)
-            if m:
-                port = int(m.group(1))
-                bind_host = tok[:m.start()]
-                if bind_host.startswith("[") and bind_host.endswith("]"):
-                    bind_host = bind_host[1:-1]
-                break
-        if port is None:
-            continue
-        found.setdefault((pid, port), set()).add(bind_host or "")
-    return found
+    """Return native listener data while preserving scan failures."""
+    snapshot = PLATFORM.scan_listeners()
+    _record_platform_issues(snapshot.status, snapshot.issues)
+    return snapshot.listeners
 
 
 def listener_open_host(listeners, port, pids=None):
@@ -680,92 +649,21 @@ def listener_open_host(listeners, port, pids=None):
 
 
 def ps_snapshot(pids=None, with_uid=True):
-    """批量进程信息 → {pid: {"uid","comm","args","cpu","mem","etime"}}。
-
-    pids=None 表示全部进程（ps -ax）。解析：左边固定列 pid[/uid]/etime/cpu/mem，
-    其余部分（可含空格）即 comm；args 单独一次 ps 取。
-    注意：不能用 `comm=` 抑制表头——macOS ps 会把空表头列压到 16 字节截断
-    内容；保留表头后解析时跳过表头行即可（首列非数字的行）。
-    """
-    base = ["ps"]
-    if pids is None:
-        base.append("-ax")
-    else:
-        pids = [int(p) for p in pids]
-        if not pids:
-            return {}
-        base += ["-p", ",".join(str(p) for p in pids)]
-    # comm 必须放在最后一列：macOS ps 只保证最后一列不被定宽截断
-    # （comm 在中间列时会被压成约 16 字节，长路径被砍断）。
-    fields = ["pid"] + (["uid"] if with_uid else []) + \
-             ["etime", "%cpu", "%mem", "comm"]
-    out1 = run_cmd(base + ["-o", ",".join(fields)])
-    out2 = run_cmd(base + ["-o", "pid,args"])
-
-    snap = {}
-    fixed = 5 if with_uid else 4  # pid [uid] etime cpu mem 之后的都是 comm
-    for line in out1.splitlines():
-        toks = line.split()
-        if len(toks) < fixed + 1:
-            continue
-        try:
-            pid = int(toks[0])
-        except ValueError:
-            continue  # 表头行
-        i = 1
-        entry = {"args": ""}
-        if with_uid:
-            try:
-                entry["uid"] = int(toks[1])
-            except ValueError:
-                entry["uid"] = -1
-            i = 2
-        entry["etime"] = parse_etime(toks[i])
-        entry["cpu"] = _to_float(toks[i + 1])
-        entry["mem"] = _to_float(toks[i + 2])
-        entry["comm"] = " ".join(toks[i + 3:])
-        snap[pid] = entry
-    for line in out2.splitlines():
-        toks = line.split(None, 1)
-        if not toks:
-            continue
-        try:
-            pid = int(toks[0])
-        except ValueError:
-            continue
-        if pid in snap:
-            snap[pid]["args"] = toks[1] if len(toks) > 1 else ""
-    return snap
+    snapshot = PLATFORM.process_snapshot(
+        None if pids is None else set(pids), with_owner=with_uid,
+    )
+    _record_platform_issues(snapshot.status, snapshot.issues)
+    return snapshot.processes
 
 
 def lsof_cwds(pids):
-    """lsof -a -p <pids> -d cwd -Fn → {pid: cwd}。"""
-    pids = [int(p) for p in pids]
-    if not pids:
-        return {}
-    out = run_cmd(["lsof", "-a", "-p", ",".join(str(p) for p in pids),
-                   "-d", "cwd", "-Fn"])
-    result = {}
-    cur = None
-    for line in out.splitlines():
-        if line.startswith("p"):
-            try:
-                cur = int(line[1:])
-            except ValueError:
-                cur = None
-        elif line.startswith("n") and cur is not None:
-            result[cur] = line[1:]
-    return result
+    snapshot = PLATFORM.process_cwds(set(pids))
+    _record_platform_issues(snapshot.status, snapshot.issues)
+    return snapshot.cwds
 
 
 def pid_alive(pid):
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except PermissionError:
-        return True
-    except (OSError, ValueError, TypeError):
-        return False
+    return PLATFORM.pid_alive(int(pid))
 
 
 # ---------------------------------------------------------------- 状态构建
@@ -875,18 +773,13 @@ _ORIGIN_MULTIPLEXERS = {"tmux": "tmux", "screen": "screen"}
 
 
 def origin_snapshot():
-    """ps -axo pid=,ppid=,args → {pid: (ppid, args)}，供来源溯源。"""
-    table = {}
-    for line in run_cmd(["ps", "-axo", "pid=,ppid=,args"]).splitlines():
-        toks = line.split(None, 2)
-        if len(toks) < 2:
-            continue
-        try:
-            pid, ppid = int(toks[0]), int(toks[1])
-        except ValueError:
-            continue
-        table[pid] = (ppid, toks[2] if len(toks) > 2 else "")
-    return table
+    """Return {pid: (ppid, args)} for origin attribution."""
+    snapshot = PLATFORM.process_parents()
+    _record_platform_issues(snapshot.status, snapshot.issues)
+    return {
+        pid: (int(info.get("ppid", 0)), str(info.get("args") or ""))
+        for pid, info in snapshot.processes.items()
+    }
 
 
 def attribute_origin(pid, table):
@@ -1021,20 +914,15 @@ def build_watched(keywords):
 
 
 def pgid_members_map():
-    """ps -axo pid=,pgid= → {pgid: [pid, ...]}。
-    进程退出后其子孙仍保留原 pgid（被 launchd 收养也不变），
-    因此按 pgid 能找到「脚本把服务放后台后自己退出」的存活成员。"""
-    groups = {}
-    for line in run_cmd(["ps", "-axo", "pid=,pgid="]).splitlines():
-        parts = line.split()
-        if len(parts) != 2:
-            continue
-        try:
-            pid, pgid = int(parts[0]), int(parts[1])
-        except ValueError:
-            continue
-        groups.setdefault(pgid, []).append(pid)
-    return groups
+    """Return {group_id: [pid, ...]} from the native adapter."""
+    snapshot = PLATFORM.process_groups()
+    _record_platform_issues(snapshot.status, snapshot.issues)
+    result = {}
+    for group_id, info in snapshot.processes.items():
+        members = info.get("members")
+        if isinstance(members, list):
+            result[group_id] = [int(pid) for pid in members]
+    return result
 
 
 def _managed_candidates(app, groups):
@@ -1256,28 +1144,34 @@ def build_apps(cfg, listeners, groups=None):
 
 
 def build_state(cfg, console_port, config_health=None):
+    _begin_platform_scan_cycle()
     degraded_reasons = []
     # 一次 pgid 快照供 build_services / build_apps 共享，避免每轮两次全量 ps。
     needs_groups = any(
         app.get("runToken")
         and isinstance(app.get("lastPgid") or app.get("lastPid"), int)
         for app in cfg.get("apps") or [])
-    groups = pgid_members_map() if needs_groups else None
+    try:
+        groups = pgid_members_map() if needs_groups else None
+    except Exception:
+        LOG.exception("构建受控进程组状态失败")
+        groups = {}
+        degraded_reasons.append({"component": "process_groups"})
     try:
         services, listeners = build_services(cfg, groups)
-    except Exception as e:
+    except Exception:
         LOG.exception("构建服务监控状态失败")
         services, listeners = [], set()
         degraded_reasons.append({"component": "services"})
     try:
         watched = build_watched(cfg.get("watchedKeywords"))
-    except Exception as e:
+    except Exception:
         LOG.exception("构建关注进程状态失败")
         watched = []
         degraded_reasons.append({"component": "watched"})
     try:
         apps = build_apps(cfg, listeners, groups)
-    except Exception as e:
+    except Exception:
         LOG.exception("构建启动台状态失败")
         apps = []
         degraded_reasons.append({"component": "apps"})
@@ -1286,6 +1180,14 @@ def build_state(cfg, console_port, config_health=None):
             {"component": "version", "error": VERSION_LOAD_ERROR})
     for issue in (config_health or {}).get("issues", []):
         degraded_reasons.append({"component": "config", "error": issue})
+    for issue in _consume_platform_scan_issues():
+        reason = {
+            "component": issue.component,
+            "code": issue.code,
+            "error": issue.message,
+        }
+        if reason not in degraded_reasons:
+            degraded_reasons.append(reason)
     return {
         "services": services,
         "watched": watched,
@@ -1410,36 +1312,20 @@ def list_themes():
 # ---------------------------------------------------------------- 进程/应用操作
 
 def process_uid(pid):
-    """返回进程 uid；进程不存在返回 None。"""
-    out = run_cmd(["ps", "-o", "uid=", "-p", str(int(pid))])
-    toks = out.split()
-    if not toks:
-        return None
+    """Return the native owner id for one process, or None."""
     try:
-        return int(toks[0])
-    except ValueError:
+        snapshot = PLATFORM.process_snapshot({int(pid)}, with_owner=True)
+        _record_platform_issues(snapshot.status, snapshot.issues)
+    except PlatformScanError:
         return None
+    owner = snapshot.processes.get(int(pid), {}).get("uid")
+    return owner if isinstance(owner, int) else None
 
 
 def kill_process(pid, force):
-    """结束单个进程；只允许当前用户的进程。返回 (ok, error)。"""
-    if pid == SELF_PID:
-        return False, "不能结束总控台自身进程"
-    uid = process_uid(pid)
-    if uid is None:
-        return False, "进程不存在"
-    if uid != SELF_UID:
-        return False, "只能结束当前用户的进程"
-    sig = signal.SIGKILL if force else signal.SIGTERM
-    try:
-        os.kill(pid, sig)
-    except ProcessLookupError:
-        return False, "进程不存在"
-    except PermissionError:
-        return False, "没有权限结束该进程"
-    except OSError as e:
-        return False, "结束失败: %s" % e
-    return True, None
+    """End one external current-user process through the platform boundary."""
+    result = PLATFORM.stop_external_process(int(pid), bool(force))
+    return result.ok, result.error
 
 
 def stop_pid_tree(pid, sig=signal.SIGTERM):
@@ -1450,15 +1336,16 @@ def stop_pid_tree(pid, sig=signal.SIGTERM):
     failures must never be swallowed: callers use them to retain management
     identity instead of creating an orphan process.
     """
-    try:
-        os.killpg(int(pid), sig)
-        return True, None
-    except ProcessLookupError:
-        return True, None
-    except PermissionError:
-        return False, "没有权限停止受控进程组"
-    except OSError as e:
-        return False, "停止受控进程组失败: %s" % e
+    identity = RuntimeIdentity(
+        PLATFORM.name,
+        "group",
+        int(pid),
+        SELF_PRINCIPAL.identifier,
+    )
+    result = PLATFORM.stop_managed(
+        identity, force=sig == getattr(signal, "SIGKILL", None)
+    )
+    return result.ok, result.error
 
 
 def app_running(app, listeners=None):
@@ -1471,36 +1358,11 @@ def app_alive_sign(app, listeners=None):
 
 
 def build_launch_env(token, environ=None):
-    """构建无 Terminal 启动时仍可找到常见开发工具的环境。
-
-    Finder/LSUIElement 启动的应用通常只有系统 PATH，不会读取用户 shell 配置；
-    因此显式补入 Homebrew、npm/pnpm、Volta、NVM、fnm 等常见目录。
-    """
-    env = dict(os.environ if environ is None else environ)
-    home = os.path.expanduser("~")
-    preferred = [
-        os.path.join(home, ".local", "bin"),
-        os.path.join(home, ".volta", "bin"),
-        os.path.join(home, ".bun", "bin"),
-        os.path.join(home, "Library", "pnpm"),
-        os.path.join(home, ".asdf", "shims"),
-        "/opt/homebrew/bin", "/opt/homebrew/sbin",
-        "/usr/local/bin", "/usr/local/sbin",
-    ]
-    preferred.extend(sorted(
-        glob.glob(os.path.join(home, ".nvm", "versions", "node", "*", "bin")),
-        reverse=True))
-    preferred.extend(sorted(
-        glob.glob(os.path.join(home, ".fnm", "node-versions", "*", "installation", "bin")),
-        reverse=True))
-    preferred.extend((env.get("PATH") or "").split(os.pathsep))
-    preferred.extend(("/usr/bin", "/bin", "/usr/sbin", "/sbin"))
-    seen = set()
-    env["PATH"] = os.pathsep.join(
-        path for path in preferred if path and not (path in seen or seen.add(path)))
-    env.setdefault("PNPM_HOME", os.path.join(home, "Library", "pnpm"))
-    env[RUN_TOKEN_ENV] = token
-    return env
+    """Compatibility wrapper for the native launch environment."""
+    builder = getattr(PLATFORM, "launch_environment", None)
+    if builder is None:
+        raise RuntimeError("当前平台尚未实现启动环境")
+    return builder(token, environ)
 
 
 def start_app(app):
@@ -1509,33 +1371,14 @@ def start_app(app):
     log_path = os.path.join(LOGS_DIR, "%s.log" % app["id"])
     rotate_log_file(log_path)
     cwd = app.get("cwd") or os.path.expanduser("~")
-    try:
-        log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                         0o600)
-        os.fchmod(log_fd, 0o600)
-        logf = os.fdopen(log_fd, "ab", buffering=0)
-    except OSError as e:
-        return False, "无法打开日志文件: %s" % e, None, None, None
-    token = secrets.token_urlsafe(24)
-    env = build_launch_env(token)
-    marker = RUN_TOKEN_ARG_PREFIX + token
-    # 外层 shell 在 argv[0] 中持有随机标记并等待内层；内层等待用户命令
-    # 留下的后台作业。因此进程组既可验证，也不会因启动脚本过早退出而失去锚点。
-    outer_script = '/bin/bash -c "$1"\nconsole_status=$?\nexit "$console_status"'
-    inner_script = (app["command"] +
-                    '\nconsole_status=$?\nwait\nexit "$console_status"')
-    try:
-        header = "\n===== 启动于 %s =====\n" % time.strftime("%Y-%m-%d %H:%M:%S")
-        logf.write(header.encode("utf-8"))
-        proc = subprocess.Popen(
-            ["/bin/bash", "-c", outer_script, marker, inner_script],
-            cwd=cwd, stdout=logf, stderr=subprocess.STDOUT,
-            start_new_session=True, env=env)
-    except Exception as e:
-        logf.close()
-        return False, "启动失败: %s" % e, None, None, None
-    logf.close()  # 子进程已持有副本，父进程关闭避免 fd 泄漏
-    return True, None, proc, proc.pid, token
+    result = PLATFORM.launch(LaunchRequest(
+        app_id=app["id"],
+        command=app["command"],
+        cwd=cwd,
+        log_path=log_path,
+    ))
+    return (result.ok, result.error, result.process, result.group_id,
+            result.token)
 
 
 def startup_failure_message(app_id, code):
@@ -1634,19 +1477,9 @@ def stop_app_for_update(cfg, app, timeout=5.0):
 
 
 def pick_path(what):
-    """macOS 原生文件/目录选择框（osascript）。返回 (path|None, canceled)。"""
-    if what == "dir":
-        script = 'POSIX path of (choose folder with prompt "选择工作目录")'
-    else:
-        script = 'POSIX path of (choose file with prompt "选择批处理脚本")'
-    try:
-        r = subprocess.run(["osascript", "-e", script],
-                           capture_output=True, text=True, timeout=180)
-    except Exception:
-        return None, False
-    if r.returncode != 0:  # 用户按了取消（"User canceled."）
-        return None, True
-    return r.stdout.strip().rstrip("/") or None, False
+    """Open the native file/folder picker."""
+    result = PLATFORM.pick_path(what)
+    return result.path, result.canceled
 
 
 def command_for_script(path):
@@ -2134,11 +1967,9 @@ def resolve_app_stop_target(app, listeners=None):
     legacy_pid = legacy_managed_pid(app, listeners)
     if legacy_pid:
         if app.get("attached"):
-            try:
-                pgid = os.getpgid(legacy_pid)
-            except (ProcessLookupError, PermissionError, OSError):
-                pgid = None
-            if isinstance(pgid, int) and pgid > 0 and pgid != os.getpgrp():
+            pgid = PLATFORM.process_group_id(legacy_pid)
+            own_group = PLATFORM.current_process_group_id()
+            if isinstance(pgid, int) and pgid > 0 and pgid != own_group:
                 members = _current_user_group_members(pgid)
                 member_cwds = lsof_cwds(members)
                 expected_cwd = app.get("cwd")
@@ -2163,42 +1994,27 @@ def resolve_app_stop_target(app, listeners=None):
 
 def signal_app_stop(target, sig=signal.SIGTERM):
     """Signal a target returned by resolve_app_stop_target."""
-    ident = target["id"]
-    if target["kind"] == "group":
-        return stop_pid_tree(ident, sig)
-    try:
-        os.kill(ident, sig)
-        return True, None
-    except ProcessLookupError:
-        return True, None
-    except PermissionError:
-        return False, "没有权限停止受控进程"
-    except OSError as e:
-        return False, "停止受控进程失败: %s" % e
+    identity = RuntimeIdentity(
+        PLATFORM.name,
+        target["kind"],
+        target["id"],
+        SELF_PRINCIPAL.identifier,
+        tuple(target.get("members") or ()),
+    )
+    result = PLATFORM.stop_managed(
+        identity, force=sig == getattr(signal, "SIGKILL", None)
+    )
+    return result.ok, result.error
 
 
 def stop_target_alive(target, expected_uid=None):
     if target["kind"] == "group":
-        try:
-            os.killpg(target["id"], 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return True
-    try:
-        os.kill(target["id"], 0)
-        if expected_uid is None:
-            expected_uid = process_uid(target["id"])
-        return expected_uid == SELF_UID
-    except ProcessLookupError:
+        return bool(_current_user_group_members(target["id"]))
+    if not PLATFORM.pid_alive(target["id"]):
         return False
-    except PermissionError:
-        return True
-    except OSError:
-        return True
+    if expected_uid is None:
+        expected_uid = process_uid(target["id"])
+    return expected_uid == SELF_UID
 
 
 def stop_app_and_wait(app, timeout=APP_STOP_TIMEOUT_SEC, listeners=None):
@@ -3807,7 +3623,7 @@ def open_browser_later(port, delay=0.8):
     def _open():
         try:
             time.sleep(delay)
-            webbrowser.open("http://%s:%d/" % (HOST, port))
+            PLATFORM.open_browser("http://%s:%d/" % (HOST, port))
         except Exception:
             pass
     threading.Thread(target=_open, daemon=True).start()
@@ -3849,29 +3665,11 @@ def find_console_instances():
 
 
 def _launcher_dialog(message):
-    script = """on run argv
-set messageText to item 1 of argv
-display dialog messageText with title "总控台" buttons {"取消", "重新启动", "打开控制台"} default button "打开控制台" cancel button "取消" with icon note
-return button returned of result
-end run"""
-    try:
-        result = subprocess.run(
-            ["osascript", "-e", script, message], capture_output=True,
-            text=True, timeout=180)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return result.stdout.strip() if result.returncode == 0 else None
+    return PLATFORM.launcher_dialog(message)
 
 
 def _launcher_alert(message):
-    script = """on run argv
-display alert "总控台" message (item 1 of argv) as critical
-end run"""
-    try:
-        subprocess.run(["osascript", "-e", script, message],
-                       capture_output=True, timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    PLATFORM.launcher_alert(message)
 
 
 def launcher_main():
@@ -3895,7 +3693,7 @@ def launcher_main():
     if choice == "打开控制台":
         ports = [p for item in instances for p in item["ports"]]
         port = min(ports) if ports else PORT_START
-        webbrowser.open("http://%s:%d/" % (HOST, port))
+        PLATFORM.open_browser("http://%s:%d/" % (HOST, port))
         return
     if choice != "重新启动":
         return
@@ -3905,10 +3703,7 @@ def launcher_main():
     targets = [item["pid"] for item in instances]
     for pid in targets:
         if process_uid(pid) == SELF_UID:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            PLATFORM.stop_external_process(pid, force=False)
     deadline = time.monotonic() + 8.0
     while time.monotonic() < deadline and any(pid_alive(pid) for pid in targets):
         time.sleep(0.1)
@@ -3926,16 +3721,15 @@ def launcher_main():
 
 def schedule_console_restart(server, preferred_port):
     """启动独立 helper，响应发出后关闭当前 HTTP 服务。"""
-    helper = subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), "--restart-helper",
-         str(SELF_PID), str(int(preferred_port))],
-        cwd=BASE_DIR, start_new_session=True, close_fds=True)
+    result = PLATFORM.restart_console(preferred_port)
+    if not result.ok:
+        raise OSError(result.error or "无法启动重启程序")
 
     def _shutdown():
         time.sleep(0.25)
         server.shutdown()
     threading.Thread(target=_shutdown, daemon=True).start()
-    return helper.pid
+    return result.helper_pid
 
 
 def schedule_console_stop(server):
@@ -3947,16 +3741,8 @@ def schedule_console_stop(server):
 
 
 def restart_helper(old_pid, preferred_port):
-    """等旧进程释放端口后，在 helper 原地 exec 新总控台。"""
-    deadline = time.monotonic() + 12.0
-    while time.monotonic() < deadline and pid_alive(old_pid):
-        time.sleep(0.1)
-    if pid_alive(old_pid):
-        return 1
-    args = [sys.executable, os.path.abspath(__file__),
-            "--preferred-port", str(int(preferred_port)), "--no-browser"]
-    os.execv(sys.executable, args)
-    return 0
+    """Complete a native console restart from the detached helper."""
+    return PLATFORM.complete_console_restart(old_pid, preferred_port)
 
 
 def _run_console(preferred_port=None, open_browser=True):
@@ -4037,7 +3823,7 @@ def main(preferred_port=None, open_browser=True, log_to_file=False):
             instances = find_console_instances()
             ports = [port for item in instances for port in item.get("ports", [])]
             if ports:
-                webbrowser.open("http://%s:%d/" % (HOST, min(ports)))
+                PLATFORM.open_browser("http://%s:%d/" % (HOST, min(ports)))
         return False
     try:
         _run_console(preferred_port, open_browser)

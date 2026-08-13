@@ -11,6 +11,8 @@ import unittest
 from unittest import mock
 
 import server
+from localops.platform.contracts import ListenerSnapshot, ScanStatus
+from localops.platform.fake import FakePlatform
 
 
 class ParsingTests(unittest.TestCase):
@@ -27,12 +29,15 @@ class ParsingTests(unittest.TestCase):
         self.assertIsNotNone(server.validate_port(70000)[1])
 
     def test_listener_scan_preserves_ipv6_loopback_for_open_links(self):
-        output = """COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
-node 101 user 1u IPv6 0x0 0t0 TCP [::1]:5173 (LISTEN)
-node 202 user 2u IPv4 0x0 0t0 TCP 127.0.0.1:8000 (LISTEN)
-node 303 user 3u IPv6 0x0 0t0 TCP *:3000 (LISTEN)
-"""
-        with mock.patch.object(server, "run_cmd", return_value=output):
+        fake = FakePlatform(listeners=ListenerSnapshot(
+            ScanStatus.OK,
+            {
+                (101, 5173): {"::1"},
+                (202, 8000): {"127.0.0.1"},
+                (303, 3000): {"*"},
+            },
+        ))
+        with mock.patch.object(server, "PLATFORM", fake):
             listeners = server.scan_listeners()
 
         self.assertEqual(listeners[(101, 5173)], {"::1"})

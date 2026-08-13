@@ -44,6 +44,7 @@ INCLUDE = (
     "licenses",
     *REQUIRED_LICENSES,
     "server.py",
+    "localops",
     "start.command",
     "总控台.app",
     "static",

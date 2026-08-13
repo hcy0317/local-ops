@@ -20,7 +20,7 @@
 
 ## Current task state
 
-- Status: Phase 1 and the Windows 11 Phase 2 target passed. Phase 3 is locally complete on Windows 11 and awaits exact-commit Windows Python 3.12 plus macOS regression/release CI before final PASS: schema v2, structured command/static preflight, transactional macOS config import, and capability-driven UI are implemented. Windows 10 remains explicitly deferred, `windowsBetaReady=false`, and Phase 4 is untouched.
+- Status: Phase 1, Windows 11 Phase 2, and Windows 11 Phase 3 passed. Phase 3 implementation commit `97c417ef1491ac11fdb036c4e4102bfc190c88e6` passed CI run `31698371278` on Windows Python 3.12 and macOS complete regression/release/reproducibility jobs. Windows 10 remains explicitly deferred, `windowsBetaReady=false`, and Phase 4 is untouched.
 - Source specification: `docs/specs/windows-native-port.md`.
 - Execution plan: `docs/windows-port/PLAN.md`.
 - Recovery source: `docs/windows-port/STATE.json`; exact-commit CI evidence is required before closing each implemented phase.

@@ -325,6 +325,6 @@ The Windows 11 Phase 2 target was `PASS`. The original cross-version Phase 2 gat
 | Phase 3 browser screenshot/click QA | NOT_RUN | `browser-harness --doctor` reports Chrome running but daemon/active CDP connections unavailable (0); no visual PASS is claimed |
 | Windows 10 non-admin | DEFERRED | Explicit user scope; no Win10 claim |
 | Phase 4 lifecycle | NOT_STARTED | No runner, Job Object, generation, runtime identity, or lifecycle side effect was added |
-| Windows Python 3.12 exact-commit CI | PENDING | Record the pushed candidate run/job before final P3 PASS |
-| macOS complete regression/release CI | PENDING | Record the pushed candidate run/job before final P3 PASS |
+| Windows Python 3.12 exact-commit CI | PASS | Commit `97c417ef1491ac11fdb036c4e4102bfc190c88e6`, run `31698371278`, job `94441279178` |
+| macOS complete regression/release CI | PASS | Commit `97c417ef1491ac11fdb036c4e4102bfc190c88e6`, run `31698371278`, job `94441279120`; project checks, release build/verify, and reproducibility passed |
 | Windows package / clean VM | NOT_RUN | Phase 5 scope |

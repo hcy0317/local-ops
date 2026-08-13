@@ -2,16 +2,16 @@
   "schemaVersion": 1,
   "task": "local-ops-windows-port",
   "baselineCommit": "a5c3adae1f1fa0bd9f0ac7b090ec422e285d0c0f",
-  "implementationCommit": null,
-  "ciRun": null,
+  "implementationCommit": "97c417ef1491ac11fdb036c4e4102bfc190c88e6",
+  "ciRun": "31698371278",
   "branch": "windows-port/phases-1-4",
   "currentPhase": "P3",
-  "phaseStatus": "IMPLEMENTED_UNVERIFIED",
+  "phaseStatus": "PASS",
   "scopedTarget": "Windows 11 Phase 3",
-  "scopedTargetStatus": "LOCAL_PASS",
+  "scopedTargetStatus": "PASS",
   "windows10Status": "DEFERRED",
-  "lastGreenPhase": "P2",
-  "macosTests": "PENDING_EXACT_COMMIT_CI",
+  "lastGreenPhase": "P3",
+  "macosTests": "PASS",
   "windowsTests": "PASS",
   "windowsBetaReady": false,
   "changedFiles": [
@@ -114,8 +114,9 @@
     "The shared contract suite ran 32 tests: 31 passed and one privileged symlink case skipped.",
     "An isolated Windows 11 API flow passed zero-write preview, explicit path mapping, identity-clearing and idempotent commit, lifecycle 409, UNC rejection, and rollback to zero imported apps.",
     "Prepared commit and rollback receipts recovered after injected writer/finalization failures; deterministic receipt hashes did not re-probe a changed environment; post-replace ACL failure kept memory and disk consistent and entered read-only protection.",
-    "Ruff, compileall, JavaScript syntax, Node port tests, HTTP security checks, shared-core platform leak audit, and git diff checks passed."
+    "Ruff, compileall, JavaScript syntax, Node port tests, HTTP security checks, shared-core platform leak audit, and git diff checks passed.",
+    "Implementation commit 97c417ef1491ac11fdb036c4e4102bfc190c88e6 passed CI run 31698371278: Windows job 94441279178 and macOS check/release job 94441279120."
   ],
-  "nextAction": "Commit and push the Phase 3 candidate, require Windows Python 3.12 and macOS complete regression/release CI, then stop before Phase 4.",
-  "lastVerifiedAt": "2026-08-13T19:57:32+08:00"
+  "nextAction": "Stop at the Phase 3 boundary. Do not begin Phase 4 without explicit user authorization.",
+  "lastVerifiedAt": "2026-08-13T20:06:18+08:00"
 }

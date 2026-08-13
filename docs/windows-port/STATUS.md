@@ -2,7 +2,7 @@
 
 ## Current result
 
-**P3 WIN11 LOCAL PASS / EXACT-COMMIT CI PENDING / WIN10 DEFERRED / PHASE 4 UNTOUCHED.**
+**P3 WIN11 PASS / WIN10 DEFERRED / PHASE 4 UNTOUCHED.**
 
 Phase 3 adds the frozen API Contract v2, additive schema v1→v2 migration, a non-executing `CommandSpec` model, Windows project detection/static preflight, explicit receipt-backed macOS configuration import, and platform/capability-driven UI. It does not add a runner, Job Object, generation, runtime identity, external attach, or any lifecycle side effect.
 
@@ -10,7 +10,9 @@ The Windows 11 non-admin local gate passed 50/50 Windows tests and ran 32 shared
 
 Phase 3 visual browser interaction is `NOT_RUN`: `browser-harness --doctor` reports a running Chrome but no active CDP connection. Static frontend contracts pass 20/21; the only failure is the pre-existing unmaterialized `static/assets/console-app-icon.png` blob. This limitation is not presented as a visual PASS. Phase 2's exact-candidate Chromium evidence remains historical only.
 
-The user explicitly deferred Windows 10. This does not fabricate the original cross-version or release gate: `windowsBetaReady=false`, packaging remains Phase 5, and Phase 4 has not started. The final P3 PASS remains pending exact-commit Windows Python 3.12 and macOS regression/release CI.
+Implementation commit `97c417ef1491ac11fdb036c4e4102bfc190c88e6` passed exact-commit CI run `31698371278`: Windows Python 3.12 job `94441279178` and macOS complete check/release/reproducibility job `94441279120` both passed.
+
+The user explicitly deferred Windows 10. This does not fabricate the original cross-version or release gate: `windowsBetaReady=false`, packaging remains Phase 5, and Phase 4 has not started.
 
 ## Phase 3 implemented scope
 

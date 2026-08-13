@@ -3127,6 +3127,9 @@ class Handler(BaseHTTPRequestHandler):
                         "port": self.server.console_port})
 
     def handle_console_stop(self):
+        if not self._require_capability(
+                "restart_console", "当前平台或阶段未启用总控台停止"):
+            return
         reserved, current, _ = self.server.reserve_console_action("stop")
         if not reserved:
             if current == "stop":
@@ -3424,15 +3427,15 @@ class Handler(BaseHTTPRequestHandler):
 
     @serialized_app_operation
     def handle_app_attach(self, app_id):
-        _, app = self._get_app_or_404(app_id)
-        if app is None:
-            return
         data, err = self.read_json_body()
         if err:
             self.send_err(400, err)
             return
         if not self._require_capability(
                 "attach_external", "当前平台或阶段禁止认领外部进程"):
+            return
+        _, app = self._get_app_or_404(app_id)
+        if app is None:
             return
         pid = data.get("pid")
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:

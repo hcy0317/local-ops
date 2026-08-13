@@ -117,14 +117,17 @@ class WindowsServerTests(unittest.TestCase):
         with mock.patch.object(server, "kill_process") as kill_process, \
                 mock.patch.object(server, "start_app") as start_app, \
                 mock.patch.object(server, "attach_app_process") as attach_process, \
-                mock.patch.object(server, "stop_app_and_clear") as stop_app:
+                mock.patch.object(server, "stop_app_and_clear") as stop_app, \
+                mock.patch.object(server, "schedule_console_stop") as stop_console:
             requests = (
                 ("POST", "/api/kill", {"pid": os.getpid()}),
                 ("POST", f"/api/apps/{app_id}/start", {}),
                 ("POST", f"/api/apps/{app_id}/stop", {}),
                 ("POST", f"/api/apps/{app_id}/restart", {}),
                 ("POST", f"/api/apps/{app_id}/attach", {"pid": os.getpid()}),
+                ("POST", "/api/apps/facefeed/attach", {"pid": os.getpid()}),
                 ("POST", "/api/console/restart", {}),
+                ("POST", "/api/console/stop", {}),
             )
             for method, path, payload in requests:
                 status, body, _ = self.harness.request(
@@ -148,7 +151,33 @@ class WindowsServerTests(unittest.TestCase):
         start_app.assert_not_called()
         attach_process.assert_not_called()
         stop_app.assert_not_called()
+        stop_console.assert_not_called()
         self.assertEqual(self.harness.cfg.snapshot(), before)
+
+    def test_disabled_attach_consumes_body_before_next_keep_alive_request(self):
+        conn = http.client.HTTPConnection(server.HOST, self.harness.port, timeout=4)
+        try:
+            conn.request(
+                "POST",
+                "/api/apps/facefeed/attach",
+                body=json.dumps({"pid": os.getpid()}),
+                headers=self.headers,
+            )
+            response = conn.getresponse()
+            self.assertEqual(response.status, 409)
+            self.assertFalse(json.loads(response.read().decode("utf-8"))["ok"])
+
+            conn.request(
+                "POST",
+                "/api/console/restart",
+                body="{}",
+                headers=self.headers,
+            )
+            response = conn.getresponse()
+            self.assertEqual(response.status, 409)
+            self.assertFalse(json.loads(response.read().decode("utf-8"))["ok"])
+        finally:
+            conn.close()
 
     def test_running_delete_and_update_do_not_stop_processes(self):
         app_id = "cafebabe"

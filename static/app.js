@@ -228,6 +228,7 @@ function stateHealthNotice(data) {
   return messages.length ? messages.join('；') + '。' : '';
 }
 function setConnected(ok, message = '') {
+  banner.dataset.connection = ok ? 'up' : 'down';
   if (!ok) {
     if (!state.restartingFrom && !state.stopping) {
       banner.textContent = message || DISCONNECTED_TEXT;
@@ -242,23 +243,33 @@ function setConnected(ok, message = '') {
   banner.classList.toggle('show', !!notice);
   banner.setAttribute('aria-hidden', String(!notice));
 }
+function consoleLifecycleSupported() {
+  return state.data && state.data.capabilities &&
+    state.data.capabilities.restart_console === true;
+}
 function render() {
   if (!state.data) return;
   const consolePid = Number(state.data.consolePid);
-  const restartSupported = Number.isInteger(consolePid) && consolePid > 0;
+  const lifecycleSupported = consoleLifecycleSupported();
+  const restartSupported = lifecycleSupported &&
+    Number.isInteger(consolePid) && consolePid > 0;
   setText(consolePortLabel, state.data.consolePort ? ':' + state.data.consolePort : ':----');
-  setText(restartConsoleLabel, state.restartingFrom
+  setText(restartConsoleLabel, !lifecycleSupported ? '不可用' : state.restartingFrom
     ? '重启中' : restartSupported ? '重启' : '启用');
-  setText(stopConsoleLabel, state.stopping ? '停止中' : '停止');
-  restartConsoleBtn.disabled = !!state.restartingFrom || state.stopping;
-  stopConsoleBtn.disabled = !!state.restartingFrom || state.stopping;
+  setText(stopConsoleLabel, !lifecycleSupported ? '不可用' : state.stopping ? '停止中' : '停止');
+  restartConsoleBtn.disabled = !lifecycleSupported || !!state.restartingFrom || state.stopping;
+  stopConsoleBtn.disabled = !lifecycleSupported || !!state.restartingFrom || state.stopping;
   restartConsoleBtn.classList.toggle('needs-activation', !restartSupported);
   restartConsoleBtn.classList.toggle('restarting', !!state.restartingFrom);
-  restartConsoleBtn.setAttribute('aria-label', restartSupported ? '重启总控台' : '启用一键重启');
-  restartConsoleBtn.title = restartSupported
+  const unavailableTitle = '当前平台或阶段未启用总控台控制';
+  restartConsoleBtn.setAttribute('aria-label', !lifecycleSupported
+    ? unavailableTitle : restartSupported ? '重启总控台' : '启用一键重启');
+  restartConsoleBtn.title = !lifecycleSupported ? unavailableTitle : restartSupported
     ? '重启总控台 · PID ' + consolePid +
       (state.data.consoleCwd ? ' · ' + state.data.consoleCwd : '')
     : '当前是旧版后台，点击查看启用方法';
+  stopConsoleBtn.setAttribute('aria-label', lifecycleSupported ? '停止总控台' : unavailableTitle);
+  stopConsoleBtn.title = lifecycleSupported ? '停止总控台' : unavailableTitle;
   /* 侧栏计数：启动台 = 运行中应用数；服务监控 = 我的服务数 */
   const apps = state.data.apps || [];
   const runningApps = apps.filter(a => a.running).length;
@@ -288,6 +299,7 @@ function showConsoleActivationInfo(action) {
 }
 
 restartConsoleBtn.addEventListener('click', () => {
+  if (!consoleLifecycleSupported()) return;
   const consolePid = Number(state.data && state.data.consolePid);
   if (state.restartingFrom) return;
   if (!Number.isInteger(consolePid) || consolePid <= 0) {
@@ -303,6 +315,7 @@ restartConsoleBtn.addEventListener('click', () => {
     onOk: async () => {
       suspendPortDiscovery();
       state.restartingFrom = consolePid;
+      banner.dataset.connection = 'down';
       banner.textContent = '总控台正在重新启动，页面会自动恢复…';
       banner.classList.add('show');
       banner.setAttribute('aria-hidden', 'false');
@@ -328,6 +341,7 @@ restartConsoleBtn.addEventListener('click', () => {
 });
 
 stopConsoleBtn.addEventListener('click', () => {
+  if (!consoleLifecycleSupported()) return;
   const consolePid = Number(state.data && state.data.consolePid);
   if (state.restartingFrom || state.stopping) return;
   if (!Number.isInteger(consolePid) || consolePid <= 0) {
@@ -341,6 +355,7 @@ stopConsoleBtn.addEventListener('click', () => {
     okText: '停止运行',
     onOk: async () => {
       state.stopping = true;
+      banner.dataset.connection = 'down';
       banner.textContent = '总控台正在停止…再次启动请双击“总控台.app”。';
       banner.classList.add('show');
       banner.setAttribute('aria-hidden', 'false');

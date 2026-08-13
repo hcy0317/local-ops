@@ -224,6 +224,25 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("const isTask = modalKind === 'task'", overlays)
         self.assertIn("const stopVerb = isTask ? '中止任务' : '停止服务'", overlays)
 
+    def test_health_notice_does_not_report_connection_loss(self):
+        app = (ROOT / "static/app.js").read_text(encoding="utf-8")
+        widgets = (ROOT / "static/js/widgets.js").read_text(encoding="utf-8")
+
+        self.assertIn("banner.dataset.connection = ok ? 'up' : 'down'", app)
+        self.assertIn("banner.dataset.connection === 'down'", widgets)
+        self.assertIn("attributeFilter: ['data-connection']", widgets)
+        self.assertNotIn("banner.classList.contains('show')", widgets)
+        self.assertEqual(app.count("banner.dataset.connection = 'down'"), 2)
+
+    def test_console_controls_follow_platform_capability(self):
+        app = (ROOT / "static/app.js").read_text(encoding="utf-8")
+
+        self.assertIn("function consoleLifecycleSupported()", app)
+        self.assertIn("state.data.capabilities.restart_console === true", app)
+        self.assertIn("restartConsoleBtn.disabled = !lifecycleSupported", app)
+        self.assertIn("stopConsoleBtn.disabled = !lifecycleSupported", app)
+        self.assertEqual(app.count("if (!consoleLifecycleSupported()) return;"), 2)
+
     def test_new_port_discovery_is_session_scoped_and_actionable(self):
         html = (ROOT / "static/index.html").read_text(encoding="utf-8")
         services = (ROOT / "static/js/services.js").read_text(encoding="utf-8")

@@ -96,16 +96,16 @@ export function initWidgets() {
     if (state.data) renderTopRes(state.data);
   });
 
-  /* 导航轨连接状态跟随断连横幅（banner 是唯一连接状态出口） */
+  /* 导航轨连接状态只跟随连接语义；降级/配置提示也会复用横幅。 */
   const banner = $('#banner');
   const syncConn = () => {
-    const down = banner.classList.contains('show');
+    const down = banner.dataset.connection === 'down';
     railConnDot.classList.toggle('running', !down);
     railConnDot.classList.toggle('danger', down);
     setText(railConnText, down ? '连接中断' : '已连接');
   };
   new MutationObserver(syncConn)
-    .observe(banner, { attributes: true, attributeFilter: ['class'] });
+    .observe(banner, { attributes: true, attributeFilter: ['data-connection'] });
   syncConn();
 
   tipsAction.addEventListener('click', () => {

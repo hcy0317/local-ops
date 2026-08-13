@@ -4,9 +4,9 @@
   "baselineCommit": "a5c3adae1f1fa0bd9f0ac7b090ec422e285d0c0f",
   "branch": "windows-port/phases-1-4",
   "currentPhase": "P1",
-  "phaseStatus": "BLOCKED",
+  "phaseStatus": "IMPLEMENTED_UNVERIFIED",
   "lastGreenPhase": "P0",
-  "macosTests": "NOT_RUN",
+  "macosTests": "FAIL",
   "windowsTests": "FAIL",
   "windowsBetaReady": false,
   "changedFiles": [
@@ -52,8 +52,7 @@
   ],
   "knownBlockers": [
     "Two macOS brand asset blobs are not materialized in this verified partial checkout, so asset and release checks cannot pass locally.",
-    "No macOS, Windows 10, clean Windows VM, or Python 3.12 environment is available for this phase evidence.",
-    "The fork currently has no registered GitHub Actions workflows, so the pushed Phase 1 commit did not start the required macos-15 suite."
+    "No local macOS, Windows 10, clean Windows VM, or Python 3.12 environment is available for this phase evidence."
   ],
   "knownFailures": [
     "The full native Windows Python discovery run executed 36 tests and ended with 2 failures and 3 errors.",
@@ -62,8 +61,8 @@
     ,
     "Phase 1 contract and baseline-golden tests passed 11 of 11 on native Windows.",
     "The current full Python discovery ran 170 tests and failed with 22 failures and 11 errors because the Windows adapter is intentionally unsupported before Phase 2, POSIX-only tests ran on Windows, and two tracked assets remain unavailable.",
-    "Commit 3bd08e9c3b231c7fa2a282c4d6b2b382c2a4cf1a was pushed successfully, but no GitHub Actions run was created because the fork reports zero registered workflows."
+    "macOS CI run 31659011083 ran 170 tests and failed with one assertion and one error: missing-PID semantics changed and the launch-environment test patched the old module owner. Both regressions are fixed locally pending rerun."
   ],
-  "nextAction": "Enable workflows in the fork Actions tab, run the macos-15 workflow for this branch, and only after a green exact-commit run change P1 to PASS.",
-  "lastVerifiedAt": "2026-08-13T09:43:51+08:00"
+  "nextAction": "Commit and push the focused macOS regression fixes, verify the automatically triggered exact-commit CI run, and only after it is green change P1 to PASS.",
+  "lastVerifiedAt": "2026-08-13T09:57:16+08:00"
 }

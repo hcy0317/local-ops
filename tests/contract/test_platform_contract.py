@@ -118,6 +118,16 @@ node 202 user 2u IPv4 0x0 0t0 TCP 127.0.0.1:8000 (LISTEN)
         self.assertEqual(snapshot.processes[42]["comm"], "python3")
         self.assertEqual(snapshot.issues[0].code, "command_failed")
 
+    def test_missing_requested_pid_is_not_a_scan_failure(self):
+        missing = subprocess.CompletedProcess(
+            [], 1, "", "ps: process id too large: 99999999"
+        )
+        with mock.patch("subprocess.run", side_effect=[missing, missing]):
+            result = self.platform.stop_external_process(99999999)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "进程不存在")
+
 
 if __name__ == "__main__":
     unittest.main()

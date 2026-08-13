@@ -13,6 +13,7 @@ from unittest import mock
 import server
 from localops.platform.contracts import ListenerSnapshot, ScanStatus
 from localops.platform.fake import FakePlatform
+from localops.platform.macos import MacOSPlatform
 
 
 class ParsingTests(unittest.TestCase):
@@ -811,14 +812,16 @@ class ProcessIdentityTests(unittest.TestCase):
 
 class LaunchEnvironmentTests(unittest.TestCase):
     def test_headless_launch_path_includes_common_user_node_locations(self):
-        with mock.patch.object(server.os.path, "expanduser", return_value="/Users/example"), \
-                mock.patch.object(server.glob, "glob", side_effect=[
+        with mock.patch("localops.platform.macos.os.path.expanduser",
+                        return_value="/Users/example"), \
+                mock.patch("localops.platform.macos.glob.glob", side_effect=[
                     ["/Users/example/.nvm/versions/node/v22/bin"],
                     ["/Users/example/.fnm/node-versions/v20/installation/bin"],
                 ]):
-            env = server.build_launch_env("secret", {"PATH": "/usr/bin:/bin"})
+            env = MacOSPlatform.launch_environment(
+                "secret", {"PATH": "/usr/bin:/bin"})
 
-        paths = env["PATH"].split(os.pathsep)
+        paths = [path.replace("\\", "/") for path in env["PATH"].split(os.pathsep)]
         self.assertIn("/Users/example/.local/bin", paths)
         self.assertIn("/usr/local/bin", paths)
         self.assertIn("/opt/homebrew/bin", paths)

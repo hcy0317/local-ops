@@ -212,6 +212,11 @@ class MacOSPlatform:
         details, detail_issue = self._run(
             base + ["-o", ",".join(fields)], component="processes"
         )
+        if pids is not None and detail_issue:
+            message = detail_issue.message.lower()
+            if (message == "ps exited with 1"
+                    or "process id too large" in message):
+                return ProcessSnapshot(ScanStatus.OK)
         args_output, args_issue = self._run(
             base + ["-o", "pid,args"], component="process_args"
         )

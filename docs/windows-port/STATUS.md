@@ -2,9 +2,9 @@
 
 ## Current result
 
-**P1 BLOCKED — implementation is present, but the fork has no registered GitHub Actions workflow to run the required macOS regression gate.**
+**P1 IMPLEMENTED_UNVERIFIED — the first macOS CI run found two regressions; focused fixes are green locally and awaiting an exact-commit rerun.**
 
-Phase 1 extracted the platform boundary and passed its focused contract, golden, lint, and platform-leak checks. Commit `3bd08e9c3b231c7fa2a282c4d6b2b382c2a4cf1a` was pushed to the phase branch, but the fork Actions API reports zero registered workflows and created no run. The workflow must be enabled in the fork before the `macos-15` gate can execute. Per the phase protocol, Phase 2–4 have not started.
+Phase 1 extracted the platform boundary and passed its focused contract, golden, lint, and platform-leak checks. GitHub Actions is now active. macOS CI run `31659011083` ran the full 170-test suite and found one assertion failure plus one error: a missing PID surfaced the raw `ps` error, and a launch-environment test still patched the pre-extraction module owner. Both are fixed with focused adapter/test changes. Per the phase protocol, Phase 2–4 have not started.
 
 ## Phase 1 completed implementation
 
@@ -16,7 +16,7 @@ Phase 1 extracted the platform boundary and passed its focused contract, golden,
 - Added baseline-golden and direct-native-call checks.
 - Added `localops/` to project syntax checks and the source release allowlist.
 
-Focused evidence is green: 11/11 Python contract/golden tests, 7/7 Node port tests, 6/6 release-manifest/project-binding tests, 6/6 HTTP security tests, Ruff, platform-leak check, and `git diff --check`.
+Focused evidence is green: 12/12 Python contract/golden tests, 2/2 launch-environment tests, 7/7 Node port tests, 6/6 release-manifest/project-binding tests, 6/6 HTTP security tests, Ruff, platform-leak check, and `git diff --check`.
 
 The full native Windows Python run is intentionally not green in P1: 170 tests ran with 22 failures and 11 errors. The failures are dominated by the explicitly unsupported Windows adapter, POSIX lifecycle/mode/symlink assumptions, and missing tracked assets. This is not a P1 macOS regression verdict.
 

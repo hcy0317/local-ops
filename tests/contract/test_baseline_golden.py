@@ -19,18 +19,26 @@ class BaselineGoldenTests(unittest.TestCase):
             )
         )
 
-    def test_config_defaults_match_phase_zero_baseline(self):
-        self.assertEqual(server.Config.DEFAULT, self.baseline["config"]["default"])
-        self.assertEqual(
-            server.Config.APP_DEFAULT,
-            self.baseline["config"]["appDefault"],
-        )
+    def test_config_defaults_preserve_phase_zero_fields_additively(self):
+        baseline_default = self.baseline["config"]["default"]
+        for key, value in baseline_default.items():
+            if key != "schemaVersion":
+                self.assertEqual(server.Config.DEFAULT[key], value)
+        self.assertEqual(server.Config.DEFAULT["schemaVersion"], 2)
+
+        for key, value in self.baseline["config"]["appDefault"].items():
+            self.assertEqual(server.Config.APP_DEFAULT[key], value)
+        self.assertEqual(server.Config.APP_DEFAULT["commandSpec"], None)
+        self.assertEqual(server.Config.APP_DEFAULT["runtimeIdentity"], None)
+        self.assertEqual(server.Config.APP_DEFAULT["importStatus"],
+                         "needs_review")
 
     def test_state_keys_match_phase_zero_baseline(self):
         with mock.patch.object(server, "PLATFORM", FakePlatform()):
             state = server.build_state(dict(server.Config.DEFAULT), 9600, {})
 
-        self.assertEqual(set(state), set(self.baseline["state"]["keys"]))
+        self.assertTrue(set(self.baseline["state"]["keys"]).issubset(state))
+        self.assertIn("platformInfo", state)
         self.assertFalse(state["degraded"])
 
 

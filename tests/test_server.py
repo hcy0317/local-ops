@@ -336,7 +336,12 @@ class ProjectDetectionTests(unittest.TestCase):
             result, error = server.detect_project(td)
 
         self.assertIsNone(error)
-        self.assertEqual(result["candidates"], [
+        legacy_fields = (
+            "command", "label", "source", "port", "kind", "detail")
+        self.assertEqual([
+            {key: item[key] for key in legacy_fields}
+            for item in result["candidates"]
+        ], [
             {"command": "hexo s", "label": "Hexo 本地服务",
              "source": "Hexo 项目结构", "port": 4000,
              "kind": "service", "detail": "等同于 hexo server"},
@@ -344,6 +349,10 @@ class ProjectDetectionTests(unittest.TestCase):
              "source": "Hexo 项目结构", "port": None,
              "kind": "task", "detail": "清除缓存和已生成文件，不启动服务"},
         ])
+        for candidate in result["candidates"]:
+            self.assertEqual(candidate["commandSpec"]["version"], 1)
+            self.assertIn(candidate["platformCompatibility"]["status"],
+                          ("ready", "needs_review", "blocked"))
 
     def test_hexo_server_script_is_not_duplicated(self):
         with tempfile.TemporaryDirectory() as td:
@@ -384,6 +393,98 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(oct(os.stat(path + ".bak").st_mode & 0o777),
                              "0o600")
 
+    def test_post_replace_acl_failure_keeps_memory_and_disk_consistent(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            cfg = server.Config(path)
+            replacement = cfg.snapshot()
+            replacement["watchedKeywords"] = ["import-applied"]
+            expected_hash = server.config_hash(cfg.snapshot())
+            original_ensure = server.PLATFORM.ensure_private_file
+
+            def fail_final_main_verification(candidate):
+                if os.path.abspath(candidate) == os.path.abspath(path):
+                    raise OSError("final ACL verification failed")
+                return original_ensure(candidate)
+
+            with mock.patch.object(
+                server.PLATFORM,
+                "ensure_private_file",
+                side_effect=fail_final_main_verification,
+            ):
+                replaced = cfg.replace_if_hash(expected_hash, replacement)
+
+            with open(path, encoding="utf-8") as handle:
+                disk = json.load(handle)
+            self.assertTrue(replaced)
+            self.assertEqual(cfg.snapshot(), disk)
+            self.assertEqual(disk["watchedKeywords"], ["import-applied"])
+            self.assertFalse(cfg.health_info()["writable"])
+            self.assertIn(
+                "配置文件提交后权限验证失败，已进入只读保护",
+                cfg.health_info()["issues"],
+            )
+
+    def test_post_replace_backup_acl_failure_stops_before_main_write(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            cfg = server.Config(path)
+            before = cfg.snapshot()
+            original_ensure = server.PLATFORM.ensure_private_file
+
+            def fail_final_backup_verification(candidate):
+                if os.path.abspath(candidate) == os.path.abspath(path + ".bak"):
+                    raise OSError("backup ACL verification failed")
+                return original_ensure(candidate)
+
+            with mock.patch.object(
+                server.PLATFORM,
+                "ensure_private_file",
+                side_effect=fail_final_backup_verification,
+            ), self.assertRaises(OSError):
+                cfg.update(
+                    lambda data: data["watchedKeywords"].append("must-not-commit")
+                )
+
+            with open(path, encoding="utf-8") as handle:
+                disk = json.load(handle)
+            self.assertEqual(cfg.snapshot(), before)
+            self.assertEqual(disk, before)
+            self.assertFalse(cfg.health_info()["writable"])
+
+    def test_import_cas_writes_the_validated_payload_without_reprobing(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            cfg = server.Config(path)
+            replacement = cfg.snapshot()
+            replacement["apps"] = [{
+                **server.Config.APP_DEFAULT,
+                "id": "deadbeef",
+                "name": "Already validated",
+                "command": "display only",
+                "commandSpec": server.direct_command_spec("runtime.exe"),
+                "importStatus": "ready",
+            }]
+            expected_hash = server.config_hash(cfg.snapshot())
+
+            with mock.patch.object(
+                cfg,
+                "_normalize",
+                side_effect=AssertionError("must not probe twice"),
+            ):
+                replaced = cfg.replace_normalized_if_hash(
+                    expected_hash, replacement
+                )
+
+            with open(path, encoding="utf-8") as handle:
+                disk = json.load(handle)
+            self.assertTrue(replaced)
+            self.assertEqual(cfg.snapshot(), replacement)
+            self.assertEqual(disk, replacement)
+            self.assertEqual(
+                server.config_hash(disk), server.config_hash(replacement)
+            )
+
     def test_load_falls_back_to_backup(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "config.json")
@@ -415,7 +516,7 @@ class ConfigTests(unittest.TestCase):
                 migrated = json.load(f)
             with open(path + ".bak", "r", encoding="utf-8") as f:
                 previous = json.load(f)
-            self.assertEqual(migrated["schemaVersion"], 1)
+            self.assertEqual(migrated["schemaVersion"], 2)
             self.assertNotIn("schemaVersion", previous)
 
             # 第二次读取已是当前 schema，不再改写备份。
@@ -425,6 +526,39 @@ class ConfigTests(unittest.TestCase):
             self.assertIsNone(cfg2.health_info()["migratedFromSchema"])
             with open(path + ".bak", "rb") as f:
                 self.assertEqual(f.read(), previous_bytes)
+
+    def test_schema_v1_to_v2_is_additive_and_idempotent(self):
+        legacy_app = {
+            "id": "deadbeef",
+            "name": "Legacy service",
+            "command": "python3 -m http.server 8000",
+            "cwd": "/Users/example/Project",
+            "port": 8000,
+            "lastPid": 123,
+            "lastPgid": 123,
+            "runToken": "legacy-token",
+            "attached": False,
+        }
+        schema_v1 = {
+            **server.Config.DEFAULT,
+            "schemaVersion": 1,
+            "apps": [legacy_app],
+        }
+
+        migrated, source_version = server.migrate_config(schema_v1)
+        migrated_again, current_source = server.migrate_config(migrated)
+
+        self.assertEqual(source_version, 1)
+        self.assertEqual(current_source, 2)
+        self.assertEqual(migrated_again, migrated)
+        app = migrated["apps"][0]
+        self.assertEqual(app["command"], legacy_app["command"])
+        self.assertEqual(app["lastPid"], 123)
+        self.assertEqual(app["runToken"], "legacy-token")
+        self.assertEqual(app["commandSpec"]["mode"], "legacy-posix")
+        self.assertTrue(app["commandSpec"]["needsReview"])
+        self.assertIsNone(app["runtimeIdentity"])
+        self.assertEqual(app["importStatus"], "needs_review")
 
     def test_future_schema_is_not_silently_overwritten(self):
         with tempfile.TemporaryDirectory() as td:

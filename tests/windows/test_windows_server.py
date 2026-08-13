@@ -9,6 +9,8 @@ import unittest
 from unittest import mock
 
 import server
+from localops.command_spec import direct_command_spec
+from localops.platform.contracts import PickResult, PlatformIssue
 
 
 class HttpHarness:
@@ -70,6 +72,117 @@ class WindowsServerTests(unittest.TestCase):
                 "launch_managed", "stop_managed", "force_stop_managed",
                 "kill_external", "attach_external", "restart_console"):
             self.assertFalse(state["capabilities"][capability])
+
+    def test_phase3_path_routes_use_stable_error_codes(self):
+        status, body, _ = self.harness.request(
+            "POST", "/api/project/detect", {"cwd": ""}, self.headers
+        )
+        self.assertEqual((status, body["code"]), (400, "INVALID_PATH"))
+
+        issue = PlatformIssue("picker", "os_error", "sensitive detail")
+        with mock.patch.object(
+                server.PLATFORM, "pick_path",
+                return_value=PickResult(issue=issue)):
+            status, body, _ = self.harness.request(
+                "POST", "/api/pick", {"what": "dir"}, self.headers
+            )
+        self.assertEqual((status, body["code"]), (500, "PICKER_UNAVAILABLE"))
+        self.assertNotIn("sensitive detail", body["error"])
+
+    def test_create_and_cwd_update_derive_import_status(self):
+        runtime = os.path.join(self.harness.temp_dir.name, "runner.exe")
+        with open(runtime, "wb") as handle:
+            handle.write(b"static preflight only")
+        payload = {
+            "name": "Structured app",
+            "command": runtime,
+            "commandSpec": direct_command_spec(runtime),
+            "cwd": self.harness.temp_dir.name,
+            "port": None,
+            "kind": "service",
+        }
+        status, created, _ = self.harness.request(
+            "POST", "/api/apps", payload, self.headers
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(created["importStatus"], "ready")
+
+        missing_cwd = os.path.join(self.harness.temp_dir.name, "missing")
+        status, updated, _ = self.harness.request(
+            "PUT", "/api/apps/%s" % created["id"],
+            {"cwd": missing_cwd}, self.headers
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["importStatus"], "blocked")
+
+    def test_config_import_http_preview_commit_and_rollback(self):
+        source_root = "/Users/alice/Projects"
+        target_root = self.harness.temp_dir.name
+        mapped_cwd = os.path.join(target_root, "demo")
+        os.mkdir(mapped_cwd)
+        source_path = os.path.join(target_root, "macos-config.json")
+        source = {
+            "schemaVersion": 1,
+            "apps": [{
+                "id": "deadbeef",
+                "name": "Imported demo",
+                "command": "python3 app.py",
+                "cwd": source_root + "/demo",
+                "port": 8000,
+                "kind": "service",
+                "lastPid": 123,
+                "lastPgid": 123,
+                "runToken": "must-be-cleared",
+                "attached": True,
+            }],
+        }
+        with open(source_path, "w", encoding="utf-8") as handle:
+            json.dump(source, handle)
+        payload = {
+            "sourcePath": source_path,
+            "pathMappings": [{
+                "sourceRoot": source_root,
+                "targetRoot": target_root,
+            }],
+        }
+        records_dir = os.path.join(target_root, "imports")
+        with mock.patch.object(server, "IMPORT_RECORDS_DIR", records_dir):
+            status, preview, _ = self.harness.request(
+                "POST", "/api/config/import/preview", payload, self.headers
+            )
+            self.assertEqual(status, 200)
+            self.assertFalse(os.path.exists(records_dir))
+            self.assertEqual(preview["apps"][0]["status"], "needs_review")
+            self.assertEqual(preview["apps"][0]["cwd"], mapped_cwd)
+
+            status, committed, _ = self.harness.request(
+                "POST",
+                "/api/config/import/commit",
+                {
+                    **payload,
+                    "previewId": preview["previewId"],
+                    "selectedAppIds": ["deadbeef"],
+                },
+                self.headers,
+            )
+            self.assertEqual(status, 200)
+            imported = self.harness.cfg.snapshot()["apps"][0]
+            self.assertEqual(imported["cwd"], mapped_cwd)
+            self.assertEqual(imported["importStatus"], "needs_review")
+            self.assertIsNone(imported["lastPid"])
+            self.assertIsNone(imported["lastPgid"])
+            self.assertIsNone(imported["runToken"])
+            self.assertFalse(imported["attached"])
+
+            status, rolled_back, _ = self.harness.request(
+                "POST",
+                "/api/config/import/rollback",
+                {"importId": committed["importId"]},
+                self.headers,
+            )
+        self.assertEqual(status, 200)
+        self.assertFalse(rolled_back["idempotent"])
+        self.assertEqual(self.harness.cfg.snapshot()["apps"], [])
 
     def test_acl_failure_keeps_configuration_read_only(self):
         with tempfile.TemporaryDirectory() as temp_dir, \

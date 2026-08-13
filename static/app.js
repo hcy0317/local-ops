@@ -8,12 +8,14 @@ import { $, el, setText, setChildren, icon, escapeHtml,
   currentUiTheme, reconcilePendingUiTheme, trapLayerFocus,
   openLayer, closeLayer, activeLayer,
   currentMutationEpoch, taskNotificationsEnabled, toggleTaskNotifications,
-  localServiceUrl } from './js/core.js';
+  localServiceUrl, platformPresentation, shortcutLabel,
+  hasCapability } from './js/core.js';
 import { renderLaunchpad, toggleApp, closePortDiagnostic, closeAppDiagnosis } from './js/launchpad.js';
 import { renderServices, observePortDiscovery,
   suspendPortDiscovery } from './js/services.js';
 import { initWidgets, renderWidgets, openLogsCenter, closeLogsCenter,
-  openSettingsCenter, closeSettingsCenter, resetFeedBaseline } from './js/widgets.js';
+  openSettingsCenter, closeSettingsCenter, closeImportWizard,
+  resetFeedBaseline } from './js/widgets.js';
 import { buildGlyphGrid, initAppModal, initLogDrawer, openConfirm,
   openAppModal, closeAppModal, closeConfirm, openLogs, closeLogs,
   openConsoleLog } from './js/overlays.js';
@@ -244,8 +246,7 @@ function setConnected(ok, message = '') {
   banner.setAttribute('aria-hidden', String(!notice));
 }
 function consoleLifecycleSupported() {
-  return state.data && state.data.capabilities &&
-    state.data.capabilities.restart_console === true;
+  return hasCapability('restart_console');
 }
 function render() {
   if (!state.data) return;
@@ -261,7 +262,7 @@ function render() {
   stopConsoleBtn.disabled = !lifecycleSupported || !!state.restartingFrom || state.stopping;
   restartConsoleBtn.classList.toggle('needs-activation', !restartSupported);
   restartConsoleBtn.classList.toggle('restarting', !!state.restartingFrom);
-  const unavailableTitle = '当前平台或阶段未启用总控台控制';
+  const unavailableTitle = platformPresentation().lifecycleNotice;
   restartConsoleBtn.setAttribute('aria-label', !lifecycleSupported
     ? unavailableTitle : restartSupported ? '重启总控台' : '启用一键重启');
   restartConsoleBtn.title = !lifecycleSupported ? unavailableTitle : restartSupported
@@ -287,11 +288,12 @@ function render() {
 }
 
 function showConsoleActivationInfo(action) {
+  const launchInstruction = platformPresentation().launchInstruction;
   openConfirm({
     title: '先启用后台控制',
     bodyHtml: '当前 <b>' + escapeHtml(consolePortLabel.textContent || '总控台') +
       '</b> 是修改前启动的旧后台，所以页面还不能直接' + escapeHtml(action) + '。' +
-      '<div class="confirm-detail">请双击项目里的 <b>总控台.app</b>，在弹窗中选择“重新启动”。只需做这一次；以后就能直接在页面里重启或停止。</div>',
+      '<div class="confirm-detail">' + escapeHtml(launchInstruction) + '</div>',
     okText: '知道了',
     tone: 'primary',
     onOk: () => {},
@@ -313,6 +315,10 @@ restartConsoleBtn.addEventListener('click', () => {
     okText: '重新启动',
     tone: 'primary',
     onOk: async () => {
+      if (!consoleLifecycleSupported()) {
+        toast(platformPresentation().lifecycleNotice);
+        return;
+      }
       suspendPortDiscovery();
       state.restartingFrom = consolePid;
       banner.dataset.connection = 'down';
@@ -333,7 +339,7 @@ restartConsoleBtn.addEventListener('click', () => {
       restartDeadlineTimer = setTimeout(() => {
         if (!state.restartingFrom) return;
         state.restartingFrom = null;
-        setConnected(false, '总控台重启超时，请双击“总控台.app”重新打开。');
+        setConnected(false, '总控台重启超时。' + platformPresentation().launchInstruction);
         render();
       }, 25000);
     },
@@ -351,12 +357,17 @@ stopConsoleBtn.addEventListener('click', () => {
   openConfirm({
     title: '停止总控台',
     bodyHtml: '确定要停止总控台吗？' +
-      '<div class="confirm-detail">当前页面会断开；启动台里已经运行的应用不会被停止。再次使用时，双击“总控台.app”即可。</div>',
+      '<div class="confirm-detail">当前页面会断开；启动台里已经运行的应用不会被停止。' +
+      escapeHtml(platformPresentation().launchInstruction) + '</div>',
     okText: '停止运行',
     onOk: async () => {
+      if (!consoleLifecycleSupported()) {
+        toast(platformPresentation().lifecycleNotice);
+        return;
+      }
       state.stopping = true;
       banner.dataset.connection = 'down';
-      banner.textContent = '总控台正在停止…再次启动请双击“总控台.app”。';
+      banner.textContent = '总控台正在停止…' + platformPresentation().launchInstruction;
       banner.classList.add('show');
       banner.setAttribute('aria-hidden', 'false');
       render();
@@ -367,13 +378,13 @@ stopConsoleBtn.addEventListener('click', () => {
         render();
         return;
       }
-      banner.textContent = '总控台已停止。再次启动请双击“总控台.app”。';
+      banner.textContent = '总控台已停止。' + platformPresentation().launchInstruction;
     },
   });
 });
 
 /* ============================================================
-   命令面板（⌘K）
+   命令面板
    ============================================================ */
 const paletteMask = $('#paletteMask'), paletteInput = $('#paletteInput');
 const paletteList = $('#paletteList');
@@ -393,6 +404,15 @@ function appPortHint(app) {
 function openableAppPort(app) {
   return app && app.running && portIsOpenable(app)
     ? preferredOpenPort(app) : null;
+}
+
+async function restartAppFromPalette(id) {
+  if (!hasCapability('stop_managed') || !hasCapability('launch_managed')) {
+    toast(platformPresentation().lifecycleNotice);
+    return;
+  }
+  const result = await act(post('/api/apps/' + id + '/restart', {}));
+  if (result && result.ok !== false && window.__poll) window.__poll();
 }
 
 function paletteActions() {
@@ -422,18 +442,22 @@ function paletteActions() {
     const isTask = (a.kind || 'service') === 'task';
     const port = openableAppPort(a);
     const name = a.name || '未命名';
-    items.push({
-      icon: running ? 'square' : 'play',
-      title: (running ? (isTask ? '中止 ' : '停止 ')
-        : (isTask ? '运行 ' : '启动 ')) + name,
-      hint: isTask ? '任务' : appPortHint(a),
-      on: running,
-      run: () => toggleApp(a.id),
-    });
-    if (running && !isTask) {
+    const canToggle = hasCapability(running ? 'stop_managed' : 'launch_managed');
+    if (canToggle) {
+      items.push({
+        icon: running ? 'square' : 'play',
+        title: (running ? (isTask ? '中止 ' : '停止 ')
+          : (isTask ? '运行 ' : '启动 ')) + name,
+        hint: isTask ? '任务' : appPortHint(a),
+        on: running,
+        run: () => toggleApp(a.id),
+      });
+    }
+    if (running && !isTask && hasCapability('stop_managed') &&
+        hasCapability('launch_managed')) {
       items.push({
         icon: 'refresh-cw', title: '重启 ' + name, hint: '重新启动', on: true,
-        run: () => act(post('/api/apps/' + a.id + '/restart', {})),
+        run: () => restartAppFromPalette(a.id),
       });
     }
     if (running && port) {
@@ -450,7 +474,7 @@ function paletteActions() {
   items.push({
     icon: 'file-text',
     title: '打开日志中心',
-    hint: '日志 · ⌘J',
+    hint: '日志 · ' + shortcutLabel('J'),
     run: openLogsCenter,
   });
   items.push({
@@ -470,7 +494,7 @@ function paletteActions() {
   items.push({
     icon: 'terminal',
     title: '总控台日志',
-    hint: '系统 · data/logs/console.log',
+    hint: platformPresentation().logsDir || '系统日志',
     run: openConsoleLog,
   });
   return items;
@@ -575,7 +599,7 @@ paletteInput.addEventListener('keydown', e => {
 });
 paletteMask.addEventListener('mousedown', e => { if (e.target === paletteMask) closePalette(); });
 
-/* ⌘K / Ctrl+K 呼出命令面板 */
+/* 使用平台对应的修饰键呼出命令面板。 */
 document.addEventListener('keydown', e => {
   if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k') {
     e.preventDefault();
@@ -583,7 +607,7 @@ document.addEventListener('keydown', e => {
     else if (!activeLayer()) openPalette();
   }
 });
-/* ⌘J / Ctrl+J 呼出日志中心（⌘L 是浏览器地址栏保留键，无法拦截） */
+/* 使用平台对应的修饰键呼出日志中心。 */
 document.addEventListener('keydown', e => {
   if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'j') {
     e.preventDefault();
@@ -598,6 +622,7 @@ document.addEventListener('keydown', e => {
   trapLayerFocus(e);
   if (e.key === 'Escape') {
     if ($('#confirmMask').classList.contains('open')) closeConfirm();
+    else if ($('#importMask').classList.contains('open')) closeImportWizard();
     else if ($('#logsMask').classList.contains('open')) closeLogsCenter();
     else if ($('#settingsMask').classList.contains('open')) closeSettingsCenter();
     else if ($('#portDiagMask').classList.contains('open')) closePortDiagnostic();

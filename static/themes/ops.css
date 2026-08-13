@@ -17,7 +17,7 @@
 :root {
   color-scheme: light;
 
-  --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text',
+  --font-sans: 'Segoe UI Variable', 'Segoe UI', -apple-system, BlinkMacSystemFont, 'SF Pro Text',
     'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
   --font-mono: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
 
@@ -723,6 +723,14 @@ body.dragging-on { cursor: grabbing; user-select: none; -webkit-user-select: non
 .input-row input { flex: 1; }
 .input-row .btn { flex: none; height: 38px; }
 .hint { margin: 8px 0 0; font-family: var(--font-mono); font-size: 10px; color: var(--ink-4); line-height: 1.55; }
+.command-compatibility {
+  margin: 7px 0 0; padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: 8px;
+  background: var(--card-2); color: var(--ink-2);
+  font-size: 11px; line-height: 1.5;
+}
+.command-compatibility.needs-review { border-color: color-mix(in srgb, var(--amber) 50%, var(--line)); }
+.command-compatibility.blocked { border-color: color-mix(in srgb, var(--red) 50%, var(--line)); color: var(--red); }
 .link-btn { font-size: 12px; font-weight: 600; color: var(--accent); }
 .link-btn:hover:not(:disabled) { text-decoration: underline; text-underline-offset: 3px; }
 .link-btn:disabled { color: var(--ink-4); cursor: default; }
@@ -839,6 +847,36 @@ body.dragging-on { cursor: grabbing; user-select: none; -webkit-user-select: non
   display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px;
   margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--line);
 }
+
+/* 配置导入 */
+.import-modal { width: 720px; }
+.import-intro { margin: -7px 0 18px; color: var(--ink-3); font-size: 12px; line-height: 1.65; }
+.import-mapping-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.import-mapping-head strong { font-size: 12.5px; color: var(--ink-2); }
+.import-mapping-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.import-mapping-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+.import-mapping-row input {
+  min-width: 0; width: 100%; padding: 8px 10px;
+  border: 1px solid var(--line-2); border-radius: 8px;
+  background: var(--card); color: var(--ink); font-family: var(--font-mono); font-size: 11px;
+}
+.import-mapping-row input:focus { outline: none; border-color: var(--accent); box-shadow: var(--focus-ring); }
+.import-result { margin-top: 16px; }
+.import-summary { padding: 10px 12px; border-radius: 8px; background: var(--card-2); font-size: 11.5px; color: var(--ink-2); }
+.import-app-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; max-height: 280px; overflow-y: auto; }
+.import-app-item {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; align-items: start;
+  padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--card);
+}
+.import-app-item input { margin-top: 2px; accent-color: var(--accent); }
+.import-app-item.is-disabled { background: var(--card-2); color: var(--ink-4); }
+.import-app-main { min-width: 0; }
+.import-app-name { display: block; font-size: 12px; font-weight: 700; }
+.import-app-detail { display: block; margin-top: 3px; color: var(--ink-4); font-family: var(--font-mono); font-size: 9.5px; overflow-wrap: anywhere; }
+.import-app-status { font-family: var(--font-mono); font-size: 9px; font-weight: 700; color: var(--green); }
+.import-app-status.needs-review { color: var(--amber); }
+.import-app-status.blocked,
+.import-app-status.conflict { color: var(--red); }
 
 /* 端口诊断 + 启动诊断 */
 .diag-summary {

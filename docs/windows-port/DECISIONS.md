@@ -137,3 +137,43 @@
 - Decision: Track loopback connection state independently from the shared status banner. Degraded scans, read-only protection, backup recovery, and schema notices may show the banner without changing the connection indicator.
 - Reason: A protected-process partial snapshot is a successful but degraded response. Treating any visible notice as a disconnect hides the distinction users need to decide whether data is stale or merely incomplete.
 - Consequence: Windows can truthfully display both `已连接` and a degraded notice; actual poll failures and console transitions still switch the connection indicator to disconnected.
+
+## P3-D001 — Add schema v2 without replacing legacy command data
+
+- Status: Accepted
+- Phase: P3
+- Decision: Add `commandSpec`, `runtimeIdentity`, and `importStatus` through an idempotent v1→v2 migration while preserving the existing `command` field and macOS behavior. Explicit cross-platform imports clear runtime identity; an in-place migration does not guess a Windows owner from legacy PID/token fields.
+- Reason: Existing configuration is user data and the macOS command string remains a compatibility asset, but stale process identity is not portable ownership proof.
+- Consequence: Older clients retain display data, Windows receives a structured compatibility model, and Phase 4 must create a new validated runtime identity.
+
+## P3-D002 — Keep command preparation structured and non-executing
+
+- Status: Accepted
+- Phase: P3
+- Decision: Represent direct, structured cmd, structured PowerShell, raw shell, and legacy POSIX commands as a fixed tagged union. Structured argv stays as separate values and is never reconstructed by parsing the display string. Phase 3 may stat local files and PATH entries but never spawn, probe a version, access the network, or execute a command.
+- Reason: cmd and PowerShell have incompatible expansion rules; a universal quoting helper would create injection and corruption risks.
+- Consequence: POSIX/raw shell text remains review-only, unsafe cmd values fail closed, and UNC/device paths are rejected before any filesystem probe.
+
+## P3-D003 — Make configuration import explicit and receipt-backed
+
+- Status: Accepted
+- Phase: P3
+- Decision: Import only from an explicit local regular JSON file through deterministic preview, explicit path mappings, selected-app validation, target-hash CAS commit, private source/before/receipt records, and post-hash CAS rollback. Never auto-discover, overwrite an existing app ID, or import logs/process identity.
+- Reason: Cross-platform migration is a data transaction, not a best-effort file copy. Users need to see blocked/review decisions before anything changes and must not lose edits made after import.
+- Consequence: Preview is zero-write; commit and rollback are retryable/idempotent, including recoverable `prepared` states after transient writer or receipt failures.
+
+## P3-D004 — Treat platform presentation as backend state
+
+- Status: Accepted
+- Phase: P3
+- Decision: Return shortcut modifier, data/log paths, console-log path, launch instruction, and lifecycle notice in `platformInfo`; the browser consumes native picker/project fields without POSIX quoting, `/` path splitting, or `/Users` home inference.
+- Reason: The backend owns native path and capability truth. Reconstructing it in JavaScript creates divergent and unsafe platform behavior.
+- Consequence: Windows shows Ctrl, native paths, and accurate disabled-operation copy while macOS keeps its existing command/data fields.
+
+## P3-D005 — Preserve the Phase 4 lifecycle boundary
+
+- Status: Accepted
+- Phase: P3
+- Decision: Do not add a Windows runner, Job Object, generation, IPC controller, runtime receipt, or lifecycle side effect in Phase 3. Adapter capabilities, HTTP routes, and UI handlers continue to reject or hide start/stop/restart/attach/kill/console-control paths.
+- Reason: A structured command is not process ownership. Safe Windows control requires the Phase 4 identity and generation model.
+- Consequence: Phase 3 can be accepted independently while every Windows lifecycle request still fails before configuration or process mutation.

@@ -260,4 +260,71 @@ python -m unittest discover -s tests/contract -p 'test_*.py' -v
 | Windows Phase 2 control gate | PASS | Lifecycle remains disabled until Phase 4; adapter, HTTP, browser controls, and no-side-effect tests agree |
 | Windows package/clean VM | SKIPPED | Packaging belongs to Phase 5 |
 
-The current Windows 11 Phase 2 target is `PASS`. The original cross-version Phase 2 gate is still `IMPLEMENTED_UNVERIFIED` because Windows 10 is deferred, not tested. Phase 3 remains untouched.
+The Windows 11 Phase 2 target was `PASS`. The original cross-version Phase 2 gate remains open because Windows 10 is deferred, not tested. Phase 3 began only after separate user authorization.
+
+---
+
+## Phase 3 evidence
+
+### Windows Python 3.12 command, schema, import, and HTTP suite — PASS
+
+```powershell
+& "$env:TEMP\localops-phase3-win11\venv\Scripts\python.exe" -m unittest discover -s tests\windows -p 'test_*.py'
+```
+
+- Passed: 50
+- Failed/errors/skipped: 0
+- Duration: 6.676 seconds
+- Covered: CommandSpec tagged-union validation, literal special-character argv, cmd/PowerShell isolation, PATHEXT/npm/pnpm shims, explicit Python 3.12 selection, static preflight, UNC/device zero-probe rejection, schema v2 migration, structured picker/project candidates, Windows adapter behavior, import HTTP preview/commit/rollback, and lifecycle 409/no-side-effect controls.
+
+### Shared contract suite — PASS with one environment skip
+
+```powershell
+& "$env:TEMP\localops-phase3-win11\venv\Scripts\python.exe" -m unittest discover -s tests\contract -p 'test_*.py'
+```
+
+- Passed: 31
+- Skipped: 1
+- Failed/errors: 0
+- Total: 32
+- Duration: 0.584 seconds
+- Skip: the non-admin Windows 11 session cannot create the source symlink needed for the explicit symlink rejection case (`WinError 1314`). Regular-file, oversize, malformed-field, UNC/device, conflict, identity clearing, CAS, prepared-state recovery, idempotency, and rollback tests all ran.
+
+### Transaction failure recovery — PASS
+
+- Injected final receipt failure plus compensation-CAS failure: a later identical commit reconciled the `prepared` receipt and returned idempotent success.
+- Injected rollback CAS failure: `rollback_prepared` remained retryable and restored the exact pre-import target.
+- Deleted private `before.json`: rollback returned the stable server-side `IMPORT_ROLLBACK_FAILED` code instead of a client path error.
+- Injected post-`os.replace` ACL verification failure: in-memory and on-disk configuration stayed on the committed bytes, writes changed to read-only protection, and the import receipt remained recoverable.
+- Changed cwd/PATH availability after commit: identical commit retry and rollback used deterministic hashes without re-running environment probes, while genuinely new commits still ran dynamic validation.
+- Verified that receipt `postHash`, the in-memory snapshot, and the exact JSON written to disk remain identical even when dynamic preflight results could otherwise change.
+
+### Real isolated Windows 11 API flow — PASS
+
+- Source server: Python 3.12, non-admin Windows 11, isolated data/log directories, `http://127.0.0.1:9608/`.
+- `/api/state`: `platform=windows`, `schemaVersion=2`, `launch_managed=false`.
+- Preview classified the legacy POSIX app as `needs_review`, mapped `/Users/example/Projects/legacy app` to the explicit local Windows root, and created no target config or import record.
+- Commit imported one selected app, retained `needs_review`, and cleared `lastPid`, `lastPgid`, `runToken`, `attached`, and `runtimeIdentity`; an identical retry returned the same `importId` with `idempotent=true`.
+- `POST /api/apps/deadbeef/start` returned HTTP 409 with `CAPABILITY_DISABLED` and did not start a process.
+- A UNC mapping preview returned HTTP 400 with `INVALID_PATH` before a network probe.
+- Rollback succeeded and the final state contained zero imported apps.
+
+### Frontend and supporting checks
+
+- Frontend contract: 20/21 PASS. The sole failure is the pre-existing partial-checkout absence of `static/assets/console-app-icon.png`; no substitute was generated.
+- JavaScript syntax: 8 files PASS.
+- Node port helpers: 7/7 PASS.
+- Shared HTTP security plus release/project bindings: 12/12 PASS.
+- Ruff, Python compileall, shared-core platform leak audit, and `git diff --check`: PASS.
+- Native `tools/check_project.py --skip-tests`: 9/11 PASS; Windows lacks `/bin/bash`, and the original tracked `AppIcon.icns` blob is not materialized.
+
+### Visual and cross-platform gates
+
+| Gate | Status | Evidence / limitation |
+| --- | --- | --- |
+| Phase 3 browser screenshot/click QA | NOT_RUN | `browser-harness --doctor` reports Chrome running but daemon/active CDP connections unavailable (0); no visual PASS is claimed |
+| Windows 10 non-admin | DEFERRED | Explicit user scope; no Win10 claim |
+| Phase 4 lifecycle | NOT_STARTED | No runner, Job Object, generation, runtime identity, or lifecycle side effect was added |
+| Windows Python 3.12 exact-commit CI | PENDING | Record the pushed candidate run/job before final P3 PASS |
+| macOS complete regression/release CI | PENDING | Record the pushed candidate run/job before final P3 PASS |
+| Windows package / clean VM | NOT_RUN | Phase 5 scope |

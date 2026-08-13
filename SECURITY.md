@@ -1,6 +1,6 @@
 # 安全政策
 
-macOS 总控台会以当前用户权限执行保存的 shell 命令，并提供启动、停止和结束本地进程的接口。Windows Phase 2 仅允许只读监控，所有进程控制与外部认领均在共享 HTTP 路由入口禁用。请把命令执行、身份校验、写接口授权、路径处理、配置完整性和敏感信息泄露问题视为高影响安全问题。
+macOS 总控台会以当前用户权限执行保存的 shell 命令，并提供启动、停止和结束本地进程的接口。Windows Phase 3 只允许监控、配置兼容和显式导入，所有命令执行、进程控制与外部认领均在共享 HTTP 路由入口禁用。请把命令执行、身份校验、写接口授权、路径处理、配置完整性和敏感信息泄露问题视为高影响安全问题。
 
 ## 支持范围
 
@@ -28,7 +28,7 @@ macOS 总控台会以当前用户权限执行保存的 shell 命令，并提供�
 
 - `~/Library/Application Support/总控台/config.json{,.bak}`；
 - `~/Library/Logs/总控台/` 中的日志；
-- `%LOCALAPPDATA%\LocalOps\config.json{,.bak}` 与其 `logs/`、`runtime/` 内容；
+- `%LOCALAPPDATA%\LocalOps\config.json{,.bak}` 与其 `imports/`、`logs/`、`runtime/` 内容；
 - 完整 shell 命令、个人工作目录、用户名和主目录路径；
 - PID、进程启动 token、访问令牌、密钥或环境变量；
 - 用户上传图标或其他不具备公开授权的文件。
@@ -42,6 +42,9 @@ macOS 总控台会以当前用户权限执行保存的 shell 命令，并提供�
 - 只有受信任的本地用户才能添加和执行命令。
 - 本地回环绑定不能替代 Host、Origin、控制令牌、当前 UID/SID 和受控进程身份校验。
 - Windows 私有文件和目录必须由当前 SID 所有，仅向当前用户、SYSTEM 和 Administrators 授权；`chmod` 结果不能作为 Windows 权限证明。
-- Windows Phase 2 的 capability flags 必须保持 `launch_managed/stop_managed/force_stop_managed/kill_external/attach_external/restart_console=false`。任何控制路径产生副作用都属于安全阻断问题。
+- Windows Phase 3 的 capability flags 必须保持 `launch_managed/stop_managed/force_stop_managed/kill_external/attach_external/restart_console=false`。任何控制路径产生副作用都属于安全阻断问题。
+- Windows 的 `commandSpec` 只用于结构化描述和静态预检；Phase 3 不创建进程、不解析展示字符串，也不把 POSIX shell 文本自动翻译成 cmd 或 PowerShell。
+- 配置导入只接受不超过 1 MiB 的显式本地常规文件。预览不得写配置或回执；提交与回滚必须使用配置哈希 CAS，拒绝 UNC、设备命名空间、冲突 ID 和发生后续修改的目标。
+- 导入和路径接口的错误响应只返回稳定错误码与通用说明，不得回显内部路径、命令输出、token、适配器异常或堆栈。
 
 修复准备公开前，维护者会尽量与报告者协调披露时间。请勿在修复可用前公开可直接利用的细节。

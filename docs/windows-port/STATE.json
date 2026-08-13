@@ -2,16 +2,16 @@
   "schemaVersion": 1,
   "task": "local-ops-windows-port",
   "baselineCommit": "a5c3adae1f1fa0bd9f0ac7b090ec422e285d0c0f",
-  "implementationCommit": "c5a31a860cb0d82a4abfc63aaf7e30eedb55556d",
-  "ciRun": "31686699247",
+  "implementationCommit": null,
+  "ciRun": null,
   "branch": "windows-port/phases-1-4",
-  "currentPhase": "P2",
+  "currentPhase": "P3",
   "phaseStatus": "IMPLEMENTED_UNVERIFIED",
-  "scopedTarget": "Windows 11 Phase 2",
-  "scopedTargetStatus": "PASS",
+  "scopedTarget": "Windows 11 Phase 3",
+  "scopedTargetStatus": "LOCAL_PASS",
   "windows10Status": "DEFERRED",
-  "lastGreenPhase": "P1",
-  "macosTests": "PASS",
+  "lastGreenPhase": "P2",
+  "macosTests": "PENDING_EXACT_COMMIT_CI",
   "windowsTests": "PASS",
   "windowsBetaReady": false,
   "changedFiles": [
@@ -27,11 +27,14 @@
     "docs/specs/windows-native-port.md",
     "docs/windows-port/PLAN.md",
     "docs/windows-port/BASELINE-CONTRACTS.json",
+    "docs/windows-port/API-CONTRACT-v2.md",
     "docs/windows-port/DECISIONS.md",
     "docs/windows-port/STATE.json",
     "docs/windows-port/STATUS.md",
     "docs/windows-port/TEST-EVIDENCE.md",
     "localops/__init__.py",
+    "localops/command_spec.py",
+    "localops/config_import.py",
     "localops/platform/__init__.py",
     "localops/platform/contracts.py",
     "localops/platform/fake.py",
@@ -42,13 +45,23 @@
     "requirements-windows.txt",
     "server.py",
     "static/app.js",
+    "static/base.css",
+    "static/index.html",
+    "static/js/core.js",
+    "static/js/launchpad.js",
+    "static/js/overlays.js",
+    "static/js/services.js",
     "static/js/widgets.js",
+    "static/themes/ops.css",
     "tests/contract/__init__.py",
     "tests/contract/test_baseline_golden.py",
     "tests/contract/test_platform_contract.py",
+    "tests/contract/test_config_import.py",
     "tests/windows/__init__.py",
     "tests/windows/test_windows_platform.py",
     "tests/windows/test_windows_server.py",
+    "tests/windows/test_command_spec.py",
+    "tests/windows/test_windows_phase3_contract.py",
     "tests/test_frontend.py",
     "tests/test_server.py",
     "tools/build_release.py",
@@ -72,26 +85,37 @@
     "P2-D003",
     "P2-D004",
     "P2-D005",
-    "P2-D006"
+    "P2-D006",
+    "P3-D001",
+    "P3-D002",
+    "P3-D003",
+    "P3-D004",
+    "P3-D005"
   ],
   "assumptions": [
     "The current local environment provides native Windows 11 non-admin evidence; macOS evidence comes from CI and Windows 10 is deferred."
   ],
   "knownBlockers": [],
   "deferredGates": [
-    "Windows 10 non-admin validation remains required to close the original cross-version Phase 2 gate."
+    "Windows 10 non-admin validation remains deferred by explicit user scope.",
+    "Windows lifecycle execution remains Phase 4 and has not started.",
+    "Windows packaging and clean-machine validation remain Phase 5."
   ],
   "knownFailures": [
     "The native Windows project checker passed 9 checks and failed only the existing Bash and missing AppIcon.icns host checks.",
-    "The frontend contract passed 15 of 16; the existing partial checkout lacks the original console-app-icon.png blob."
+    "The frontend contract passed 20 of 21; the existing partial checkout lacks the original console-app-icon.png blob."
+  ],
+  "verificationLimitations": [
+    "Phase 3 visual browser interaction is NOT_RUN because browser-harness reported no active Chrome/CDP connection; no visual PASS is claimed.",
+    "One symlink rejection test is skipped because this non-admin Windows session cannot create symlinks."
   ],
   "verifiedResults": [
-    "The Phase 2 Windows suite passed 16 of 16 tests and the shared contract suite passed 12 of 12.",
-    "The exact-candidate Windows 11 non-admin source/browser flow passed monitoring, connection/degraded semantics, a configuration write/read/remove round-trip, disabled UI controls, and HTTP 409 control rejection while the server remained live.",
-    "The real Windows 11 non-admin source-process smoke rejected a second writer and preserved a protected configuration DACL.",
-    "Ruff, compileall, the shared-core platform leak audit, git diff checks, Node port tests, and release/module checks passed.",
-    "CI run 31686699247 passed the Windows Python 3.12 adapter job and the macOS complete check/release job for implementation commit c5a31a8."
+    "The Phase 3 Windows Python 3.12 suite passed 50 of 50 tests.",
+    "The shared contract suite ran 32 tests: 31 passed and one privileged symlink case skipped.",
+    "An isolated Windows 11 API flow passed zero-write preview, explicit path mapping, identity-clearing and idempotent commit, lifecycle 409, UNC rejection, and rollback to zero imported apps.",
+    "Prepared commit and rollback receipts recovered after injected writer/finalization failures; deterministic receipt hashes did not re-probe a changed environment; post-replace ACL failure kept memory and disk consistent and entered read-only protection.",
+    "Ruff, compileall, JavaScript syntax, Node port tests, HTTP security checks, shared-core platform leak audit, and git diff checks passed."
   ],
-  "nextAction": "Stop after the Windows 11 Phase 2 PASS. Keep Windows 10 deferred and Phase 3 untouched until separate user authorization.",
-  "lastVerifiedAt": "2026-08-13T17:29:05+08:00"
+  "nextAction": "Commit and push the Phase 3 candidate, require Windows Python 3.12 and macOS complete regression/release CI, then stop before Phase 4.",
+  "lastVerifiedAt": "2026-08-13T19:57:32+08:00"
 }

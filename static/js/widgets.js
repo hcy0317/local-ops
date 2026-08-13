@@ -7,7 +7,8 @@
    ============================================================ */
 import { $, el, setText, setChildren, icon, state, fmtClock, taskExitStatus,
   openLayer, closeLayer, act, post, toast, escapeHtml, applyTheme,
-  taskNotificationsEnabled, toggleTaskNotifications } from './core.js';
+  taskNotificationsEnabled, toggleTaskNotifications, currentPlatform,
+  platformPresentation, shortcutLabel, hasCapability } from './core.js';
 import { openAppModal, openLogs, openConsoleLog, openConfirm } from './overlays.js';
 import { configuredPort } from './ports.js';
 
@@ -51,7 +52,10 @@ export function initWidgets() {
     else if (action === 'refresh' && window.__poll) window.__poll();
     else if (action === 'logs') openLogsCenter();
     else if (action === 'settings') openSettingsCenter();
-    else if (action === 'batch-stop') batchStopApps();
+    else if (action === 'batch-stop') {
+      if (!hasCapability('stop_managed')) return;
+      batchStopApps();
+    }
   });
   /* 导航轨动作按钮（非视图切换） */
   document.querySelectorAll('.rail-btn[data-action]').forEach(btn => {
@@ -70,6 +74,9 @@ export function initWidgets() {
   $('#settingsMask').addEventListener('mousedown', e => {
     if (e.target === $('#settingsMask')) closeSettingsCenter();
   });
+  for (const id of ['setCwd', 'setDataDir', 'setLogsDir']) {
+    $("#" + id).addEventListener('click', () => copySettingsPath(id));
+  }
   $('#setNotify').addEventListener('click', () => {
     toggleTaskNotifications();
     syncSettings();
@@ -112,6 +119,7 @@ export function initWidgets() {
     const tab = $('#tab-services');
     if (tab) tab.click();
   });
+  initImportWizard();
 }
 
 /* ---------------- 实时动态 / 实时告警 ----------------
@@ -313,8 +321,11 @@ function renderTips(data) {
     actionable = true;
   } else if (data.degraded) {
     text = '当前处于降级模式，部分组件数据可能不完整；可尝试重启总控台恢复。';
+  } else if (!hasCapability('launch_managed', data) || !hasCapability('stop_managed', data)) {
+    text = platformPresentation(data).lifecycleNotice;
   } else {
-    text = '所有服务运行正常。小技巧：按 ⌘K 打开命令面板，可以快速启动、停止任意应用。';
+    text = '所有服务运行正常。小技巧：按 ' + shortcutLabel('K', data) +
+      ' 打开命令面板，可以快速启动、停止任意应用。';
   }
   setText(tipsText, text);
   tipsAction.hidden = !actionable;
@@ -331,11 +342,18 @@ export function renderWidgets(data) {
   renderTopPortsInto(topPortsS, data);
   renderTopRes(data);
   renderTips(data);
+  setText($('#cmdkShortcut'), shortcutLabel('K', data));
+  setText($('#logsShortcut'), shortcutLabel('J', data));
+  setText($('#pasteShortcut'), shortcutLabel('V', data));
+  const batchStop = $('#batchStopAction');
+  const canStop = hasCapability('stop_managed', data);
+  batchStop.hidden = !canStop;
+  batchStop.disabled = !canStop;
   setText(railVer, data.version ? 'v' + data.version : 'v—');
 }
 
 /* ============================================================
-   日志中心（聚合弹层，⌘J）：所有应用与总控台日志的目录页
+   日志中心（聚合弹层）：所有应用与总控台日志的目录页
    ============================================================ */
 const logsMask = $('#logsMask'), logsList = $('#logsList');
 
@@ -384,7 +402,7 @@ function renderLogsList() {
   const name = el('span', 'logs-name');
   name.textContent = '总控台日志';
   const sub = el('span', 'logs-sub');
-  sub.textContent = '系统 · console.log';
+  sub.textContent = '系统 · ' + (platformPresentation().consoleLogPath || 'console.log');
   main.append(name, sub);
   row.append(box, main, icon('chevron-right', 14));
   row.addEventListener('click', () => {
@@ -421,21 +439,333 @@ function syncSettings() {
     tab.classList.toggle('active', tab.dataset.appearance === mode);
   }
   const d = state.data || {};
+  const presentation = platformPresentation(d);
+  const platform = currentPlatform(d);
+  setText($('#setPlatform'), platform === 'windows' ? 'Windows'
+    : platform === 'macos' || platform === 'darwin' ? 'macOS' : '—');
   setText($('#setVersion'), d.version ? 'v' + d.version : '—');
   setText($('#setPort'), d.consolePort ? ':' + d.consolePort : '—');
   setText($('#setCwd'), d.consoleCwd || '—');
+  setText($('#setDataDir'), presentation.dataDir || '—');
+  setText($('#setLogsDir'), presentation.logsDir || '—');
+  setText($('#setLaunchInstruction'), presentation.launchInstruction);
+  setText($('#setLifecycleNotice'), presentation.lifecycleNotice);
+  $('#setImportRow').hidden = platform !== 'windows';
+  const pathLabels = { setCwd: '工作目录', setDataDir: '数据目录', setLogsDir: '日志目录' };
+  for (const id of ['setCwd', 'setDataDir', 'setLogsDir']) {
+    const button = $("#" + id);
+    button.disabled = button.textContent === '—';
+    button.title = button.disabled ? '' : '复制路径';
+    button.setAttribute('aria-label', button.disabled ? pathLabels[id] + '不可用'
+      : '复制' + pathLabels[id] + '：' + button.textContent);
+  }
+}
+
+async function copySettingsPath(id) {
+  const value = $("#" + id).textContent.trim();
+  if (!value || value === '—') return;
+  try {
+    await navigator.clipboard.writeText(value);
+    toast('路径已复制');
+  } catch (_) {
+    toast('无法复制路径，请手动选择文本');
+  }
 }
 
 export function openSettingsCenter() {
   syncSettings();
   openLayer(settingsMask, $('#settingsMaskClose'));
 }
-export function closeSettingsCenter() { closeLayer(settingsMask); }
+export function closeSettingsCenter(restoreFocus = true) {
+  closeLayer(settingsMask, restoreFocus !== false);
+}
+
+/* ============================================================
+   Windows 配置导入：显式源文件 -> 预览 -> 选择 -> 提交/回滚
+   ============================================================ */
+const importMask = $('#importMask');
+const importSourcePath = $('#importSourcePath');
+const importMappingList = $('#importMappingList');
+const importResult = $('#importResult');
+const importSummary = $('#importSummary');
+const importAppList = $('#importAppList');
+const importStatus = $('#importStatus');
+const importPreviewButton = $('#importPreview');
+const importCommitButton = $('#importCommit');
+const importRollbackButton = $('#importRollback');
+const IMPORT_SELECTABLE_STATUSES = new Set(['ready', 'needs_review']);
+let importPreviewState = null;
+let importReceiptId = null;
+let importBusy = false;
+
+function setImportStatus(message) {
+  setText(importStatus, message || '');
+}
+
+function invalidateImportPreview() {
+  importPreviewState = null;
+  importResult.hidden = true;
+  importCommitButton.hidden = true;
+  importSourcePath.removeAttribute('aria-invalid');
+  for (const input of importMappingList.querySelectorAll('input')) {
+    input.removeAttribute('aria-invalid');
+  }
+  setImportStatus('');
+}
+
+function createImportMappingRow(values = {}) {
+  const row = el('div', 'import-mapping-row');
+  const source = el('input', 'mono import-source-root');
+  source.type = 'text';
+  source.placeholder = 'macOS source root';
+  source.setAttribute('aria-label', 'macOS 源目录');
+  source.setAttribute('aria-describedby', 'importMappingHint importStatus');
+  source.value = typeof values.sourceRoot === 'string' ? values.sourceRoot : '';
+  const target = el('input', 'mono import-target-root');
+  target.type = 'text';
+  target.placeholder = 'Windows target root';
+  target.setAttribute('aria-label', 'Windows 目标目录');
+  target.setAttribute('aria-describedby', 'importMappingHint importStatus');
+  target.value = typeof values.targetRoot === 'string' ? values.targetRoot : '';
+  const remove = el('button', 'btn import-mapping-remove');
+  remove.type = 'button';
+  remove.textContent = '移除';
+  remove.setAttribute('aria-label', '移除这条路径映射');
+  const changed = () => invalidateImportPreview();
+  source.addEventListener('input', changed);
+  target.addEventListener('input', changed);
+  remove.addEventListener('click', () => {
+    if (importMappingList.children.length === 1) {
+      source.value = '';
+      target.value = '';
+    } else {
+      row.remove();
+    }
+    invalidateImportPreview();
+  });
+  row.append(source, target, remove);
+  return row;
+}
+
+function readImportRequest() {
+  const sourcePath = importSourcePath.value.trim();
+  if (!sourcePath) {
+    setImportStatus('请先填写源配置文件路径。');
+    importSourcePath.setAttribute('aria-invalid', 'true');
+    importSourcePath.focus();
+    return null;
+  }
+  const pathMappings = [];
+  for (const row of importMappingList.querySelectorAll('.import-mapping-row')) {
+    const sourceRoot = row.querySelector('.import-source-root').value.trim();
+    const targetRoot = row.querySelector('.import-target-root').value.trim();
+    if (!sourceRoot && !targetRoot) continue;
+    if (!sourceRoot || !targetRoot) {
+      row.querySelector('.import-source-root').setAttribute(
+        'aria-invalid', String(!sourceRoot));
+      row.querySelector('.import-target-root').setAttribute(
+        'aria-invalid', String(!targetRoot));
+      setImportStatus('每条路径映射都必须同时填写源目录和目标目录。');
+      return null;
+    }
+    pathMappings.push({ sourceRoot, targetRoot });
+  }
+  return { sourcePath, pathMappings };
+}
+
+function importAppStatus(app) {
+  if (app && typeof app.status === 'string') return app.status;
+  if (app && typeof app.importStatus === 'string') return app.importStatus;
+  const compatibility = app && app.platformCompatibility;
+  return compatibility && typeof compatibility.status === 'string'
+    ? compatibility.status : 'blocked';
+}
+
+function importStatusLabel(status) {
+  return ({
+    ready: '可导入',
+    needs_review: '需要复核',
+    blocked: '已阻止',
+    conflict: '与现有应用冲突',
+  })[status] || '不可导入';
+}
+
+function importAppReasons(app) {
+  const reasons = Array.isArray(app && app.reasons) ? app.reasons
+    : Array.isArray(app && app.platformCompatibility && app.platformCompatibility.reasons)
+      ? app.platformCompatibility.reasons : [];
+  return reasons.map(reason => typeof reason === 'string' ? reason
+    : reason && typeof reason.message === 'string' ? reason.message : '')
+    .filter(Boolean).join('；');
+}
+
+function syncImportCommitState() {
+  const checked = importAppList.querySelectorAll(
+    'input[type="checkbox"][data-import-selectable="true"]:checked').length;
+  importCommitButton.disabled = importBusy || checked === 0;
+}
+
+function renderImportPreview(result) {
+  const summary = result && result.summary && typeof result.summary === 'object'
+    ? result.summary : {};
+  setText(importSummary,
+    '可导入 ' + (Number(summary.ready) || 0) +
+    ' · 需要复核 ' + (Number(summary.needs_review) || 0) +
+    ' · 已阻止 ' + (Number(summary.blocked) || 0) +
+    ' · 冲突 ' + (Number(summary.conflict) || 0));
+  importAppList.replaceChildren();
+  const apps = Array.isArray(result && result.apps) ? result.apps : [];
+  for (const app of apps) {
+    const status = importAppStatus(app);
+    const selectable = IMPORT_SELECTABLE_STATUSES.has(status);
+    const row = el('label', 'import-app-item' + (selectable ? '' : ' is-disabled'));
+    const checkbox = el('input');
+    checkbox.type = 'checkbox';
+    checkbox.value = app && app.id != null ? String(app.id) : '';
+    checkbox.dataset.importSelectable = String(selectable);
+    checkbox.disabled = !selectable || !checkbox.value;
+    checkbox.checked = selectable && !!checkbox.value;
+    checkbox.addEventListener('change', syncImportCommitState);
+    const copy = el('span', 'import-app-main');
+    const title = el('strong', 'import-app-name');
+    title.textContent = app && app.name ? app.name : '未命名应用';
+    const meta = el('span', 'import-app-detail');
+    meta.textContent = (app && (app.cwd || app.command)) || '没有可显示的路径或命令';
+    const reason = importAppReasons(app);
+    const detail = el('span', 'import-app-detail');
+    detail.textContent = reason || importStatusLabel(status);
+    copy.append(title, meta, detail);
+    const badge = el('span', 'import-app-status');
+    badge.dataset.status = status;
+    badge.classList.add(status.replace('_', '-'));
+    badge.textContent = importStatusLabel(status);
+    row.append(checkbox, copy, badge);
+    importAppList.appendChild(row);
+  }
+  if (!apps.length) {
+    const empty = el('p', 'import-empty');
+    empty.textContent = '源配置中没有可预览的应用。';
+    importAppList.appendChild(empty);
+  }
+  importResult.hidden = false;
+  importCommitButton.hidden = false;
+  syncImportCommitState();
+}
+
+function setImportBusy(value) {
+  importBusy = value;
+  importMask.setAttribute('aria-busy', String(value));
+  importPreviewButton.disabled = value;
+  importRollbackButton.disabled = value;
+  syncImportCommitState();
+}
+
+async function previewImport() {
+  if (importBusy || currentPlatform() !== 'windows') return;
+  const request = readImportRequest();
+  if (!request) return;
+  invalidateImportPreview();
+  setImportBusy(true);
+  setImportStatus('正在生成预览…');
+  const result = await act(post('/api/config/import/preview', request));
+  setImportBusy(false);
+  if (!result || result.ok === false) {
+    setImportStatus(result && result.error ? result.error : '无法生成导入预览。');
+    return;
+  }
+  if (!result.previewId) {
+    setImportStatus('预览响应缺少 previewId，未允许提交。');
+    return;
+  }
+  importPreviewState = { ...request, previewId: result.previewId };
+  renderImportPreview(result);
+  setImportStatus('预览已生成。请核对应用状态和路径后再提交。');
+}
+
+async function commitImport() {
+  if (importBusy || currentPlatform() !== 'windows' || !importPreviewState) return;
+  const selectedAppIds = [...importAppList.querySelectorAll(
+    'input[type="checkbox"][data-import-selectable="true"]:checked')]
+    .map(input => input.value).filter(Boolean);
+  if (!selectedAppIds.length) {
+    setImportStatus('请选择至少一个可导入的应用。');
+    return;
+  }
+  const request = {
+    sourcePath: importPreviewState.sourcePath,
+    pathMappings: importPreviewState.pathMappings,
+    previewId: importPreviewState.previewId,
+    selectedAppIds,
+  };
+  setImportBusy(true);
+  setImportStatus('正在提交所选应用…');
+  const result = await act(post('/api/config/import/commit', request));
+  setImportBusy(false);
+  if (!result || result.ok === false) {
+    setImportStatus(result && result.error ? result.error : '导入提交失败。');
+    return;
+  }
+  importReceiptId = typeof result.importId === 'string' ? result.importId : null;
+  importCommitButton.hidden = true;
+  importRollbackButton.hidden = !importReceiptId;
+  setImportStatus('导入已提交' + (importReceiptId ? '，可在此回滚本次导入。' : '。'));
+  if (window.__poll) window.__poll();
+}
+
+async function rollbackImport() {
+  if (importBusy || currentPlatform() !== 'windows' || !importReceiptId) return;
+  setImportBusy(true);
+  setImportStatus('正在回滚本次导入…');
+  const result = await act(post('/api/config/import/rollback', { importId: importReceiptId }));
+  setImportBusy(false);
+  if (!result || result.ok === false) {
+    setImportStatus(result && result.error ? result.error : '回滚失败。');
+    return;
+  }
+  importReceiptId = null;
+  importRollbackButton.hidden = true;
+  invalidateImportPreview();
+  setImportStatus('本次导入已回滚。');
+  if (window.__poll) window.__poll();
+}
+
+function initImportWizard() {
+  if (!importMappingList.children.length) {
+    importMappingList.appendChild(createImportMappingRow());
+  }
+  $('#setImportOpen').addEventListener('click', openImportWizard);
+  $('#importClose').addEventListener('click', closeImportWizard);
+  importMask.addEventListener('mousedown', event => {
+    if (event.target === importMask) closeImportWizard();
+  });
+  importSourcePath.addEventListener('input', invalidateImportPreview);
+  $('#importAddMapping').addEventListener('click', () => {
+    importMappingList.appendChild(createImportMappingRow());
+    invalidateImportPreview();
+  });
+  importPreviewButton.addEventListener('click', previewImport);
+  importCommitButton.addEventListener('click', commitImport);
+  importRollbackButton.addEventListener('click', rollbackImport);
+}
+
+export function openImportWizard() {
+  if (currentPlatform() !== 'windows') return;
+  const returnFocus = $('#rail-settings');
+  closeSettingsCenter(false);
+  importRollbackButton.hidden = !importReceiptId;
+  openLayer(importMask, importSourcePath, returnFocus);
+}
+
+export function closeImportWizard() { closeLayer(importMask); }
 
 /* ============================================================
    批量停止服务：确认后逐个走安全停止，绝不按端口结束进程
    ============================================================ */
 function batchStopApps() {
+  if (!hasCapability('stop_managed')) {
+    toast(platformPresentation().lifecycleNotice);
+    return;
+  }
   const running = ((state.data && state.data.apps) || []).filter(a => a.running);
   if (!running.length) {
     toast('当前没有运行中的应用');
@@ -450,6 +780,10 @@ function batchStopApps() {
     okText: '全部停止',
     tone: 'danger',
     onOk: async () => {
+      if (!hasCapability('stop_managed')) {
+        toast(platformPresentation().lifecycleNotice);
+        return;
+      }
       let stopped = 0;
       for (const app of running) {
         const result = await act(post('/api/apps/' + app.id + '/stop', {}));

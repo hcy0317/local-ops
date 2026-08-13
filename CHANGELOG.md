@@ -10,6 +10,9 @@
 
 ### Added
 
+- 增加 Windows Phase 3 兼容性源码预览：schema v2、`commandSpec`、静态命令预检、Windows 脚本/PATHEXT/npm/pnpm/Python 3.12 项目候选，以及平台化快捷键、路径和能力说明。
+- 设置中心增加显式 macOS 配置导入向导，支持零写入预览、路径映射、逐项选择、原子提交、幂等重试与 CAS 回滚；旧运行身份和进程状态不会被导入。
+- 增加 `docs/windows-port/API-CONTRACT-v2.md`，冻结 Phase 3 的配置、命令、路径选择、导入和稳定错误码契约。
 - 增加 Windows Phase 2 只读源码预览：Local AppData、SID/DACL、Named Mutex、`psutil` 进程/监听快照、原生路径选择器、独占回环端口语义和 Windows Python 3.12 CI。
 - `/api/state` 增加 `platform` 与 `capabilities`，供调用方识别当前平台实际开放的能力。
 - 顶栏新增 GitHub 仓库图标按钮，点击在新标签页打开项目源码仓库。
@@ -31,6 +34,7 @@
 
 ### Changed
 
+- Windows 浏览器界面现在完全按后端 platform/capabilities 呈现操作，并移除客户端 POSIX quote、`/Users/...` 路径推断和外部进程控制入口；生命周期仍保持禁用。
 - 默认将配置/图标移至 `~/Library/Application Support/总控台`，日志移至 `~/Library/Logs/总控台`。新目标不存在时仅首次复制旧 `data/`，不删除原文件。
 - `config.json.bak` 现保留修改前的上一份良好配置，而不是与主配置相同的副本。
 - 运行目录权限收紧为 `0700`，配置、图标和日志文件为 `0600`。
@@ -61,6 +65,7 @@
 
 ### Security
 
+- Phase 3 静态预检和配置导入在任何文件系统探针前拒绝 UNC/设备命名空间；导入源限制为 1 MiB 本地常规文件，事务回执可从 prepared 状态恢复，配置在原子替换后的 ACL 校验失败时保持内存/磁盘一致并转入只读保护。
 - Windows 私有目录和文件使用仅当前 SID、SYSTEM 与 Administrators 可访问的受保护 DACL；验证失败时配置进入只读保护。
 - Windows Phase 2 在 adapter 与 HTTP 路由双重禁用外部认领、进程结束、应用启停/重启和总控台重启，拒绝发生在配置或进程副作用之前。
 - 将用户配置、日志、图标、token 和临时发行产物排除出版本控制默认范围。

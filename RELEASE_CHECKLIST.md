@@ -36,6 +36,16 @@
 - [ ] Windows capability flags 禁用 attach/kill/start/stop/restart，相关 API 在扫描、写配置或控制进程前返回拒绝。
 - [ ] 未完成 Windows 10、完整生命周期与打包验收时，发行说明明确标记为只读源码预览，不使用 Beta 或 production-ready 表述。
 
+### Windows Phase 3 兼容性门禁
+
+- [ ] schema v1→v2 迁移幂等，旧 `command` 保留，future schema 保持只读且不会覆盖主文件或备份。
+- [ ] direct/cmd/PowerShell `commandSpec` 与特殊字符 argv 测试通过；静态预检不执行命令、不访问网络，并在 stat 前拒绝 UNC/设备路径。
+- [ ] 项目识别覆盖 `.cmd/.bat/.ps1`、PATHEXT、npm/pnpm shim 和明确的 Python 3.12 launcher；POSIX 命令只标记为待复核。
+- [ ] 配置导入 preview 零写入，commit 不覆盖目标并清空运行身份，重复提交幂等，CAS rollback 不丢弃后续用户修改。
+- [ ] 导入的 prepared/rollback_prepared 回执能在写入或 CAS 瞬时失败后安全重试；原子替换后的 ACL 校验失败保持内存/磁盘一致并进入只读保护。
+- [ ] Windows UI 不存在 start/stop/restart/attach/kill/batch-stop 可触发路径，HTTP 路由在任何配置或进程副作用前返回 `CAPABILITY_DISABLED`。
+- [ ] Windows 10 仍未验收或 Phase 4 runner 尚未实现时，发行说明继续使用“兼容性源码预览”，不声称完整 Windows 生命周期或 Beta readiness。
+
 ## 3. 安全与进程生命周期
 
 - [ ] HTTP 服务仅绑定 `127.0.0.1`，不会因配置或启动方式变为局域网可访问。

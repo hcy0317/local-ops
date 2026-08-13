@@ -12,20 +12,25 @@
 - Extract only operating-system boundaries. Preserve the shared HTTP/API core, configuration domain, logs, project detection, and frontend wherever possible.
 - Windows process control must fail closed. A port, PID, process name, or working directory alone never proves ownership.
 - Preserve loopback-only HTTP binding, Host/Origin/token checks, atomic configuration writes, and protection against terminating unrelated processes.
+- Schema v2 is additive: preserve legacy `command` for macOS/display compatibility, use `commandSpec` as the structured Windows compatibility contract, and never infer runtime ownership from migrated PID/port/token data.
+- Phase 3 command preparation is data-only. Structured argv is never reconstructed from a display string; POSIX/raw shell text remains review-only, and local static preflight rejects UNC/device paths before any filesystem probe.
+- Cross-platform config import is explicit and transactional: deterministic zero-write preview, explicit root mappings, selected-app validation, source/target hashes, target CAS, private receipts, idempotent retry, and post-hash rollback. Imported runtime identity is always cleared.
 - Native Windows support may add narrowly scoped `psutil` and `pywin32` runtime dependencies plus PyInstaller for packaging. When implementation begins, update `AGENTS.md` and installation/release documentation so the dependency policy matches reality.
 - Do not claim Windows Beta readiness without real non-admin Windows 10/11 lifecycle tests and a self-contained package test on a clean machine.
 
 ## Current task state
 
-- Status: Phase 1 platform extraction passed its full macOS CI and release gate on `windows-port/phases-1-4`. The current Windows 11 Phase 2 target is `PASS`: exact candidate `c5a31a8` passed a real non-admin source/browser flow plus Windows Python 3.12 and macOS regression/release jobs in CI run `31686699247`. Windows 10 is explicitly deferred, so the original cross-version Phase 2 gate remains open and `windowsBetaReady=false`. Phase 3–4 have not started.
+- Status: Phase 1 and the Windows 11 Phase 2 target passed. Phase 3 is locally complete on Windows 11 and awaits exact-commit Windows Python 3.12 plus macOS regression/release CI before final PASS: schema v2, structured command/static preflight, transactional macOS config import, and capability-driven UI are implemented. Windows 10 remains explicitly deferred, `windowsBetaReady=false`, and Phase 4 is untouched.
 - Source specification: `docs/specs/windows-native-port.md`.
 - Execution plan: `docs/windows-port/PLAN.md`.
-- Recovery source: `docs/windows-port/STATE.json`; obtain macOS test evidence before advancing beyond Phase 1.
+- Recovery source: `docs/windows-port/STATE.json`; exact-commit CI evidence is required before closing each implemented phase.
 - The local checkout was reconstructed as a verified shallow/partial checkout because GitHub large-object transfer was unavailable. Two macOS-only image blobs remain unmaterialized and must be fetched before macOS asset or release builds.
 - The top-level `fcntl` blocker was removed by the Phase 1 adapter boundary. Windows Phase 2 now uses pinned `psutil` and `pywin32` for observation, Local AppData, SID/DACL, and Named Mutex behavior.
 - Windows lifecycle remains fail closed: launch, managed stop, force stop, external kill, external attach, console restart, and console stop are disabled across capability metadata, HTTP route guards, and browser controls until the Phase 4 runner/Job Object identity gate passes.
 - Full-machine Windows command-line ancestry was too slow for the first state response. Phase 2 queries PPID ancestry only for observed listeners and keeps Windows origin badges best-effort; do not reintroduce per-poll PowerShell/WMI or full process `cmdline` enumeration.
 - A visible status banner is not connection truth. Windows partial scans legitimately return HTTP 200 plus a degraded notice, so the navigation connection indicator must follow the explicit connection state rather than banner visibility.
+- Import receipts must survive the atomic-write commit point. A failed final receipt/ACL verification cannot be modeled as if `os.replace` never happened; reconcile `prepared` state from the current config hash and keep memory/disk aligned before entering read-only protection.
+- Import receipt hashes are deterministic over already-normalized snapshots. Idempotent commit retry and rollback must not re-run cwd, PATH, executable, or other environment probes; only a genuinely new commit performs dynamic preflight.
 
 ## Memory hygiene
 

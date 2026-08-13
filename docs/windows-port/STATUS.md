@@ -2,11 +2,25 @@
 
 ## Current result
 
-**P2 WIN11 PASS / WIN10 DEFERRED — the exact candidate passed Windows 11 non-admin storage, single-instance, real-browser read-only monitoring, safe configuration writes, fail-closed UI/HTTP controls, Windows Python 3.12 CI, and the complete macOS regression/release gate.**
+**P3 WIN11 LOCAL PASS / EXACT-COMMIT CI PENDING / WIN10 DEFERRED / PHASE 4 UNTOUCHED.**
 
-Phase 2 adds the Windows adapter, pinned runtime dependencies, Local AppData/SID/DACL enforcement, a per-user/data-directory Named Mutex, `psutil` snapshots, a native picker, Windows exclusive socket binding, capability metadata, and route-level control rejection. The final Windows 11 browser flow kept protected-process degradation separate from connection status, showed live listeners, completed a configuration add/read/remove round-trip, disabled console controls, and rejected all Phase 4 control routes without stopping the server. Phase 3–4 have not started.
+Phase 3 adds the frozen API Contract v2, additive schema v1→v2 migration, a non-executing `CommandSpec` model, Windows project detection/static preflight, explicit receipt-backed macOS configuration import, and platform/capability-driven UI. It does not add a runner, Job Object, generation, runtime identity, external attach, or any lifecycle side effect.
 
-The user explicitly deferred Windows 10 until after Windows 11 works. This closes the current Windows 11 target but does not fabricate the original Win10/Win11 cross-version gate: machine state keeps the full-spec status open and `windowsBetaReady=false`. CI run `31686699247` passed both jobs for implementation commit `c5a31a860cb0d82a4abfc63aaf7e30eedb55556d`. Phase 3 must not begin without separate authorization.
+The Windows 11 non-admin local gate passed 50/50 Windows tests and ran 32 shared contract tests under Python 3.12: 31 passed and one symlink case was skipped because this non-admin session cannot create symlinks. An isolated real API flow on port 9608 proved schema v2 state, zero-write preview, explicit path mapping, runtime-identity clearing, atomic and idempotent commit, lifecycle HTTP 409, UNC rejection, and rollback to the original target. Ruff, compileall, JavaScript syntax, Node helpers, platform-leak audit, HTTP security checks, and diff checks pass.
+
+Phase 3 visual browser interaction is `NOT_RUN`: `browser-harness --doctor` reports a running Chrome but no active CDP connection. Static frontend contracts pass 20/21; the only failure is the pre-existing unmaterialized `static/assets/console-app-icon.png` blob. This limitation is not presented as a visual PASS. Phase 2's exact-candidate Chromium evidence remains historical only.
+
+The user explicitly deferred Windows 10. This does not fabricate the original cross-version or release gate: `windowsBetaReady=false`, packaging remains Phase 5, and Phase 4 has not started. The final P3 PASS remains pending exact-commit Windows Python 3.12 and macOS regression/release CI.
+
+## Phase 3 implemented scope
+
+- Added schema v2 fields `commandSpec`, `runtimeIdentity`, and `importStatus` while preserving legacy `command` and macOS compatibility.
+- Added direct/cmd/PowerShell/legacy-POSIX tagged command data, special-character-safe argv handling, PATHEXT/npm/pnpm/Python 3.12 selection, and local-only static preflight.
+- Rejected UNC/device namespaces before PATH, cwd, executable, project, or import filesystem probes.
+- Added explicit import preview/commit/rollback with a 1 MiB local regular-file limit, deterministic decisions, source/target hashes, target CAS, private before/source/receipt records, no-overwrite selection, identity clearing, idempotent retry, and recoverable prepared states.
+- Added platform presentation metadata and removed browser POSIX quoting, slash parsing, and `/Users` inference.
+- Gated Windows lifecycle/external-process actions at adapter, HTTP, rendered UI, and event-handler boundaries.
+- Kept atomic configuration memory/disk state aligned when post-replace ACL verification fails, then entered read-only protection.
 
 ## Phase 2 implemented scope
 

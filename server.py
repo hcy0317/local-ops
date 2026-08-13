@@ -35,6 +35,27 @@ from localops.platform.contracts import (
     ScanStatus,
 )
 from localops.platform.loader import load_platform
+from localops.command_spec import (
+    CommandSpecError,
+    command_spec_for_executable,
+    command_spec_for_script,
+    direct_command_spec,
+    display_command,
+    is_local_windows_path,
+    legacy_command_spec,
+    normalize_command_spec,
+    platform_compatibility,
+    python_command_spec,
+    select_python_executable,
+    static_preflight,
+)
+from localops.config_import import (
+    ConfigImportError,
+    commit_import,
+    config_hash,
+    preview_import,
+    rollback_import,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_PATH = os.path.join(BASE_DIR, "VERSION")
@@ -74,8 +95,9 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 THEMES_DIR = os.path.join(STATIC_DIR, "themes")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 INSTANCE_LOCK_PATH = os.path.join(DATA_DIR, "console.lock")
+IMPORT_RECORDS_DIR = os.path.join(DATA_DIR, "imports")
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 # 默认 UI 主题：新安装与无偏好回退均使用它，主题清单中固定排首位。
 DEFAULT_UI_THEME = "ops"
@@ -417,7 +439,32 @@ def migrate_config_v0_to_v1(raw):
     return migrated
 
 
-CONFIG_MIGRATIONS = {0: migrate_config_v0_to_v1}
+def migrate_config_v1_to_v2(raw):
+    """Add command metadata without changing legacy macOS runtime state."""
+    migrated = json.loads(json.dumps(raw, ensure_ascii=False))
+    apps = migrated.get("apps")
+    if isinstance(apps, list):
+        for app in apps:
+            if not isinstance(app, dict):
+                continue
+            command = app.get("command")
+            if not isinstance(app.get("commandSpec"), dict):
+                safe_command = (command if isinstance(command, str)
+                                and "\x00" not in command else "")
+                app["commandSpec"] = legacy_command_spec(
+                    safe_command)
+                if safe_command != command:
+                    app["importStatus"] = "blocked"
+            app["runtimeIdentity"] = None
+            app.setdefault("importStatus", "needs_review")
+    migrated["schemaVersion"] = 2
+    return migrated
+
+
+CONFIG_MIGRATIONS = {
+    0: migrate_config_v0_to_v1,
+    1: migrate_config_v1_to_v2,
+}
 
 
 def migrate_config(raw):
@@ -452,6 +499,8 @@ class Config:
                "apps": [], "hidden": [], "pinned": [], "promoted": [],
                "watchedKeywords": [], "uiTheme": DEFAULT_UI_THEME}
     APP_DEFAULT = {"id": None, "name": "", "command": "", "cwd": None,
+                   "commandSpec": None, "runtimeIdentity": None,
+                   "importStatus": "needs_review",
                    "port": None, "emoji": None, "glyph": None, "icon": None,
                    "favicon": None, "kind": "service", "lastPid": None,
                    "lastPgid": None, "runToken": None,
@@ -492,6 +541,33 @@ class Config:
             for key in app:
                 if key in item:
                     app[key] = item[key]
+            # Phase 3 does not accept or expose a PID-only/runtime identity.
+            # Phase 4 will introduce a separately validated tagged union.
+            app["runtimeIdentity"] = None
+            invalid_command_spec = False
+            try:
+                command_spec = app.get("commandSpec")
+                if command_spec is None:
+                    command = app.get("command")
+                    safe_command = (command if isinstance(command, str)
+                                    and "\x00" not in command else "")
+                    command_spec = legacy_command_spec(
+                        safe_command)
+                    if safe_command != command:
+                        app["importStatus"] = "blocked"
+                        invalid_command_spec = True
+                app["commandSpec"] = normalize_command_spec(command_spec)
+            except CommandSpecError:
+                command = app.get("command")
+                safe_command = (command if isinstance(command, str)
+                                and "\x00" not in command else "")
+                app["commandSpec"] = legacy_command_spec(
+                    safe_command)
+                app["importStatus"] = "blocked"
+                invalid_command_spec = True
+            if not invalid_command_spec:
+                app["importStatus"] = command_import_status(
+                    app["commandSpec"], app.get("cwd"))
             apps.append(app)
         data["apps"] = apps
         return data
@@ -552,7 +628,9 @@ class Config:
         try:
             if not source_index and needs_migration:
                 # 迁移前的配置是上一份良好版本。
-                self._write_atomic(self._path + ".bak", self._payload(raw))
+                if not self._write_atomic(
+                        self._path + ".bak", self._payload(raw)):
+                    raise OSError("配置备份权限验证失败")
             # 从 .bak 恢复时只修复主文件，保留已验证的备份。
             self._write_atomic(self._path, self._payload(data))
         except OSError as e:
@@ -585,7 +663,9 @@ class Config:
                 payload = self._payload(self._data)
                 previous_payload = self._payload(previous)
                 # 先保存上一份良好内容，再替换主文件。
-                self._write_atomic(self._path + ".bak", previous_payload)
+                if not self._write_atomic(
+                        self._path + ".bak", previous_payload):
+                    raise OSError("配置备份权限验证失败")
                 self._write_atomic(self._path, payload)
                 invalidate_state_cache()
                 return result
@@ -593,8 +673,50 @@ class Config:
                 self._data = previous
                 raise
 
-    @staticmethod
-    def _write_atomic(path, payload):
+    def replace_if_hash(self, expected_hash, replacement):
+        """Atomically replace the full config only if its normalized hash matches."""
+        return self._replace_if_hash(
+            expected_hash, replacement, normalize_replacement=True
+        )
+
+    def replace_normalized_if_hash(self, expected_hash, replacement):
+        """Commit an already-normalized import payload without re-running probes."""
+        return self._replace_if_hash(
+            expected_hash, replacement, normalize_replacement=False
+        )
+
+    def _replace_if_hash(
+            self, expected_hash, replacement, *, normalize_replacement):
+        with self._lock:
+            if not self._writable:
+                raise OSError("配置处于只读保护状态，请先恢复配置或权限")
+            if config_hash(self._data) != expected_hash:
+                return False
+            if normalize_replacement:
+                normalized = self._normalize(replacement)
+            else:
+                if (not isinstance(replacement, dict)
+                        or replacement.get("schemaVersion")
+                        != CURRENT_SCHEMA_VERSION
+                        or not isinstance(replacement.get("apps"), list)):
+                    raise ValueError("导入配置不是已规范化的 schema v2")
+                normalized = json.loads(json.dumps(
+                    replacement, ensure_ascii=False
+                ))
+            previous = json.loads(json.dumps(self._data, ensure_ascii=False))
+            try:
+                if not self._write_atomic(
+                        self._path + ".bak", self._payload(previous)):
+                    raise OSError("配置备份权限验证失败")
+                self._write_atomic(self._path, self._payload(normalized))
+                self._data = normalized
+                invalidate_state_cache()
+                return True
+            except Exception:
+                self._data = previous
+                raise
+
+    def _write_atomic(self, path, payload):
         _ensure_private_dir(os.path.dirname(path) or ".")
         tmp = path + ".tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -609,7 +731,26 @@ class Config:
             if fd >= 0:
                 os.close(fd)
         os.replace(tmp, path)
-        PLATFORM.ensure_private_file(path)
+        try:
+            PLATFORM.ensure_private_file(path)
+        except OSError:
+            # os.replace above is the commit point. The new bytes are already
+            # authoritative, so callers must keep memory aligned with disk.
+            # Fail closed for later writes instead of reporting a false
+            # rollback that would strand an import without its receipt.
+            self._writable = False
+            issue = "配置文件提交后权限验证失败，已进入只读保护"
+            if issue not in self._health_issues:
+                self._health_issues.append(issue)
+            LOG.exception("配置文件提交后权限验证失败: %s", path)
+            return False
+        return True
+
+
+def normalize_import_config(raw):
+    """Migrate and normalize import data through the existing config contract."""
+    migrated, _source_version = migrate_config(raw)
+    return Config._normalize(migrated)
 
 
 def acquire_instance_lock(path=INSTANCE_LOCK_PATH):
@@ -1166,8 +1307,37 @@ def build_apps(cfg, listeners, groups=None):
         except Exception as exc:
             LOG.warning("检查应用配置失败（%s）：%s", app.get("id"), exc)
             health = {"status": "unknown", "blocking": False, "issues": []}
+        command_spec = app.get("commandSpec")
+        if command_spec is None:
+            command_spec = legacy_command_spec(app.get("command") or "")
+        try:
+            command_spec = normalize_command_spec(command_spec)
+            compatibility = platform_compatibility(
+                command_spec, app.get("cwd"), PLATFORM.name)
+            if (app.get("importStatus") == "blocked"
+                    and compatibility.get("status") != "blocked"):
+                compatibility = {
+                    "status": "blocked",
+                    "reasons": [{
+                        "code": "COMMAND_SPEC_INVALID",
+                        "message": "The stored command requires correction.",
+                    }],
+                }
+        except CommandSpecError as exc:
+            command_spec = legacy_command_spec(app.get("command") or "")
+            compatibility = {
+                "status": "blocked",
+                "reasons": [{
+                    "code": "COMMAND_SPEC_INVALID",
+                    "message": str(exc),
+                }],
+            }
         apps.append({
             "id": app["id"], "name": app["name"], "command": app["command"],
+            "commandSpec": command_spec,
+            "runtimeIdentity": None,
+            "importStatus": compatibility.get("status", "blocked"),
+            "platformCompatibility": compatibility,
             "cwd": app.get("cwd"), "port": port,
             "emoji": app.get("emoji"), "glyph": app.get("glyph"), "icon": app.get("icon"),
             "favicon": app.get("favicon"),
@@ -1239,6 +1409,15 @@ def build_state(cfg, console_port, config_health=None):
         if reason not in degraded_reasons:
             degraded_reasons.append(reason)
     platform_metadata = PLATFORM.platform_metadata()
+    platform_name = platform_metadata.get("platform", PLATFORM.name)
+    if platform_name == "windows":
+        launch_instruction = "运行 python server.py 启动总控台。"
+        lifecycle_notice = "Windows 进程控制在当前阶段尚未启用。"
+        shortcut_modifier = "Ctrl"
+    else:
+        launch_instruction = "运行 start.command 或打开总控台应用。"
+        lifecycle_notice = "仅对总控台验证启动的进程提供生命周期控制。"
+        shortcut_modifier = "⌘"
     return {
         "services": services,
         "watched": watched,
@@ -1249,8 +1428,16 @@ def build_state(cfg, console_port, config_health=None):
         "consoleCwd": BASE_DIR,
         "version": APP_VERSION,
         "schemaVersion": cfg.get("schemaVersion", CURRENT_SCHEMA_VERSION),
-        "platform": platform_metadata.get("platform", PLATFORM.name),
+        "platform": platform_name,
         "capabilities": dict(platform_metadata.get("capabilities") or {}),
+        "platformInfo": {
+            "shortcutModifier": shortcut_modifier,
+            "dataDir": DATA_DIR,
+            "logsDir": LOGS_DIR,
+            "consoleLogPath": os.path.join(LOGS_DIR, "console.log"),
+            "launchInstruction": launch_instruction,
+            "lifecycleNotice": lifecycle_notice,
+        },
         "degraded": bool(degraded_reasons),
         "degradedReasons": degraded_reasons,
         "configHealth": dict(config_health or {}),
@@ -1530,8 +1717,45 @@ def stop_app_for_update(cfg, app, timeout=5.0):
 
 def pick_path(what):
     """Open the native file/folder picker."""
-    result = PLATFORM.pick_path(what)
-    return result.path, result.canceled
+    return PLATFORM.pick_path(what)
+
+
+def command_import_status(command_spec, cwd):
+    """Return the persisted Phase 3 status from the platform contract."""
+    status = platform_compatibility(command_spec, cwd, PLATFORM.name).get(
+        "status")
+    return status if status in ("ready", "needs_review", "blocked") else "blocked"
+
+
+def picker_payload(path, what):
+    """Return native path components so the browser never parses separators."""
+    normalized = os.path.abspath(os.path.expanduser(str(path)))
+    parent = os.path.dirname(normalized)
+    stem = os.path.splitext(os.path.basename(normalized))[0]
+    payload = {
+        "ok": True,
+        "canceled": False,
+        "path": normalized,
+        "dir": parent,
+        "stem": stem,
+    }
+    if what == "script":
+        python_executable = (
+            select_python_executable(
+                PLATFORM.name,
+                current_executable=sys.executable,
+                current_version=sys.version_info[:2],
+                frozen=bool(getattr(sys, "frozen", False)),
+            ) if PLATFORM.name == "windows" else None)
+        spec = command_spec_for_script(
+            normalized, PLATFORM.name, python_executable)
+        payload["command"] = (display_command(spec)
+                              if PLATFORM.name == "windows"
+                              else command_for_script(normalized))
+        payload["commandSpec"] = spec
+        payload["platformCompatibility"] = platform_compatibility(
+            spec, parent, PLATFORM.name)
+    return payload
 
 
 def command_for_script(path):
@@ -1640,6 +1864,10 @@ def _script_target(tokens, cwd):
 
 def inspect_app_health(app):
     """静态检查配置是否可运行；只读文件系统，绝不执行或展开用户命令。"""
+    if PLATFORM.name == "windows":
+        spec = app.get("commandSpec") or legacy_command_spec(
+            app.get("command") or "")
+        return static_preflight(spec, app.get("cwd"), "windows")
     issues = []
 
     def add(kind, title, detail, fix, action):
@@ -1784,7 +2012,10 @@ def detect_project(root):
     """只读分析项目根目录，返回可由启动台直接使用的启动候选。"""
     if not isinstance(root, str) or not root.strip():
         return None, "请选择项目文件夹"
-    root = os.path.abspath(os.path.expanduser(root.strip()))
+    raw_root = root.strip()
+    if PLATFORM.name == "windows" and not is_local_windows_path(raw_root):
+        return None, "项目文件夹不存在或不可访问"
+    root = os.path.abspath(os.path.expanduser(raw_root))
     if not os.path.isdir(root):
         return None, "项目文件夹不存在或不可访问"
 
@@ -1799,13 +2030,21 @@ def detect_project(root):
         return exists
 
     def add(command, label, source, port=None, priority=50, detail=None,
-            kind="service"):
+            kind="service", command_spec=None):
         if not command or any(item["command"] == command for item in candidates):
             return
         if port is not None and not (isinstance(port, int) and 1 <= port <= 65535):
             port = None
+        if command_spec is None:
+            command_spec = legacy_command_spec(command)
+        command_spec = normalize_command_spec(command_spec)
+        if PLATFORM.name == "windows":
+            command = display_command(command_spec)
         candidates.append({
             "command": command,
+            "commandSpec": command_spec,
+            "platformCompatibility": platform_compatibility(
+                command_spec, root, PLATFORM.name),
             "label": label,
             "source": source,
             "port": port,
@@ -1813,6 +2052,12 @@ def detect_project(root):
             "detail": detail,
             "_priority": priority,
         })
+
+    def native_spec(executable, args=()):
+        if PLATFORM.name == "windows":
+            return command_spec_for_executable(
+                executable, args, platform_name="windows", cwd=root)
+        return direct_command_spec(executable, args)
 
     # Node / 前端 / 博客项目：优先读取 package.json 的 scripts。
     package = {}
@@ -1874,18 +2119,21 @@ def detect_project(root):
             port = _port_from_command(script)
             if port is None:
                 port = _package_default_port(str(name).lower(), script, deps)
+            spec = native_spec(runner.split()[0], [
+                *runner.split()[1:], str(name)])
             add(command, labels.get(str(name).lower(), "项目脚本：%s" % name),
                 "package.json · scripts.%s" % name, port,
-                10 + index, "由项目自己的脚本定义")
+                10 + index, "由项目自己的脚本定义", command_spec=spec)
 
     # Hexo 即使没有 scripts 也有稳定 CLI：服务与清缓存分别作为服务/任务。
     if is_hexo:
         if hexo_config:
             note_file("_config.yml")
         add("hexo s", "Hexo 本地服务", "Hexo 项目结构", 4000, 8,
-            "等同于 hexo server")
+            "等同于 hexo server", command_spec=native_spec("hexo", ["s"]))
         add("hexo cl", "Hexo 清除缓存", "Hexo 项目结构", None, 9,
-            "清除缓存和已生成文件，不启动服务", kind="task")
+            "清除缓存和已生成文件，不启动服务", kind="task",
+            command_spec=native_spec("hexo", ["cl"]))
 
     # 常见博客与静态站点生成器。
     hugo_config = next((name for name in ("hugo.toml", "hugo.yaml", "hugo.yml")
@@ -1896,13 +2144,15 @@ def detect_project(root):
         source = hugo_config or "config.toml"
         note_file(source)
         add("hugo server -D", "Hugo 本地预览", source, 1313, 18,
-            "包含草稿内容")
+            "包含草稿内容",
+            command_spec=native_spec("hugo", ["server", "-D"]))
 
     gemfile = _read_project_text(root, "Gemfile")
     if gemfile is not None:
         note_file("Gemfile", gemfile)
         if "jekyll" in gemfile.lower():
-            add("bundle exec jekyll serve", "Jekyll 本地预览", "Gemfile", 4000, 19)
+            add("bundle exec jekyll serve", "Jekyll 本地预览", "Gemfile", 4000, 19,
+                command_spec=native_spec("bundle", ["exec", "jekyll", "serve"]))
 
     # Python Web 项目。
     pyproject = _read_project_text(root, "pyproject.toml")
@@ -1918,7 +2168,16 @@ def detect_project(root):
     if os.path.isfile(os.path.join(root, "manage.py")):
         note_file("manage.py")
         prefix = "uv run python" if python_runner == "uv run" else "python3"
-        add(prefix + " manage.py runserver", "Django 开发服务器", "manage.py", 8000, 20)
+        django_spec = (native_spec("uv", ["run", "python", "manage.py", "runserver"])
+                       if python_runner == "uv run" else
+                       python_command_spec(
+                           ["manage.py", "runserver"],
+                           platform_name=PLATFORM.name,
+                           current_executable=sys.executable,
+                           current_version=sys.version_info[:2],
+                           frozen=bool(getattr(sys, "frozen", False))))
+        add(prefix + " manage.py runserver", "Django 开发服务器", "manage.py", 8000, 20,
+            command_spec=django_spec)
     else:
         for module_file in ("app.py", "main.py", "server.py"):
             module_text = _read_project_text(root, module_file)
@@ -1934,20 +2193,49 @@ def detect_project(root):
             if "streamlit" in py_deps or imports_streamlit:
                 note_file(module_file, module_text)
                 prefix = "uv run" if python_runner == "uv run" else "python3 -m"
+                streamlit_spec = (native_spec("uv", ["run", "streamlit", "run", module_file])
+                                  if python_runner == "uv run" else
+                                  python_command_spec(
+                                      ["-m", "streamlit", "run", module_file],
+                                      platform_name=PLATFORM.name,
+                                      current_executable=sys.executable,
+                                      current_version=sys.version_info[:2],
+                                      frozen=bool(getattr(sys, "frozen", False))))
                 add(prefix + " streamlit run " + module_file,
-                    "Streamlit 应用", module_file, 8501, 22)
+                    "Streamlit 应用", module_file, 8501, 22,
+                    command_spec=streamlit_spec)
                 break
             if "fastapi" in py_deps or imports_fastapi:
                 note_file(module_file, module_text)
                 prefix = "uv run" if python_runner == "uv run" else "python3 -m"
+                uvicorn_args = ["uvicorn", "%s:app" % module, "--reload"]
+                fastapi_spec = (native_spec("uv", ["run", *uvicorn_args])
+                                if python_runner == "uv run" else
+                                python_command_spec(
+                                    ["-m", *uvicorn_args],
+                                    platform_name=PLATFORM.name,
+                                    current_executable=sys.executable,
+                                    current_version=sys.version_info[:2],
+                                    frozen=bool(getattr(sys, "frozen", False))))
                 add(prefix + " uvicorn %s:app --reload" % module,
-                    "FastAPI 开发服务器", module_file, 8000, 23)
+                    "FastAPI 开发服务器", module_file, 8000, 23,
+                    command_spec=fastapi_spec)
                 break
             if "flask" in py_deps or imports_flask:
                 note_file(module_file, module_text)
                 prefix = "uv run" if python_runner == "uv run" else "python3 -m"
+                flask_args = ["flask", "--app", module, "run", "--debug"]
+                flask_spec = (native_spec("uv", ["run", *flask_args])
+                              if python_runner == "uv run" else
+                              python_command_spec(
+                                  ["-m", *flask_args],
+                                  platform_name=PLATFORM.name,
+                                  current_executable=sys.executable,
+                                  current_version=sys.version_info[:2],
+                                  frozen=bool(getattr(sys, "frozen", False))))
                 add(prefix + " flask --app %s run --debug" % module,
-                    "Flask 开发服务器", module_file, 5000, 24)
+                    "Flask 开发服务器", module_file, 5000, 24,
+                    command_spec=flask_spec)
                 break
 
     # Docker Compose、Go、Rust 和已有的常用启动脚本。
@@ -1962,26 +2250,52 @@ def detect_project(root):
             if match and 1 <= int(match.group(1)) <= 65535:
                 port = int(match.group(1))
         add("docker compose up", "Docker Compose", compose_name, port, 55,
-            "以前台方式运行，停止按钮可正常关闭")
+            "以前台方式运行，停止按钮可正常关闭",
+            command_spec=native_spec("docker", ["compose", "up"]))
     if os.path.isfile(os.path.join(root, "go.mod")):
         note_file("go.mod")
-        add("go run .", "Go 项目", "go.mod", None, 60)
+        add("go run .", "Go 项目", "go.mod", None, 60,
+            command_spec=native_spec("go", ["run", "."]))
     if os.path.isfile(os.path.join(root, "Cargo.toml")):
         note_file("Cargo.toml")
-        add("cargo run", "Rust 项目", "Cargo.toml", None, 61)
+        add("cargo run", "Rust 项目", "Cargo.toml", None, 61,
+            command_spec=native_spec("cargo", ["run"]))
 
-    for script_name in ("start.command", "dev.command", "run.command", "start.sh", "dev.sh", "run.sh"):
+    script_names = (
+        ("start.cmd", "dev.cmd", "run.cmd",
+         "start.bat", "dev.bat", "run.bat",
+         "start.ps1", "dev.ps1", "run.ps1",
+         "start.command", "dev.command", "run.command",
+         "start.sh", "dev.sh", "run.sh")
+        if PLATFORM.name == "windows" else
+        ("start.command", "dev.command", "run.command",
+         "start.sh", "dev.sh", "run.sh")
+    )
+    for script_name in script_names:
         if os.path.isfile(os.path.join(root, script_name)):
             note_file(script_name)
-            add("bash %s" % shlex.quote("./" + script_name),
+            script_spec = command_spec_for_script(
+                os.path.join(root, script_name), PLATFORM.name)
+            command = (display_command(script_spec)
+                       if PLATFORM.name == "windows"
+                       else "bash %s" % shlex.quote("./" + script_name))
+            add(command,
                 "现有启动脚本", script_name, None, 70,
-                "也可以继续使用“选择脚本”手动指定")
-            break
+                "也可以继续使用“选择脚本”手动指定",
+                command_spec=script_spec)
+            if PLATFORM.name != "windows":
+                break
 
     # 纯静态站点最后兜底，避免把 Vite/Next 等项目误当成普通文件目录。
     if not candidates and os.path.isfile(os.path.join(root, "index.html")):
         note_file("index.html")
-        add("python3 -m http.server 8000", "静态网站预览", "index.html", 8000, 90)
+        add("python3 -m http.server 8000", "静态网站预览", "index.html", 8000, 90,
+            command_spec=python_command_spec(
+                ["-m", "http.server", "8000"],
+                platform_name=PLATFORM.name,
+                current_executable=sys.executable,
+                current_version=sys.version_info[:2],
+                frozen=bool(getattr(sys, "frozen", False))))
 
     candidates.sort(key=lambda item: item.pop("_priority"))
     return {
@@ -2536,6 +2850,16 @@ def validate_app_fields(data, partial):
             fields[key] = v.strip()
         elif not partial:
             return None, "缺少字段 %s" % key
+    if "commandSpec" in data:
+        try:
+            fields["commandSpec"] = normalize_command_spec(
+                data["commandSpec"])
+        except CommandSpecError as exc:
+            return None, "commandSpec 无效: %s" % exc
+    elif "command" in fields:
+        # Legacy clients remain valid, but a changed display command must not
+        # leave an older structured command attached to the app.
+        fields["commandSpec"] = legacy_command_spec(fields["command"])
     if "cwd" in data:
         v = data["cwd"]
         if v is not None and not isinstance(v, str):
@@ -2675,7 +2999,7 @@ class Handler(BaseHTTPRequestHandler):
     def _require_capability(self, name, message):
         if getattr(PLATFORM.capabilities, name, False):
             return True
-        self.send_json({"ok": False, "error": message}, 409)
+        self.send_err(409, message, "CAPABILITY_DISABLED")
         return False
 
     def _parsed_request_host(self):
@@ -2819,8 +3143,11 @@ class Handler(BaseHTTPRequestHandler):
         self._send(json.dumps(obj, ensure_ascii=False).encode("utf-8"),
                    status, "application/json; charset=utf-8")
 
-    def send_err(self, status, msg):
-        self.send_json({"ok": False, "error": msg}, status)
+    def send_err(self, status, msg, code=None):
+        payload = {"ok": False, "error": msg}
+        if code:
+            payload["code"] = code
+        self.send_json(payload, status)
 
     def discard_body(self):
         """读掉并丢弃请求体。keep-alive 连接复用前必须清空，
@@ -2995,6 +3322,15 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/project/detect":
                 self.handle_project_detect()
                 return
+            if path == "/api/config/import/preview":
+                self.handle_config_import_preview()
+                return
+            if path == "/api/config/import/commit":
+                self.handle_config_import_commit()
+                return
+            if path == "/api/config/import/rollback":
+                self.handle_config_import_rollback()
+                return
             if path == "/api/console/restart":
                 self.discard_body()
                 self.handle_console_restart()
@@ -3047,34 +3383,127 @@ class Handler(BaseHTTPRequestHandler):
     def handle_pick(self):
         data, err = self.read_json_body()
         if err:
-            self.send_err(400, err)
+            self.send_err(400, err, "INVALID_REQUEST")
             return
         if not self._require_capability(
                 "pick_path", "当前平台未启用系统路径选择器"):
             return
         what = data.get("what")
         if what not in ("dir", "script"):
-            self.send_err(400, "what 必须是 dir/script")
+            self.send_err(400, "what 必须是 dir/script", "INVALID_REQUEST")
             return
-        path, canceled = pick_path(what)
-        if canceled:  # 用户取消不是错误，前端静默
+        result = pick_path(what)
+        if result.issue:
+            LOG.warning("系统选择框失败（%s）", result.issue.code)
+            self.send_err(500, "无法打开系统选择框", "PICKER_UNAVAILABLE")
+        elif result.canceled:  # 用户取消不是错误，前端静默
             self.send_json({"ok": True, "canceled": True})
-        elif not path:
-            self.send_json({"ok": False, "error": "无法打开系统选择框"})
+        elif not result.path:
+            self.send_err(500, "无法打开系统选择框", "PICKER_UNAVAILABLE")
         else:
-            result = {"ok": True, "path": path}
-            if what == "script":
-                result["command"] = command_for_script(path)
-            self.send_json(result)
+            self.send_json(picker_payload(result.path, what))
 
     def handle_project_detect(self):
         data, err = self.read_json_body()
         if err:
-            self.send_err(400, err)
+            self.send_err(400, err, "INVALID_REQUEST")
             return
         result, err = detect_project(data.get("cwd"))
         if err:
-            self.send_err(400, err)
+            self.send_err(400, err, "INVALID_PATH")
+            return
+        self.send_json(result)
+
+    def _import_available(self):
+        if PLATFORM.name == "windows":
+            return True
+        self.send_err(
+            409,
+            "当前平台不提供 macOS 到 Windows 的配置导入",
+            "CAPABILITY_DISABLED",
+        )
+        return False
+
+    def _read_import_request(self):
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err, "INVALID_REQUEST")
+            return None
+        return data
+
+    def _send_import_error(self, exc):
+        self.send_err(exc.http_status, exc.message, exc.code)
+
+    def handle_config_import_preview(self):
+        data = self._read_import_request()
+        if data is None or not self._import_available():
+            return
+        try:
+            result = preview_import(
+                data.get("sourcePath"),
+                data.get("pathMappings", []),
+                self.server.cfg.snapshot(),
+                normalize_config=normalize_import_config,
+            )
+        except ConfigImportError as exc:
+            self._send_import_error(exc)
+            return
+        self.send_json(result)
+
+    def handle_config_import_commit(self):
+        data = self._read_import_request()
+        if data is None or not self._import_available():
+            return
+        if not self.server.cfg.health_info().get("writable"):
+            self.send_err(
+                409,
+                "配置处于只读保护状态，请先恢复配置或权限",
+                "CONFIG_READ_ONLY",
+            )
+            return
+        try:
+            _ensure_private_dir(IMPORT_RECORDS_DIR)
+            result = commit_import(
+                data.get("sourcePath"),
+                data.get("pathMappings", []),
+                data.get("previewId"),
+                data.get("selectedAppIds"),
+                records_dir=IMPORT_RECORDS_DIR,
+                get_target=self.server.cfg.snapshot,
+                replace_target=self.server.cfg.replace_normalized_if_hash,
+                normalize_config=normalize_import_config,
+                ensure_private_file=PLATFORM.ensure_private_file,
+            )
+        except ConfigImportError as exc:
+            self._send_import_error(exc)
+            return
+        except OSError:
+            self.send_err(500, "无法写入私有导入记录", "IMPORT_COMMIT_FAILED")
+            return
+        self.send_json(result)
+
+    def handle_config_import_rollback(self):
+        data = self._read_import_request()
+        if data is None or not self._import_available():
+            return
+        if not self.server.cfg.health_info().get("writable"):
+            self.send_err(
+                409,
+                "配置处于只读保护状态，请先恢复配置或权限",
+                "CONFIG_READ_ONLY",
+            )
+            return
+        try:
+            result = rollback_import(
+                data.get("importId"),
+                records_dir=IMPORT_RECORDS_DIR,
+                get_target=self.server.cfg.snapshot,
+                replace_target=self.server.cfg.replace_normalized_if_hash,
+                normalize_config=normalize_import_config,
+                ensure_private_file=PLATFORM.ensure_private_file,
+            )
+        except ConfigImportError as exc:
+            self._send_import_error(exc)
             return
         self.send_json(result)
 
@@ -3229,7 +3658,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         fields, err = validate_app_fields(data, partial=False)
         if err:
-            self.send_err(400, err)
+            self.send_err(
+                400, err,
+                "COMMAND_SPEC_INVALID"
+                if err.startswith("commandSpec 无效:") else None)
             return
 
         snapshot = self.server.cfg.snapshot()
@@ -3238,6 +3670,10 @@ class Handler(BaseHTTPRequestHandler):
             new_id = secrets.token_hex(4)
         app = {"id": new_id, "name": fields["name"],
                "command": fields["command"], "cwd": fields["cwd"],
+               "commandSpec": fields["commandSpec"],
+               "runtimeIdentity": None,
+               "importStatus": command_import_status(
+                   fields["commandSpec"], fields["cwd"]),
                "port": fields["port"], "emoji": fields["emoji"],
                "glyph": fields["glyph"], "kind": fields["kind"],
                "icon": None, "favicon": None, "lastPid": None,
@@ -3579,12 +4015,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             fields, err = validate_app_fields(data, partial=True)
             if err:
-                self.send_err(400, err)
+                self.send_err(
+                    400, err,
+                    "COMMAND_SPEC_INVALID"
+                    if err.startswith("commandSpec 无效:") else None)
                 return
             if not fields:
                 self.send_err(400, "没有可更新的字段")
                 return
-            lifecycle_fields = {"command", "cwd", "port", "kind"}
+            lifecycle_fields = {"command", "commandSpec", "cwd", "port", "kind"}
             lifecycle_changed = any(
                 key in fields and fields[key] != app.get(key)
                 for key in lifecycle_fields)
@@ -3614,6 +4053,9 @@ class Handler(BaseHTTPRequestHandler):
             def op(c):
                 target = find_app(c, m.group(1))
                 target.update(fields)
+                if "commandSpec" in fields or "cwd" in fields:
+                    target["importStatus"] = command_import_status(
+                        target["commandSpec"], target.get("cwd"))
                 return dict(target)
 
             updated = self.server.cfg.update(op)

@@ -2,11 +2,11 @@
 
 **Preview / Alpha · 源码预览**
 
-总控台是一个本地服务与批处理任务快速启动、运行监测工具。macOS 版本保留完整现有功能；Windows 当前处于 Phase 2 只读源码预览，只提供安全的本地监听与进程观察，不提供进程控制。共享核心只绑定回环地址；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
+总控台是一个本地服务与批处理任务快速启动、运行监测工具。macOS 版本保留完整现有功能；Windows 当前处于 Phase 3 兼容性源码预览，提供安全的本地监听与进程观察、结构化命令配置和显式 macOS 配置导入，但仍不提供进程控制。共享核心只绑定回环地址；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
 
 > 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整；`总控台.app` 目前不是可单独复制的自包含应用，也尚不代表经过签名、公证的最终 macOS 发行版。
 
-总控台只服务当前机器和当前用户，不是远程运维、多人协作或公网管理面板。macOS 完整版能够以当前用户权限执行保存的 shell 命令；Windows Phase 2 明确禁用这类执行和进程控制。不要将监听地址、反向代理、SSH 隧道或端口映射暴露到不受信任的网络。
+总控台只服务当前机器和当前用户，不是远程运维、多人协作或公网管理面板。macOS 完整版能够以当前用户权限执行保存的 shell 命令；Windows Phase 3 只描述和静态校验命令，明确禁用命令执行和进程控制。不要将监听地址、反向代理、SSH 隧道或端口映射暴露到不受信任的网络。
 
 ## 功能
 
@@ -34,9 +34,9 @@
 - macOS 自带的 `ps`、`lsof`、`osascript` 等系统工具。
 - Safari、Chrome 或其他支持 ES Modules 的现代浏览器。
 
-Windows Phase 2 源码预览要求 Windows 10/11 x64、Python 3.12，以及 `requirements-windows.txt` 中锁定的依赖。当前提交仅在 Windows 11 非管理员会话完成本机验证；Windows 10 尚未完成真实机验收，因此不构成 Windows Beta 发布。
+Windows Phase 3 源码预览要求 Windows 10/11 x64、Python 3.12，以及 `requirements-windows.txt` 中锁定的依赖。当前提交仅在 Windows 11 非管理员会话完成本机验证；Windows 10 尚未完成真实机验收，因此不构成 Windows Beta 发布。
 
-## Windows Phase 2 只读源码预览
+## Windows Phase 3 兼容性源码预览
 
 在 PowerShell 中从项目根目录运行：
 
@@ -48,9 +48,11 @@ py -3.12 -m venv .venv
 
 Windows 用户数据固定写入 `%LOCALAPPDATA%\LocalOps\`。程序使用当前用户 SID、SYSTEM 和 Administrators 的受保护 DACL；同一用户、同一数据目录通过 Named Mutex 保证只有一个写者。自定义数据或日志目录会拒绝盘符根、用户主目录、项目根目录、UNC 共享根以及 symlink/junction 路径。ACL 验证失败时配置进入只读保护。
 
-本阶段可用：当前用户可访问的 IPv4/IPv6 本地监听、进程信息、原生目录/文件选择、配置的非生命周期编辑。以下接口在 Windows 上明确返回拒绝且不产生副作用：外部进程结束、外部认领、应用启动、停止、重启、运行中生命周期修改和总控台重启。不要通过改前端或直接调用这些接口绕过限制；Windows 生命周期属于 Phase 4。
+本阶段可用：当前用户可访问的 IPv4/IPv6 本地监听、进程信息、原生目录/文件选择、配置的非生命周期编辑、schema v2、结构化 `commandSpec`、Windows 项目命令候选与静态预检。旧 `command` 字段继续保留；POSIX 命令只会标记为 `needs_review`，不会被猜测性转换或执行。
 
-Windows 不会自动导入项目内旧 `data/` 或 macOS 配置。显式预览、路径映射与 schema v2 属于 Phase 3。
+Windows 不会自动发现或导入项目内旧 `data/` 或 macOS 配置。设置中心的导入向导只接受用户明确选择的本地 JSON 文件，并按“预览 → 路径映射 → 选择 → 提交”执行；预览零写入，提交不覆盖同 ID 应用、清空旧运行身份，并可在目标未发生后续修改时回滚。UNC/设备路径不会被探测或导入。
+
+以下接口在 Windows 上仍明确返回拒绝且不产生副作用：外部进程结束、外部认领、应用启动、停止、重启、运行中生命周期修改和总控台重启。浏览器会按后端 capability 隐藏或禁用对应入口。不要通过改前端或直接调用接口绕过限制；Windows runner、Job Object 和完整生命周期属于 Phase 4。
 
 `VERSION` 是项目版本的唯一权威来源。`Info.plist`、发行包名和发行说明应与它保持一致。
 
@@ -201,7 +203,7 @@ python3 server.py
 4. 运行 `make check`。
 5. 启动后检查应用数量、主题、关注关键字和一个可控服务的完整启停。
 
-配置包含 `schemaVersion`，启动时逐版执行显式、幂等迁移。新程序不会静默降级它不认识的更高 schema；回退程序时仍应同时恢复与该版本匹配的数据备份。
+当前配置为 schema v2，启动时逐版执行显式、幂等迁移。v2 保留旧 `command`，并增加只用于结构化兼容描述的 `commandSpec`；Windows Phase 3 不会据此执行命令。新程序不会静默降级它不认识的更高 schema；回退程序时仍应同时恢复与该版本匹配的数据备份。
 
 ## 卸载
 

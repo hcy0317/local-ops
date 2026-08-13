@@ -3,8 +3,9 @@
    services.js — 服务监控：表格行 / 关注进程 / 折叠分区
    ============================================================ */
 import { $, el, setText, setChildren, setKpi, setKpiUnit, icon, iconBtn,
-  post, act, toast, reconcile, state, truncateMiddle, shortHome,
-  fmtUptime, fmtPct, fmtClock, localServiceUrl } from './core.js';
+  post, act, toast, reconcile, state, truncateMiddle,
+  fmtUptime, fmtPct, fmtClock, localServiceUrl, hasCapability,
+  platformPresentation } from './core.js';
 import { confirmKill, openAppModal } from './overlays.js';
 import { configuredPort, actualPorts } from './ports.js';
 
@@ -132,14 +133,17 @@ function openServiceAppModal(s) {
     if (linked) openAppModal(linked);
     if (linked) return;
   }
-  openAppModal({
+  const draft = {
     name: s.appName || s.project || s.name || '',
     command: s.cmd || '',
     cwd: s.cwd || null,
     port: s.port != null ? s.port : null,
-    attachPid: s.pid,
-    attachInstanceKey: s.instanceKey || null,
-  });
+  };
+  if (hasCapability('attach_external')) {
+    draft.attachPid = s.pid;
+    draft.attachInstanceKey = s.instanceKey || null;
+  }
+  openAppModal(draft);
 }
 
 async function setServiceFlag(key, flag, value) {
@@ -283,7 +287,9 @@ function createServiceRow(kind) {
     const bHide = iconBtn('eye-off', '移入已隐藏列表');
     bHide.addEventListener('click', () => flag('hidden', true));
     const bKill = iconBtn('power', '结束进程', 'danger');
+    bKill.hidden = !hasCapability('kill_external');
     bKill.addEventListener('click', () => {
+      if (!hasCapability('kill_external')) return;
       const s = findSvc(key());
       if (s) confirmKill(s);
     });
@@ -295,7 +301,9 @@ function createServiceRow(kind) {
     const bPromote = iconBtn('upload', '移到我的服务');
     bPromote.addEventListener('click', () => flag('promoted', true));
     const bKill = iconBtn('power', '结束进程', 'danger');
+    bKill.hidden = !hasCapability('kill_external');
     bKill.addEventListener('click', () => {
+      if (!hasCapability('kill_external')) return;
       const s = findSvc(key());
       if (s) confirmKill(s);
     });
@@ -348,7 +356,7 @@ function updateServiceRow(row, svc) {
     r.port.removeAttribute('aria-label');
   }
   const full = svc.cwd || '';
-  setText(r.cwd, full ? truncateMiddle(shortHome(full)) : '');
+  setText(r.cwd, full ? truncateMiddle(full) : '');
   r.cwd.title = full;
   setText(r.ldCpu, fmtPct(svc.cpu));
   setText(r.ldMem, fmtPct(svc.mem));
@@ -361,6 +369,7 @@ function updateServiceRow(row, svc) {
     r.pin.classList.toggle('active', !!svc.pinned);
   }
   if (r.demote) r.demote.hidden = !svc.promoted;
+  if (r.kill) r.kill.hidden = !hasCapability('kill_external');
   setText(r.cmdCode, svc.cmd || '');
   if (r.add) {
     const linked = !!svc.appId;
@@ -377,7 +386,8 @@ function updateServiceRow(row, svc) {
     button.title = action + '：' + title;
     button.setAttribute('aria-label', action + '：' + title);
   };
-  label(svc.appId ? '编辑启动台应用' : '添加到启动台', r.add);
+  label(svc.appId ? '编辑启动台应用' : hasCapability('attach_external')
+    ? '添加到启动台并认领进程' : '创建未认领的启动台应用', r.add);
   label('移回应用后台', r.demote);
   label(row.classList.contains('expanded') ? '收起完整命令' : '展开完整命令', r.command);
   label(svc.pinned ? '取消置顶' : '置顶', r.pin);
@@ -444,11 +454,15 @@ function updateDiscoveryRow(row, svc) {
     (svc.pid ? ' · PID ' + svc.pid : '') +
     (svc.port != null ? ' · :' + svc.port : ''));
   const detail = svc.cwd || svc.cmd || '';
-  setText(r.detail, detail ? truncateMiddle(shortHome(detail), 72) : '未能读取工作目录');
+  setText(r.detail, detail ? truncateMiddle(detail, 72) : '未能读取工作目录');
   r.detail.title = detail;
   row.classList.remove('is-offline');
-  r.add.textContent = '加入启动台';
-  r.add.setAttribute('aria-label', '将 ' + title + ' 加入启动台');
+  const canAttach = hasCapability('attach_external');
+  r.add.textContent = canAttach ? '加入启动台' : '创建未认领卡片';
+  r.add.title = canAttach ? '' : platformPresentation().lifecycleNotice;
+  r.add.setAttribute('aria-label', canAttach
+    ? '将 ' + title + ' 加入启动台并认领进程'
+    : '为 ' + title + ' 创建未认领的启动台应用');
   r.ignore.setAttribute('aria-label', '忽略并隐藏 ' + title + ' 的端口 ' + svc.port);
   r.dismiss.setAttribute('aria-label', '暂时关闭 ' + title + ' 的新端口提醒');
 }
@@ -481,7 +495,9 @@ function createWatchRow() {
   cAct.setAttribute('role', 'cell');
   cAct.setAttribute('aria-label', '操作');
   const bKill = iconBtn('power', '结束进程', 'danger');
+  bKill.hidden = !hasCapability('kill_external');
   bKill.addEventListener('click', () => {
+    if (!hasCapability('kill_external')) return;
     const w = findWatch(row.dataset.key);
     if (w) confirmKill({ pid: w.pid, name: w.name, port: null });
   });
@@ -501,6 +517,7 @@ function updateWatchRow(row, w) {
   setText(r.ldMem, fmtPct(w.mem));
   setText(r.up, fmtUptime(w.uptimeSec));
   const target = w.name || ('PID ' + w.pid);
+  r.kill.hidden = !hasCapability('kill_external');
   r.kill.title = '结束进程：' + target;
   r.kill.setAttribute('aria-label', '结束进程：' + target);
 }

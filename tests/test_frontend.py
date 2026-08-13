@@ -193,14 +193,15 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("if (s.appId)", source)
         self.assertIn("if (linked) openAppModal(linked);", source)
         self.assertIn("linked ? 'pencil' : 'plus'", source)
-        self.assertIn("svc.appId ? '编辑启动台应用' : '添加到启动台'", source)
+        self.assertIn("svc.appId ? '编辑启动台应用' : hasCapability('attach_external')", source)
         self.assertNotIn("configuredPortClaims", source)
 
     def test_adding_a_running_service_creates_and_attaches_in_one_flow(self):
         services = (ROOT / "static/js/services.js").read_text(encoding="utf-8")
         overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
 
-        self.assertIn("attachPid: s.pid", services)
+        self.assertIn("if (hasCapability('attach_external'))", services)
+        self.assertIn("draft.attachPid = s.pid", services)
         self.assertIn("let pendingAttach = null", overlays)
         self.assertIn("保存并认领", overlays)
         self.assertIn("body.attachPid = attachRequest.pid", overlays)
@@ -238,10 +239,99 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         app = (ROOT / "static/app.js").read_text(encoding="utf-8")
 
         self.assertIn("function consoleLifecycleSupported()", app)
-        self.assertIn("state.data.capabilities.restart_console === true", app)
+        self.assertIn("return hasCapability('restart_console');", app)
         self.assertIn("restartConsoleBtn.disabled = !lifecycleSupported", app)
         self.assertIn("stopConsoleBtn.disabled = !lifecycleSupported", app)
         self.assertEqual(app.count("if (!consoleLifecycleSupported()) return;"), 2)
+        self.assertGreaterEqual(app.count("if (!consoleLifecycleSupported()) {"), 2)
+
+    def test_platform_presentation_comes_from_state(self):
+        core = (ROOT / "static/js/core.js").read_text(encoding="utf-8")
+        widgets = (ROOT / "static/js/widgets.js").read_text(encoding="utf-8")
+        app = (ROOT / "static/app.js").read_text(encoding="utf-8")
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+
+        for field in (
+            "shortcutModifier",
+            "dataDir",
+            "logsDir",
+            "consoleLogPath",
+            "launchInstruction",
+            "lifecycleNotice",
+        ):
+            self.assertIn(field, core)
+        self.assertIn("shortcutLabel('K', data)", widgets)
+        self.assertIn("shortcutLabel('J', data)", widgets)
+        self.assertIn("shortcutLabel('V', data)", widgets)
+        self.assertIn("platformPresentation().launchInstruction", app)
+        self.assertNotIn("总控台.app", app)
+        self.assertNotIn("~/Library", html)
+        self.assertNotIn("kill -9", html)
+
+    def test_picker_uses_structured_path_and_command_fields(self):
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+
+        self.assertIn("r.commandSpec", overlays)
+        self.assertIn("r.platformCompatibility", overlays)
+        self.assertIn("r.dir", overlays)
+        self.assertIn("r.stem", overlays)
+        self.assertNotIn("shellQuotePath", overlays)
+        self.assertNotIn("fallbackScriptCommand", overlays)
+        self.assertNotIn("split('/')", overlays)
+        self.assertNotIn("lastIndexOf('/')", overlays)
+        self.assertIn("if (selectedCommandSpec) body.commandSpec", overlays)
+
+        core = (ROOT / "static/js/core.js").read_text(encoding="utf-8")
+        services = (ROOT / "static/js/services.js").read_text(encoding="utf-8")
+        self.assertNotIn("shortHome", core + services)
+        self.assertNotIn("/Users/", core + services)
+
+    def test_lifecycle_and_external_process_actions_are_capability_gated(self):
+        app = (ROOT / "static/app.js").read_text(encoding="utf-8")
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+        services = (ROOT / "static/js/services.js").read_text(encoding="utf-8")
+        widgets = (ROOT / "static/js/widgets.js").read_text(encoding="utf-8")
+
+        self.assertIn("hasCapability(running ? 'stop_managed' : 'launch_managed')", app)
+        self.assertIn("!hasCapability('stop_managed') || !hasCapability('launch_managed')", app)
+        self.assertIn("const capability = app.running ? 'stop_managed' : 'launch_managed'", launchpad)
+        self.assertIn("diagAttach.hidden = !hasCapability('attach_external')", launchpad)
+        self.assertIn("? hasCapability('stop_managed') : hasCapability('kill_external')", launchpad)
+        self.assertGreaterEqual(overlays.count("hasCapability('kill_external')"), 2)
+        self.assertIn("pendingAttach = hasCapability('attach_external')", overlays)
+        self.assertIn("r.kill.hidden = !hasCapability('kill_external')", services)
+        self.assertIn("if (!hasCapability('kill_external')) return;", services)
+        self.assertIn("batchStop.hidden = !canStop", widgets)
+        self.assertGreaterEqual(widgets.count("if (!hasCapability('stop_managed'))"), 2)
+
+    def test_windows_import_wizard_follows_preview_commit_rollback_contract(self):
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+        widgets = (ROOT / "static/js/widgets.js").read_text(encoding="utf-8")
+
+        for element_id in (
+            "importMask",
+            "importSourcePath",
+            "importMappingList",
+            "importPreview",
+            "importCommit",
+            "importRollback",
+        ):
+            self.assertIn(f'id="{element_id}"', html)
+        self.assertIn("post('/api/config/import/preview', request)", widgets)
+        self.assertIn("post('/api/config/import/commit', request)", widgets)
+        self.assertIn("post('/api/config/import/rollback', { importId: importReceiptId })", widgets)
+        self.assertIn("new Set(['ready', 'needs_review'])", widgets)
+        self.assertIn("checkbox.disabled = !selectable", widgets)
+        self.assertIn("selectedAppIds", widgets)
+        self.assertIn("platform !== 'windows'", widgets)
+        self.assertIn("closeSettingsCenter(false)", widgets)
+        self.assertIn("openLayer(importMask, importSourcePath, returnFocus)", widgets)
+
+    def test_windows_font_stack_precedes_macos_fallbacks(self):
+        ops = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
+        font_line = next(line for line in ops.splitlines() if "--font-sans:" in line)
+        self.assertLess(font_line.index("'Segoe UI'"), font_line.index("-apple-system"))
 
     def test_new_port_discovery_is_session_scoped_and_actionable(self):
         html = (ROOT / "static/index.html").read_text(encoding="utf-8")

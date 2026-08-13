@@ -4,7 +4,8 @@
    ============================================================ */
 import { $, el, setText, setChildren, icon, escapeHtml,
   post, put, del, act, toast, openLayer, closeLayer,
-  GLYPHS, findApp, bumpMutationEpoch } from './core.js';
+  GLYPHS, findApp, bumpMutationEpoch, hasCapability,
+  platformPresentation } from './core.js';
 
 /* ---------------- DOM 引用 ---------------- */
 const appModalMask = $('#appModalMask'), appModal = $('#appModal'), appModalTitle = $('#appModalTitle');
@@ -22,6 +23,7 @@ const iconPreviewTxt = $('#iconPreviewTxt');
 const appearanceDetails = $('#appearanceDetails'), appearanceChevron = $('#appearanceChevron');
 const appCancel = $('#appCancel'), appSave = $('#appSave');
 const appStopEdit = $('#appStopEdit'), editRunningNotice = $('#editRunningNotice');
+const commandCompatibility = $('#commandCompatibility');
 
 const confirmMask = $('#confirmMask'), confirmTitle = $('#confirmTitle'), confirmBody = $('#confirmBody');
 const forceRow = $('#forceRow'), forceCheck = $('#forceCheck');
@@ -35,18 +37,6 @@ const iconVer = new Map();   // appId → 图标版本号，上传/删除后刷�
 setChildren(appearanceChevron, icon('chevron-down', 16));
 export function bumpIconVer(id) { iconVer.set(id, (iconVer.get(id) || 0) + 1); }
 export function getIconVer(id) { return iconVer.get(id) || 0; }
-
-/* 兼容尚未重启的旧后端；新后端会返回经过同样规则生成的 command。 */
-function shellQuotePath(path) {
-  return "'" + String(path).replace(/'/g, "'\"'\"'") + "'";
-}
-function fallbackScriptCommand(path) {
-  const quoted = shellQuotePath(path);
-  const suffix = (String(path).match(/(\.[^./]+)$/) || [])[1]?.toLowerCase();
-  if (suffix === '.py') return 'python3 -- ' + quoted;
-  if (suffix === '.zsh') return '/bin/zsh -- ' + quoted;
-  return '/bin/bash -- ' + quoted;
-}
 
 /* ============================================================
    确认模态
@@ -79,6 +69,10 @@ confirmMask.addEventListener('mousedown', e => { if (e.target === confirmMask) c
 
 /* ---------------- 结束进程确认 ---------------- */
 export function confirmKill(svc) {
+  if (!hasCapability('kill_external')) {
+    toast(platformPresentation().lifecycleNotice);
+    return;
+  }
   openConfirm({
     title: '结束进程',
     bodyHtml: '确定要结束进程 <b>' + escapeHtml(svc.name || '') + '</b> 吗？' +
@@ -87,6 +81,10 @@ export function confirmKill(svc) {
     okText: '结束',
     showForce: true,
     onOk: async force => {
+      if (!hasCapability('kill_external')) {
+        toast(platformPresentation().lifecycleNotice);
+        return;
+      }
       await act(post('/api/kill', { pid: svc.pid, force }));
     },
   });
@@ -103,6 +101,42 @@ let selectedGlyph = null;    // 选中的 Lucide 图标名
 let removeStoredIcon = false; // 仅在保存成功后删除，取消编辑不触碰后端
 let pendingAttach = null;     // 从服务监控添加时待认领的来源进程信息
 let detectingProject = false; // 认领流程必须等项目命令识别完成后再允许保存
+let selectedCommandSpec = null;
+let selectedCompatibility = null;
+
+function compatibilityStatus(value) {
+  if (value && ['ready', 'needs_review', 'blocked'].includes(value.status)) {
+    return value.status;
+  }
+  return null;
+}
+
+function renderCommandCompatibility() {
+  const status = compatibilityStatus(selectedCompatibility)
+    || (selectedCommandSpec && selectedCommandSpec.needsReview ? 'needs_review' : null);
+  commandCompatibility.classList.toggle('needs-review', status === 'needs_review');
+  commandCompatibility.classList.toggle('blocked', status === 'blocked');
+  if (!status) {
+    commandCompatibility.hidden = true;
+    commandCompatibility.textContent = '';
+    return;
+  }
+  const label = status === 'ready' ? '可用于当前平台'
+    : status === 'needs_review' ? '保存后仍需人工复核，当前平台不会执行'
+      : '当前命令或路径不可用';
+  const reasons = selectedCompatibility && Array.isArray(selectedCompatibility.reasons)
+    ? selectedCompatibility.reasons.map(reason => reason && reason.message).filter(Boolean)
+    : [];
+  commandCompatibility.textContent = label + (reasons.length ? '：' + reasons.join('；') : '');
+  commandCompatibility.hidden = false;
+}
+
+function setStructuredCommand(commandSpec, compatibility) {
+  selectedCommandSpec = commandSpec && typeof commandSpec === 'object' ? commandSpec : null;
+  selectedCompatibility = compatibility && typeof compatibility === 'object'
+    ? compatibility : null;
+  renderCommandCompatibility();
+}
 
 export function buildGlyphGrid() {
   GLYPHS.forEach(g => {
@@ -215,23 +249,28 @@ function refreshEditSaveMode() {
   const needsStop = running && modalLifecycleChanged();
   const isTask = modalKind === 'task';
   const stopVerb = isTask ? '中止任务' : '停止服务';
+  const canStop = hasCapability('stop_managed');
+  const commandBlocked = compatibilityStatus(selectedCompatibility) === 'blocked';
   editRunningNotice.hidden = !running;
   if (running) {
-    setText(editRunningNotice, needsStop
-      ? '修改内容已保留。请先' + stopVerb + '，再继续保存。'
-      : (isTask ? '任务' : '服务') + '正在运行。可在这里先' + stopVerb +
-        '，编辑面板不会关闭，当前填写内容也不会丢失。');
+    setText(editRunningNotice, !canStop ? platformPresentation().lifecycleNotice
+      : needsStop ? '修改内容已保留。请先' + stopVerb + '，再继续保存。'
+        : (isTask ? '任务' : '服务') + '正在运行。可在这里先' + stopVerb +
+          '，编辑面板不会关闭，当前填写内容也不会丢失。');
   }
   setText(appStopEdit, stopVerb);
-  appStopEdit.hidden = !running;
-  appStopEdit.disabled = appSaving;
+  appStopEdit.hidden = !running || !canStop;
+  appStopEdit.disabled = appSaving || !canStop;
   appSave.hidden = false;
   const willAttach = !editingAppId && pendingAttach && modalKind === 'service'
     && readPortValue() === pendingAttach.port;
   setText(appSave, willAttach ? '保存并认领' : '保存');
-  appSave.disabled = appSaving || needsStop || (willAttach && detectingProject);
-  appSave.title = needsStop ? '请先在当前面板' + stopVerb
-    : (willAttach && detectingProject ? '正在识别可靠的项目启动命令' : '');
+  appSave.disabled = appSaving || needsStop || commandBlocked
+    || (willAttach && detectingProject);
+  appSave.title = commandBlocked ? '当前命令或路径不可用，请先修正'
+    : needsStop ? (canStop ? '请先在当前面板' + stopVerb
+      : platformPresentation().lifecycleNotice)
+      : (willAttach && detectingProject ? '正在识别可靠的项目启动命令' : '');
 }
 
 function setModalKind(kind) {
@@ -257,7 +296,8 @@ kindRow.querySelectorAll('.kind-btn').forEach(b =>
 
 export function openAppModal(app, presetKind, focusAction = '') {
   editingAppId = app ? app.id : null;
-  pendingAttach = !editingAppId && app && Number.isInteger(app.attachPid)
+  pendingAttach = hasCapability('attach_external') && !editingAppId && app
+    && Number.isInteger(app.attachPid)
     && app.attachPid > 0 && Number.isInteger(Number(app.port))
     ? {
         pid: app.attachPid,
@@ -275,6 +315,7 @@ export function openAppModal(app, presetKind, focusAction = '') {
   clearPendingIcon();
   removeStoredIcon = false;
   selectedGlyph = (app && app.glyph) || null;
+  setStructuredCommand(app && app.commandSpec, app && app.platformCompatibility);
   fName.value = (app && app.name) || '';
   fCmd.value = (app && app.command) || '';
   fCwd.value = (app && app.cwd) || '';
@@ -302,12 +343,14 @@ export function closeAppModal() {
   selectedGlyph = null;
   removeStoredIcon = false;
   pendingAttach = null;
+  setStructuredCommand(null, null);
 }
 
 function applyDetectedCandidate(candidate, option) {
   const previousAutoPort = detectedPortValue == null ? '' : String(detectedPortValue);
   const currentPort = fPort.value.trim();
   fCmd.value = candidate.command || '';
+  setStructuredCommand(candidate.commandSpec, candidate.platformCompatibility);
   clearFieldError(fCmd);
   setModalKind(candidate.kind || 'service');
   if (candidate.port != null) {
@@ -370,7 +413,8 @@ function renderDetection(result) {
       head.appendChild(port);
     }
     const command = el('span', 'detect-command mono');
-    command.textContent = candidate.command || '';
+    const mode = candidate.commandSpec && candidate.commandSpec.mode;
+    command.textContent = (mode ? '[' + mode + '] ' : '') + (candidate.command || '');
     const source = el('span', 'detect-source');
     source.textContent = candidate.source || '';
     option.append(head, command, source);
@@ -436,6 +480,10 @@ function clearFieldError(input) {
 
 async function stopEditingApp() {
   if (!editingAppId || !editingAppOriginal || !editingAppOriginal.running) return;
+  if (!hasCapability('stop_managed')) {
+    toast(platformPresentation().lifecycleNotice);
+    return;
+  }
   appSaving = true;
   refreshEditSaveMode();
   const isTask = modalKind === 'task';
@@ -463,6 +511,7 @@ function rememberSavedApp(app, id, body) {
     kind: body.kind,
     running: !!app.running,
   };
+  setStructuredCommand(app.commandSpec || body.commandSpec, app.platformCompatibility);
   setModalKind(body.kind);
 }
 
@@ -482,8 +531,10 @@ async function saveApp() {
     glyph: selectedGlyph || null,
     kind: modalKind,
   };
+  if (selectedCommandSpec) body.commandSpec = selectedCommandSpec;
   const wasCreating = !editingAppId;
-  const attachRequest = wasCreating && pendingAttach && modalKind === 'service'
+  const attachRequest = wasCreating && hasCapability('attach_external') && pendingAttach
+    && modalKind === 'service'
     && port === pendingAttach.port ? { ...pendingAttach } : null;
   if (attachRequest) body.attachPid = attachRequest.pid;
   appSaving = true;
@@ -563,13 +614,15 @@ export function initAppModal({ onAddService, onAddTask }) {
     try {
       const r = await act(post('/api/pick', { what: 'script' }));
       if (!r || r.canceled || !r.path) return;  // 取消或失败均静默
-      const p = r.path;
-      fCmd.value = r.command || fallbackScriptCommand(p);
-      const dir = p.slice(0, p.lastIndexOf('/'));
-      if (dir && !fCwd.value.trim()) fCwd.value = dir;
+      if (!r.command || !r.commandSpec) {
+        toast('选择结果缺少结构化命令，请刷新总控台后重试');
+        return;
+      }
+      fCmd.value = r.command;
+      setStructuredCommand(r.commandSpec, r.platformCompatibility);
+      if (r.dir && !fCwd.value.trim()) fCwd.value = r.dir;
       if (!fName.value.trim()) {
-        const base = p.split('/').pop().replace(/\.(command|sh|bash|zsh|py)$/i, '');
-        if (base) fName.value = base;
+        if (r.stem) fName.value = r.stem;
       }
       fCmd.classList.remove('invalid');
       refreshEditSaveMode();
@@ -583,13 +636,14 @@ export function initAppModal({ onAddService, onAddTask }) {
     }
   });
 
-  /* 浏览工作目录（macOS 原生选择框） */
+  /* 浏览工作目录（当前平台原生选择框） */
   btnPickCwd.addEventListener('click', async () => {
     btnPickCwd.disabled = true;
     try {
       const r = await act(post('/api/pick', { what: 'dir' }));
       if (r && !r.canceled && r.path) {
         fCwd.value = r.path;
+        if (!fName.value.trim() && r.stem) fName.value = r.stem;
         fCwd.classList.remove('invalid');
         refreshEditSaveMode();
         await detectProject();
@@ -600,11 +654,16 @@ export function initAppModal({ onAddService, onAddTask }) {
   });
   btnDetectProject.addEventListener('click', detectProject);
   fCwd.addEventListener('input', () => resetDetection(true));
-  [fName, fCmd, fCwd, fPort].forEach(input =>
+  [fName, fCwd, fPort].forEach(input =>
     input.addEventListener('input', () => {
       clearFieldError(input);
       refreshEditSaveMode();
     }));
+  fCmd.addEventListener('input', () => {
+    clearFieldError(fCmd);
+    setStructuredCommand(null, null);
+    refreshEditSaveMode();
+  });
 
   /* 图标：上传 / 粘贴 / 清除 */
   btnPickIcon.addEventListener('click', () => iconFile.click());

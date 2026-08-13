@@ -2,9 +2,29 @@
 
 ## Current result
 
+**P2 IMPLEMENTED_UNVERIFIED — Windows 11 non-admin storage, single-instance, read-only monitoring, and fail-closed HTTP capability tests pass locally; Windows 10 and the current branch CI gate are not yet verified.**
+
+Phase 2 adds the Windows adapter, pinned runtime dependencies, Local AppData/SID/DACL enforcement, a per-user/data-directory Named Mutex, `psutil` snapshots, a native picker, Windows exclusive socket binding, capability metadata, and route-level control rejection. The real source-process checks showed state builds under two seconds, visible current-user listeners, explicit degradation for protected processes, and rejection of a second writer. Phase 3–4 have not started.
+
+The remaining Phase 2 gate is environmental rather than an invitation to continue coding: run the candidate on Windows 10 non-admin and complete the current branch macOS/Windows CI checks. Until both are green, `lastGreenPhase` remains P1 and Phase 3 must not begin.
+
+## Phase 2 implemented scope
+
+- Added `localops/platform/windows.py` with Known Folder paths, current SID identity, protected DACL application/verification, Named Mutex locking, read-only snapshots, native picker, and exclusive socket configuration.
+- Added exact Windows runtime pins: `psutil==7.2.2` and `pywin32==312`.
+- Added native owner matching in the shared core without changing macOS numeric UID behavior.
+- Added `platform` and `capabilities` to the state contract as an intentional additive Phase 2 API change.
+- Disabled Windows launch, managed stop, force stop, external kill, external attach, and console restart in both adapter capabilities and HTTP handlers.
+- Added Windows tests for roots/UNC/junctions, Chinese/spaces paths, DACL principals, mutex recovery, IPv4/IPv6, protected/racing processes, picker cancellation, exclusive address use, read-only ACL failure, and no-side-effect route rejection.
+- Added a direct Windows CI job using Python 3.12 without Make/Bash.
+
+Local evidence: 15/15 Windows tests, 12/12 shared contract tests, 6/6 HTTP security tests, 7/7 Node port tests, 6/6 release/module checks, Ruff, compileall, platform-leak audit, and diff checks pass. The frontend contract is 13/14 solely because the known partial checkout still lacks the original `console-app-icon.png`; the project checker remains 9/11 because native Windows lacks `/bin/bash` and the original `AppIcon.icns` is not materialized.
+
+## Phase 1 result
+
 **P1 PASS — the platform boundary, complete macOS checks, release build, release verification, and reproducibility audit are green.**
 
-Phase 1 extracted the platform boundary and passed its focused contract, golden, lint, and platform-leak checks. macOS CI run `31659571268` passed the full `make check` gate, all 170 Python tests, the release build and verification, and a second byte-for-byte reproducibility build. Per the phase protocol, Phase 2–4 have not started.
+Phase 1 extracted the platform boundary and passed its focused contract, golden, lint, and platform-leak checks. macOS CI run `31659571268` passed the full `make check` gate, all 170 Python tests, the release build and verification, and a second byte-for-byte reproducibility build.
 
 ## Phase 1 completed implementation
 

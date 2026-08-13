@@ -2,11 +2,11 @@
 
 **Preview / Alpha · 源码预览**
 
-总控台是一个面向 macOS 的本地服务与批处理任务快速启动、运行监测工具。它把常用项目命令、长期服务和一次性批处理任务集中到本地网页中，并用 Python 3 标准库提供只绑定回环地址的后端；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
+总控台是一个本地服务与批处理任务快速启动、运行监测工具。macOS 版本保留完整现有功能；Windows 当前处于 Phase 2 只读源码预览，只提供安全的本地监听与进程观察，不提供进程控制。共享核心只绑定回环地址；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
 
 > 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整；`总控台.app` 目前不是可单独复制的自包含应用，也尚不代表经过签名、公证的最终 macOS 发行版。
 
-总控台只服务当前 Mac 和当前用户，不是远程运维、多人协作或公网管理面板。它能够以当前用户权限执行保存的 shell 命令；不要将监听地址、反向代理、SSH 隧道或端口映射暴露到不受信任的网络。
+总控台只服务当前机器和当前用户，不是远程运维、多人协作或公网管理面板。macOS 完整版能够以当前用户权限执行保存的 shell 命令；Windows Phase 2 明确禁用这类执行和进程控制。不要将监听地址、反向代理、SSH 隧道或端口映射暴露到不受信任的网络。
 
 ## 功能
 
@@ -33,6 +33,24 @@
 - Python 3.12。运行时仅使用 Python 标准库。
 - macOS 自带的 `ps`、`lsof`、`osascript` 等系统工具。
 - Safari、Chrome 或其他支持 ES Modules 的现代浏览器。
+
+Windows Phase 2 源码预览要求 Windows 10/11 x64、Python 3.12，以及 `requirements-windows.txt` 中锁定的依赖。当前提交仅在 Windows 11 非管理员会话完成本机验证；Windows 10 尚未完成真实机验收，因此不构成 Windows Beta 发布。
+
+## Windows Phase 2 只读源码预览
+
+在 PowerShell 中从项目根目录运行：
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-windows.txt
+.\.venv\Scripts\python.exe server.py
+```
+
+Windows 用户数据固定写入 `%LOCALAPPDATA%\LocalOps\`。程序使用当前用户 SID、SYSTEM 和 Administrators 的受保护 DACL；同一用户、同一数据目录通过 Named Mutex 保证只有一个写者。自定义数据或日志目录会拒绝盘符根、用户主目录、项目根目录、UNC 共享根以及 symlink/junction 路径。ACL 验证失败时配置进入只读保护。
+
+本阶段可用：当前用户可访问的 IPv4/IPv6 本地监听、进程信息、原生目录/文件选择、配置的非生命周期编辑。以下接口在 Windows 上明确返回拒绝且不产生副作用：外部进程结束、外部认领、应用启动、停止、重启、运行中生命周期修改和总控台重启。不要通过改前端或直接调用这些接口绕过限制；Windows 生命周期属于 Phase 4。
+
+Windows 不会自动导入项目内旧 `data/` 或 macOS 配置。显式预览、路径映射与 schema v2 属于 Phase 3。
 
 `VERSION` 是项目版本的唯一权威来源。`Info.plist`、发行包名和发行说明应与它保持一致。
 
@@ -231,7 +249,7 @@ python3 server.py
 
 ## 开发
 
-运行时无第三方 Python 依赖。重新生成品牌图标派生文件或图标库时需要开发依赖：
+macOS runtime 无第三方 Python 依赖；Windows runtime 使用 `requirements-windows.txt` 中精确锁定的 `psutil` 与 `pywin32`。重新生成品牌图标派生文件或图标库时需要开发依赖：
 
 ```bash
 python3 -m venv .venv
@@ -242,7 +260,8 @@ python3 -m pip install -r requirements-dev.txt
 主要目录：
 
 ```text
-server.py                 Python 标准库后端
+server.py                 共享 Python HTTP、配置与业务核心
+localops/platform/        macOS/Windows 原生 adapter
 static/                   原生前端、主题、品牌、图标和字体
 tests/                    后端、前端契约、发布与交付检查
 tools/gen_brand_assets.py 从品牌主图生成 favicon 与 macOS App Icon

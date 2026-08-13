@@ -89,3 +89,43 @@
 - Decision: Mark P1 `BLOCKED`, not `PASS`, until the complete existing suite passes on macOS with the original tracked assets.
 - Reason: Contract tests and a POSIX surrogate cannot prove macOS zero regression.
 - Consequence: No Phase 2, 3, or 4 implementation is started in this worktree.
+
+## P2-D001 — Use pinned native libraries for observation and Windows security
+
+- Status: Accepted
+- Phase: P2
+- Decision: Use `psutil==7.2.2` for listener/process observation and `pywin32==312` for Known Folder resolution, SID/DACL operations, and Named Mutex security.
+- Reason: Both libraries directly cover the required Windows primitives; replacing them with polling PowerShell/WMI subprocesses or a large custom `ctypes` layer would add latency and security-sensitive code without product value.
+- Consequence: macOS remains dependency-free at runtime, while Windows installs only `requirements-windows.txt`.
+
+## P2-D002 — Keep Windows lifecycle disabled at both adapter and HTTP boundaries
+
+- Status: Accepted
+- Phase: P2
+- Decision: Report observation and picker capabilities, but keep launch, managed stop, force stop, external kill, external attach, and console restart false. Reject their HTTP routes before scanning, persisting configuration, or invoking a control adapter.
+- Reason: Phase 2 has no Windows runner, Job Object, generation token, or verified runtime identity. Adapter-only failure is too late for attach/create and running-card mutations that can write state first.
+- Consequence: Windows is useful for read-only monitoring without creating a hidden path into unfinished process control.
+
+## P2-D003 — Make Windows storage security verifiable and fail read-only
+
+- Status: Accepted
+- Phase: P2
+- Decision: Store data under the Local AppData Known Folder, apply a protected DACL containing only the current SID, SYSTEM, and Administrators, and verify owner, ACE type, access mask, principals, and DACL protection. ACL verification failure disables configuration writes and log maintenance.
+- Reason: POSIX mode bits do not prove Windows privacy, and continuing to write after an ACL failure could expose commands or logs to another local user.
+- Consequence: `--prepare-storage` fails nonzero on an ACL issue; interactive startup may still expose diagnostics but remains in read-only protection.
+
+## P2-D004 — Use SID plus data-directory identity for one writer
+
+- Status: Accepted
+- Phase: P2
+- Decision: Name a session-local Windows Mutex from SHA-256(current SID + canonical data directory) and protect it with the same private principals.
+- Reason: A port is not a writer lock, and a lock file alone does not provide reliable Windows crash recovery or per-user object security.
+- Consequence: The second instance for the same user/data directory is rejected, while closing or crashing releases the kernel object automatically.
+
+## P2-D005 — Optimize only the Windows origin scan that blocked real state delivery
+
+- Status: Accepted
+- Phase: P2
+- Decision: Query listener process details normally, but build Windows PPID ancestry only for observed current-user listeners and do not fetch every ancestor command line in Phase 2.
+- Reason: Full-machine `cmdline` enumeration took about five seconds on the real non-admin host and caused the first `/api/state` request to time out. SID-first filtering plus targeted PPID ancestry reduced repeated real state builds to under two seconds while preserving the required current-user service rows.
+- Consequence: Windows Phase 2 origin badges are best-effort and may be absent; macOS attribution behavior is unchanged.

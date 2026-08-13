@@ -13,6 +13,11 @@ def load_platform(base_dir: str, entrypoint: str) -> PlatformBackend:
 
         return MacOSPlatform(base_dir=base_dir, entrypoint=entrypoint)
 
+    if sys.platform == "win32":
+        from .windows import WindowsPlatform
+
+        return WindowsPlatform(base_dir=base_dir, entrypoint=entrypoint)
+
     from .unsupported import UnsupportedPlatform
 
     return UnsupportedPlatform(sys.platform)

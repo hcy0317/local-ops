@@ -14,7 +14,7 @@
 - macOS 12 或更高版本；
 - Python 3.12；
 - Node.js，仅用于 JavaScript 语法检查；
-- 运行时无第三方 Python 依赖。
+- macOS runtime 无第三方 Python 依赖；Windows runtime 只允许使用 `requirements-windows.txt` 中精确锁定并通过 CI 的依赖。
 
 只有重新生成纹理时才需要开发依赖：
 

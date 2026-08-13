@@ -26,6 +26,7 @@ from .contracts import (
 
 class UnsupportedPlatform:
     capabilities = PlatformCapabilities()
+    requires_verified_permissions = False
 
     def __init__(self, name: str):
         self.name = name
@@ -42,6 +43,25 @@ class UnsupportedPlatform:
             os.environ.get("USERNAME") or os.environ.get("USER") or "unknown",
             -1,
         )
+
+    @staticmethod
+    def validate_runtime_path(path: str, forbidden: set[str]) -> str:
+        normalized = os.path.abspath(path)
+        if normalized in forbidden:
+            raise ValueError("runtime path must be a dedicated subdirectory")
+        return normalized
+
+    @staticmethod
+    def ensure_private_directory(path: str) -> None:
+        return None
+
+    @staticmethod
+    def ensure_private_file(path: str) -> None:
+        return None
+
+    @staticmethod
+    def should_migrate_legacy_data() -> bool:
+        return False
 
     @staticmethod
     def launch_environment(
@@ -65,7 +85,7 @@ class UnsupportedPlatform:
     def process_cwds(self, pids: set[int]) -> CwdSnapshot:
         return CwdSnapshot(ScanStatus.FAILED, issues=(self._issue,))
 
-    def process_parents(self) -> ProcessSnapshot:
+    def process_parents(self, pids: set[int] | None = None) -> ProcessSnapshot:
         return ProcessSnapshot(ScanStatus.FAILED, issues=(self._issue,))
 
     def process_groups(self) -> ProcessSnapshot:
@@ -112,3 +132,7 @@ class UnsupportedPlatform:
 
     def platform_metadata(self) -> Mapping[str, object]:
         return {"platform": self.name, "capabilities": self.capabilities.__dict__}
+
+    @staticmethod
+    def configure_server_socket(sock: object) -> None:
+        return None

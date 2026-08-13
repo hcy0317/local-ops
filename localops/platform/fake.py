@@ -33,6 +33,7 @@ class FakeInstanceLock:
 @dataclass
 class FakePlatform:
     name: str = "fake"
+    requires_verified_permissions: bool = False
     capabilities: PlatformCapabilities = field(
         default_factory=lambda: PlatformCapabilities(
             monitor_processes=True,
@@ -81,6 +82,21 @@ class FakePlatform:
     def current_principal(self) -> Principal:
         return self.principal
 
+    def validate_runtime_path(self, path: str, forbidden: set[str]) -> str:
+        if path in forbidden:
+            raise ValueError("runtime path must be a dedicated subdirectory")
+        return path
+
+    def ensure_private_directory(self, path: str) -> None:
+        self.calls.append(("ensure_private_directory", path))
+
+    def ensure_private_file(self, path: str) -> None:
+        self.calls.append(("ensure_private_file", path))
+
+    @staticmethod
+    def should_migrate_legacy_data() -> bool:
+        return True
+
     def acquire_instance_lock(self, identity: str) -> FakeInstanceLock | None:
         self.calls.append(("acquire_instance_lock", identity))
         return FakeInstanceLock() if self.lock_available else None
@@ -99,7 +115,8 @@ class FakePlatform:
         self.calls.append(("process_cwds", pids))
         return self.cwds
 
-    def process_parents(self) -> ProcessSnapshot:
+    def process_parents(self, pids: set[int] | None = None) -> ProcessSnapshot:
+        self.calls.append(("process_parents", pids))
         return self.parents
 
     def process_groups(self) -> ProcessSnapshot:
@@ -154,3 +171,6 @@ class FakePlatform:
 
     def platform_metadata(self) -> Mapping[str, object]:
         return {"platform": self.name, "capabilities": self.capabilities.__dict__}
+
+    def configure_server_socket(self, sock: object) -> None:
+        self.calls.append(("configure_server_socket", sock))

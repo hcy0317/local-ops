@@ -27,6 +27,15 @@
 - [ ] GitHub Bug/Feature Issue 表单与 Pull Request 模板仍符合当前安全、隐私和素材门禁。
 - [ ] 已人工复核从上一版本到当前 commit 的完整 diff。
 
+### Windows Phase 2 源码门禁
+
+- [ ] `requirements-windows.txt` 中 `psutil` 与 `pywin32` 精确锁定，并在 Windows Python 3.12 CI 中从零安装成功。
+- [ ] Windows adapter import、compile、contract 与 `tests/windows/` 全部通过，测试数量大于 0。
+- [ ] 普通用户 Windows 10 与 Windows 11 均验证 Local AppData、SID/DACL、Named Mutex、IPv4/IPv6 和受保护进程降级行为。
+- [ ] Windows HTTP socket 使用 `SO_EXCLUSIVEADDRUSE`，仍只绑定 `127.0.0.1`。
+- [ ] Windows capability flags 禁用 attach/kill/start/stop/restart，相关 API 在扫描、写配置或控制进程前返回拒绝。
+- [ ] 未完成 Windows 10、完整生命周期与打包验收时，发行说明明确标记为只读源码预览，不使用 Beta 或 production-ready 表述。
+
 ## 3. 安全与进程生命周期
 
 - [ ] HTTP 服务仅绑定 `127.0.0.1`，不会因配置或启动方式变为局域网可访问。

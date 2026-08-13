@@ -49,6 +49,8 @@
       "consoleCwd",
       "version",
       "schemaVersion",
+      "platform",
+      "capabilities",
       "degraded",
       "degradedReasons",
       "configHealth",

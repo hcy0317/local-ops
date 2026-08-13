@@ -47,20 +47,22 @@ DEFAULT_LOGS_DIR = PLATFORM_PATHS.logs_dir
 
 def resolve_runtime_dir(name, default):
     """解析专用运行目录，拒绝空值、相对路径和过宽目标。"""
-    if name not in os.environ:
-        return os.path.abspath(default), False
-    raw = (os.environ.get(name) or "").strip()
+    overridden = name in os.environ
+    raw = (os.environ.get(name) or "").strip() if overridden else default
     if not raw:
         raise RuntimeError("%s 不能为空" % name)
     expanded = os.path.expanduser(raw)
-    if not os.path.isabs(expanded):
+    if overridden and not os.path.isabs(expanded):
         raise RuntimeError("%s 必须是绝对路径" % name)
     path = os.path.abspath(expanded)
     forbidden = {os.path.abspath(os.sep), os.path.abspath(os.path.expanduser("~")),
                  os.path.abspath(BASE_DIR)}
-    if path in forbidden:
-        raise RuntimeError("%s 必须指向专用子目录" % name)
-    return path, True
+    try:
+        path = PLATFORM.validate_runtime_path(path, forbidden)
+    except ValueError as exc:
+        raise RuntimeError("%s 必须指向安全的专用子目录: %s" %
+                           (name, exc)) from exc
+    return path, overridden
 
 
 DATA_DIR, DATA_DIR_OVERRIDDEN = resolve_runtime_dir(
@@ -121,6 +123,23 @@ LOG_LOCK = threading.RLock()
 MANUAL_STOP_LOCK = threading.RLock()
 MANUAL_STOP_TOKENS = set()
 _PLATFORM_SCAN_STATE = threading.local()
+
+
+def process_owned_by_current(info):
+    """Match native process ownership without assuming a POSIX numeric UID."""
+    if not info:
+        return False
+    owner = info.get("owner")
+    if owner is not None:
+        return owner == SELF_PRINCIPAL.identifier
+    return info.get("uid") == SELF_UID
+
+
+def process_owner_value(info):
+    if not info:
+        return None
+    owner = info.get("owner")
+    return owner if owner is not None else info.get("uid")
 
 
 def _begin_platform_scan_cycle():
@@ -210,8 +229,10 @@ def _ensure_private_dir(path):
     if os.path.islink(path) or not os.path.isdir(path):
         raise OSError("私有运行路径不是安全目录: %s" % path)
     try:
-        os.chmod(path, 0o700)
+        PLATFORM.ensure_private_directory(path)
     except OSError:
+        if PLATFORM.requires_verified_permissions:
+            raise
         LOG.warning("无法收紧目录权限: %s", path)
 
 
@@ -229,6 +250,7 @@ def _copy_private_regular_file(source, target):
         target_fd = os.open(
             target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
+            PLATFORM.ensure_private_file(target)
             with os.fdopen(os.dup(source_fd), "rb") as src, \
                     os.fdopen(target_fd, "wb") as dst:
                 target_fd = -1
@@ -240,7 +262,7 @@ def _copy_private_regular_file(source, target):
                 os.close(target_fd)
     finally:
         os.close(source_fd)
-    os.chmod(target, 0o600)
+    PLATFORM.ensure_private_file(target)
     return True
 
 
@@ -255,7 +277,7 @@ def _install_migrated_directory(target, populate):
     staging = tempfile.mkdtemp(prefix=".console-migration-", dir=parent)
     installed = False
     try:
-        os.chmod(staging, 0o700)
+        PLATFORM.ensure_private_directory(staging)
         populate(staging)
         try:
             os.rename(staging, target)
@@ -282,6 +304,8 @@ def migrate_legacy_runtime_data(
     旧文件不会被删除或改权限。
     """
     result = {"dataMigrated": False, "logsMigrated": False}
+    if not PLATFORM.should_migrate_legacy_data():
+        return result
     legacy_data_dir = os.path.abspath(legacy_data_dir)
     data_dir = os.path.abspath(data_dir)
     logs_dir = os.path.abspath(logs_dir)
@@ -327,12 +351,18 @@ def migrate_legacy_runtime_data(
 
 def prepare_runtime_storage():
     migration = migrate_legacy_runtime_data()
+    security_issues = []
     for private_dir in (DATA_DIR, ICONS_DIR, LOGS_DIR):
-        _ensure_private_dir(private_dir)
+        try:
+            _ensure_private_dir(private_dir)
+        except PermissionError as exc:
+            security_issues.append("运行目录 ACL 验证失败: %s" % exc)
     for path in (CONFIG_PATH, CONFIG_PATH + ".bak", INSTANCE_LOCK_PATH):
         try:
             if stat.S_ISREG(os.lstat(path).st_mode):
-                os.chmod(path, 0o600)
+                PLATFORM.ensure_private_file(path)
+        except PermissionError as exc:
+            security_issues.append("运行文件 ACL 验证失败: %s" % exc)
         except OSError:
             pass
     for directory in (ICONS_DIR, LOGS_DIR):
@@ -344,20 +374,29 @@ def prepare_runtime_storage():
             for entry in entries:
                 try:
                     if entry.is_file(follow_symlinks=False):
-                        os.chmod(entry.path, 0o600)
+                        PLATFORM.ensure_private_file(entry.path)
+                except PermissionError as exc:
+                    security_issues.append("运行文件 ACL 验证失败: %s" % exc)
                 except OSError:
                     LOG.warning("无法收紧文件权限: %s", entry.path)
+    migration["securityIssues"] = list(dict.fromkeys(security_issues))
     return migration
 
 
 def write_private_bytes(path, payload):
     """以 0600 权限写入用户数据文件。"""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(payload)
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(path, 0o600)
+    try:
+        PLATFORM.ensure_private_file(path)
+        with os.fdopen(fd, "wb") as f:
+            fd = -1
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    PLATFORM.ensure_private_file(path)
 
 
 # ---------------------------------------------------------------- 配置
@@ -418,13 +457,15 @@ class Config:
                    "lastPgid": None, "runToken": None,
                    "attached": False, "lastExit": None, "createdAt": 0}
 
-    def __init__(self, path):
+    def __init__(self, path, force_read_only_reason=None):
         self._lock = threading.RLock()
         self._path = path
-        self._writable = True
+        self._writable = not bool(force_read_only_reason)
         self._recovered_from_backup = False
         self._migration_from = None
-        self._health_issues = []
+        self._health_issues = (
+            [str(force_read_only_reason)] if force_read_only_reason else []
+        )
         self._data = self._load()
 
     @staticmethod
@@ -469,9 +510,10 @@ class Config:
                     LOG.warning("主配置不可读，已从备份恢复: %s", path)
                 if source_version < CURRENT_SCHEMA_VERSION:
                     self._migration_from = source_version
-                self._persist_loaded_state(
-                    data, raw, source_index=index,
-                    source_version=source_version)
+                if self._writable:
+                    self._persist_loaded_state(
+                        data, raw, source_index=index,
+                        source_version=source_version)
                 return data
             except FileNotFoundError:
                 continue
@@ -492,6 +534,8 @@ class Config:
             self._writable = False
             self._health_issues.append(
                 "主配置与备份均不可读，已进入只读保护状态")
+            return data
+        if not self._writable:
             return data
         try:
             self._write_atomic(self._path, self._payload(data))
@@ -554,12 +598,18 @@ class Config:
         _ensure_private_dir(os.path.dirname(path) or ".")
         tmp = path + ".tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
+        try:
+            PLATFORM.ensure_private_file(tmp)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = -1
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+        finally:
+            if fd >= 0:
+                os.close(fd)
         os.replace(tmp, path)
-        os.chmod(path, 0o600)
+        PLATFORM.ensure_private_file(path)
 
 
 def acquire_instance_lock(path=INSTANCE_LOCK_PATH):
@@ -772,9 +822,9 @@ _ORIGIN_BUNDLE_RE = re.compile(r"/([^/]+)\.app/Contents/MacOS/", re.I)
 _ORIGIN_MULTIPLEXERS = {"tmux": "tmux", "screen": "screen"}
 
 
-def origin_snapshot():
+def origin_snapshot(pids=None):
     """Return {pid: (ppid, args)} for origin attribution."""
-    snapshot = PLATFORM.process_parents()
+    snapshot = PLATFORM.process_parents(None if pids is None else set(pids))
     _record_platform_issues(snapshot.status, snapshot.issues)
     return {
         pid: (int(info.get("ppid", 0)), str(info.get("args") or ""))
@@ -831,9 +881,9 @@ def build_services(cfg, groups=None):
     snap = ps_snapshot({pid for pid, _ in listeners}, with_uid=True)
     mine_pids = [pid for pid, _ in listeners
                  if pid != SELF_PID and pid in snap
-                 and snap[pid].get("uid") == SELF_UID]
+                 and process_owned_by_current(snap[pid])]
     cwds = lsof_cwds(mine_pids)
-    origin_table = origin_snapshot()
+    origin_table = origin_snapshot(mine_pids) if mine_pids else {}
 
     hidden = set(cfg.get("hidden") or [])
     pinned = set(cfg.get("pinned") or [])
@@ -848,7 +898,7 @@ def build_services(cfg, groups=None):
         if pid == SELF_PID:
             continue
         info = snap.get(pid)
-        if not info or info.get("uid") != SELF_UID:
+        if not process_owned_by_current(info):
             continue
         comm = info.get("comm") or ""
         args = info.get("args") or comm
@@ -894,7 +944,7 @@ def build_watched(keywords):
     snap = ps_snapshot(None, with_uid=True)
     result = []
     for pid, info in sorted(snap.items()):
-        if pid == SELF_PID or info.get("uid") != SELF_UID:
+        if pid == SELF_PID or not process_owned_by_current(info):
             continue
         name = os.path.basename(info.get("comm") or "") or "?"
         if name in ("ps", "lsof"):
@@ -958,7 +1008,7 @@ def managed_process_index(apps, groups=None):
         marker = RUN_TOKEN_ARG_PREFIX + token if token else None
         current_user = sorted(
             pid for pid in candidates.get(app.get("id"), set())
-            if snap.get(pid, {}).get("uid") == SELF_UID)
+            if process_owned_by_current(snap.get(pid)))
         controller_found = bool(marker and any(
             marker in snap.get(pid, {}).get("args", "") for pid in current_user))
         # 随机标记在进程组的常驻外层 shell 上；校验后整组均为受控后代。
@@ -1002,7 +1052,7 @@ def legacy_managed_pid(app, listeners=None, snap=None, cwds=None):
         cwds = lsof_cwds(port_pids)
     matches = []
     for pid in sorted(port_pids):
-        if snap.get(pid, {}).get("uid") != SELF_UID:
+        if not process_owned_by_current(snap.get(pid)):
             continue
         actual_cwd = cwds.get(pid)
         if not actual_cwd:
@@ -1099,7 +1149,7 @@ def build_apps(cfg, listeners, groups=None):
                 "cwd": owner_cwd,
                 "project": project_name(owner_cwd),
                 "uid": owner_info.get("uid"),
-                "currentUser": owner_info.get("uid") == SELF_UID,
+                "currentUser": process_owned_by_current(owner_info),
                 "uptimeSec": owner_info.get("etime"),
                 "appId": owner_app.get("id") if owner_app else None,
                 "appName": owner_app.get("name") if owner_app else None,
@@ -1188,6 +1238,7 @@ def build_state(cfg, console_port, config_health=None):
         }
         if reason not in degraded_reasons:
             degraded_reasons.append(reason)
+    platform_metadata = PLATFORM.platform_metadata()
     return {
         "services": services,
         "watched": watched,
@@ -1198,6 +1249,8 @@ def build_state(cfg, console_port, config_health=None):
         "consoleCwd": BASE_DIR,
         "version": APP_VERSION,
         "schemaVersion": cfg.get("schemaVersion", CURRENT_SCHEMA_VERSION),
+        "platform": platform_metadata.get("platform", PLATFORM.name),
+        "capabilities": dict(platform_metadata.get("capabilities") or {}),
         "degraded": bool(degraded_reasons),
         "degradedReasons": degraded_reasons,
         "configHealth": dict(config_health or {}),
@@ -1318,8 +1371,7 @@ def process_uid(pid):
         _record_platform_issues(snapshot.status, snapshot.issues)
     except PlatformScanError:
         return None
-    owner = snapshot.processes.get(int(pid), {}).get("uid")
-    return owner if isinstance(owner, int) else None
+    return process_owner_value(snapshot.processes.get(int(pid)))
 
 
 def kill_process(pid, force):
@@ -1953,7 +2005,7 @@ def _current_user_group_members(pgid):
         return []
     snap = ps_snapshot(members, with_uid=True)
     return sorted(pid for pid in members
-                  if snap.get(pid, {}).get("uid") == SELF_UID)
+                  if process_owned_by_current(snap.get(pid)))
 
 
 def resolve_app_stop_target(app, listeners=None):
@@ -2014,7 +2066,7 @@ def stop_target_alive(target, expected_uid=None):
         return False
     if expected_uid is None:
         expected_uid = process_uid(target["id"])
-    return expected_uid == SELF_UID
+    return expected_uid in (SELF_UID, SELF_PRINCIPAL.identifier)
 
 
 def stop_app_and_wait(app, timeout=APP_STOP_TIMEOUT_SEC, listeners=None):
@@ -2089,7 +2141,7 @@ def inspect_attach_process(cfg, app, pid):
     if (pid, port) not in listeners:
         return False, "PID %d 并未监听端口 %d，进程可能已退出" % (pid, port), {"status": 409}
     snap = ps_snapshot({pid}, with_uid=True)
-    if snap.get(pid, {}).get("uid") != SELF_UID:
+    if not process_owned_by_current(snap.get(pid)):
         return False, "该进程不属于当前用户，不能认领", {"status": 403}
     cfg_now = cfg.snapshot()
     owners = listener_app_owners(cfg_now.get("apps") or [], listeners, snap, None)
@@ -2542,7 +2594,11 @@ def serialized_app_operation(fn):
 
 class ConsoleServer(ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    allow_reuse_address = False
+
+    def server_bind(self):
+        PLATFORM.configure_server_socket(self.socket)
+        super().server_bind()
 
     def __init__(self, addr, handler_cls, cfg, port):
         super().__init__(addr, handler_cls)
@@ -2559,7 +2615,8 @@ class ConsoleServer(ThreadingHTTPServer):
         """空闲连接超时 / 客户端中途断开属正常现象，不刷 traceback。"""
         exc_type, exc, _ = sys.exc_info()
         if exc_type and isinstance(exc, (TimeoutError, BrokenPipeError,
-                                         ConnectionResetError)):
+                                         ConnectionResetError,
+                                         ConnectionAbortedError)):
             return
         super().handle_error(request, client_address)
 
@@ -2614,6 +2671,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         sys.stderr.write("%s - %s\n" % (self.client_address[0], fmt % args))
+
+    def _require_capability(self, name, message):
+        if getattr(PLATFORM.capabilities, name, False):
+            return True
+        self.send_json({"ok": False, "error": message}, 409)
+        return False
 
     def _parsed_request_host(self):
         """Return (hostname, port) only for the exact local console origin."""
@@ -2986,6 +3049,9 @@ class Handler(BaseHTTPRequestHandler):
         if err:
             self.send_err(400, err)
             return
+        if not self._require_capability(
+                "pick_path", "当前平台未启用系统路径选择器"):
+            return
         what = data.get("what")
         if what not in ("dir", "script"):
             self.send_err(400, "what 必须是 dir/script")
@@ -3034,6 +3100,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"ok": True, "theme": theme_id})
 
     def handle_console_restart(self):
+        if not self._require_capability(
+                "restart_console", "当前平台或阶段未启用总控台重启"):
+            return
         reserved, current, helper_pid = self.server.reserve_console_action("restart")
         if not reserved:
             if current == "restart":
@@ -3076,6 +3145,9 @@ class Handler(BaseHTTPRequestHandler):
         data, err = self.read_json_body()
         if err:
             self.send_err(400, err)
+            return
+        if not self._require_capability(
+                "kill_external", "当前平台或阶段禁止结束外部进程"):
             return
         pid = data.get("pid")
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
@@ -3148,6 +3220,9 @@ class Handler(BaseHTTPRequestHandler):
                 or isinstance(attach_pid, bool)
                 or attach_pid <= 0):
             self.send_err(400, "attachPid 必须是正整数")
+            return
+        if attach_pid is not None and not self._require_capability(
+                "attach_external", "当前平台或阶段禁止认领外部进程"):
             return
         fields, err = validate_app_fields(data, partial=False)
         if err:
@@ -3282,6 +3357,9 @@ class Handler(BaseHTTPRequestHandler):
 
     @serialized_app_operation
     def handle_app_start(self, app_id):
+        if not self._require_capability(
+                "launch_managed", "当前平台或阶段未启用应用启动"):
+            return
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
@@ -3329,6 +3407,9 @@ class Handler(BaseHTTPRequestHandler):
 
     @serialized_app_operation
     def handle_app_stop(self, app_id):
+        if not self._require_capability(
+                "stop_managed", "当前平台或阶段未启用应用停止"):
+            return
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
@@ -3350,6 +3431,9 @@ class Handler(BaseHTTPRequestHandler):
         if err:
             self.send_err(400, err)
             return
+        if not self._require_capability(
+                "attach_external", "当前平台或阶段禁止认领外部进程"):
+            return
         pid = data.get("pid")
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
             self.send_err(400, "pid 必须是正整数")
@@ -3364,6 +3448,11 @@ class Handler(BaseHTTPRequestHandler):
 
     @serialized_app_operation
     def handle_app_restart(self, app_id):
+        if not (self._require_capability(
+                "stop_managed", "当前平台或阶段未启用应用重启")
+                and self._require_capability(
+                    "launch_managed", "当前平台或阶段未启用应用重启")):
+            return
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
@@ -3495,6 +3584,10 @@ class Handler(BaseHTTPRequestHandler):
                 for key in lifecycle_fields)
             stopped_for_update = False
             if lifecycle_changed and app_alive_sign(app):
+                if not self._require_capability(
+                        "stop_managed",
+                        "当前平台或阶段禁止修改运行中应用的生命周期配置"):
+                    return
                 if not stop_before_update:
                     stop_label = ("中止任务"
                                   if (app.get("kind") or "service") == "task"
@@ -3565,6 +3658,9 @@ class Handler(BaseHTTPRequestHandler):
         if app is None:
             return
         if app_running(app):
+            if not self._require_capability(
+                    "stop_managed", "当前平台或阶段禁止删除运行中的应用"):
+                return
             stopped, error = stop_app_and_clear(self.server.cfg, app)
             if not stopped:
                 self.send_err(409, "删除已取消：%s" %
@@ -3635,7 +3731,7 @@ def find_console_instances():
     candidates = []
     for pid, info in snap.items():
         args = info.get("args") or ""
-        if (pid == SELF_PID or info.get("uid") != SELF_UID
+        if (pid == SELF_PID or not process_owned_by_current(info)
                 or "server.py" not in args
                 or "--restart-helper" in args):
             continue
@@ -3702,7 +3798,7 @@ def launcher_main():
     preferred = min(preferred_ports) if preferred_ports else PORT_START
     targets = [item["pid"] for item in instances]
     for pid in targets:
-        if process_uid(pid) == SELF_UID:
+        if process_uid(pid) in (SELF_UID, SELF_PRINCIPAL.identifier):
             PLATFORM.stop_external_process(pid, force=False)
     deadline = time.monotonic() + 8.0
     while time.monotonic() < deadline and any(pid_alive(pid) for pid in targets):
@@ -3745,14 +3841,21 @@ def restart_helper(old_pid, preferred_port):
     return PLATFORM.complete_console_restart(old_pid, preferred_port)
 
 
-def _run_console(preferred_port=None, open_browser=True):
+def _run_console(preferred_port=None, open_browser=True, storage_issues=None):
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    for private_dir in (DATA_DIR, ICONS_DIR, LOGS_DIR):
-        _ensure_private_dir(private_dir)
-    start_log_maintenance()
-    cfg = Config(CONFIG_PATH)
+    storage_issues = list(storage_issues or [])
+    if not storage_issues:
+        start_log_maintenance()
+    cfg = Config(
+        CONFIG_PATH,
+        force_read_only_reason=(
+            "Windows 存储安全验证失败，已进入只读保护: "
+            + "; ".join(storage_issues)
+            if storage_issues else None
+        ),
+    )
 
     server, port = None, None
     candidates = list(range(PORT_START, PORT_START + PORT_TRIES))
@@ -3808,7 +3911,7 @@ def redirect_console_output():
 def main(preferred_port=None, open_browser=True, log_to_file=False):
     """Run exactly one console for this project/data directory."""
     migration = prepare_runtime_storage()
-    if log_to_file:
+    if log_to_file and not migration.get("securityIssues"):
         redirect_console_output()
     if migration["dataMigrated"]:
         print("已将项目内旧配置和图标复制到: %s" % DATA_DIR,
@@ -3826,7 +3929,7 @@ def main(preferred_port=None, open_browser=True, log_to_file=False):
                 PLATFORM.open_browser("http://%s:%d/" % (HOST, min(ports)))
         return False
     try:
-        _run_console(preferred_port, open_browser)
+        _run_console(preferred_port, open_browser, migration.get("securityIssues"))
         return True
     finally:
         release_instance_lock(instance_lock)
@@ -3835,7 +3938,11 @@ def main(preferred_port=None, open_browser=True, log_to_file=False):
 if __name__ == "__main__":
     if "--prepare-storage" in sys.argv:
         # 供安装/诊断流程预先验证迁移和目录权限，不启动 HTTP。
-        prepare_runtime_storage()
+        storage = prepare_runtime_storage()
+        if storage.get("securityIssues"):
+            for issue in storage["securityIssues"]:
+                print(issue, file=sys.stderr)
+            sys.exit(1)
     elif "--launcher" in sys.argv:
         launcher_main()
     elif "--restart-helper" in sys.argv:

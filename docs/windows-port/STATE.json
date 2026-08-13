@@ -3,14 +3,22 @@
   "task": "local-ops-windows-port",
   "baselineCommit": "a5c3adae1f1fa0bd9f0ac7b090ec422e285d0c0f",
   "branch": "windows-port/phases-1-4",
-  "currentPhase": "P1",
-  "phaseStatus": "PASS",
+  "currentPhase": "P2",
+  "phaseStatus": "IMPLEMENTED_UNVERIFIED",
   "lastGreenPhase": "P1",
-  "macosTests": "PASS",
-  "windowsTests": "FAIL",
+  "macosTests": "NOT_RUN",
+  "windowsTests": "PASS",
   "windowsBetaReady": false,
   "changedFiles": [
     "MEMORY.md",
+    ".github/workflows/ci.yml",
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "README.md",
+    "RELEASE_CHECKLIST.md",
+    "SECURITY.md",
+    "THIRD_PARTY_NOTICES.md",
     "docs/specs/windows-native-port.md",
     "docs/windows-port/PLAN.md",
     "docs/windows-port/BASELINE-CONTRACTS.json",
@@ -25,10 +33,15 @@
     "localops/platform/loader.py",
     "localops/platform/macos.py",
     "localops/platform/unsupported.py",
+    "localops/platform/windows.py",
+    "requirements-windows.txt",
     "server.py",
     "tests/contract/__init__.py",
     "tests/contract/test_baseline_golden.py",
     "tests/contract/test_platform_contract.py",
+    "tests/windows/__init__.py",
+    "tests/windows/test_windows_platform.py",
+    "tests/windows/test_windows_server.py",
     "tests/test_server.py",
     "tools/build_release.py",
     "tools/check_platform_leaks.py",
@@ -45,21 +58,29 @@
     "P1-D002",
     "P1-D003",
     "P1-D004",
-    "P1-D005"
+    "P1-D005",
+    "P2-D001",
+    "P2-D002",
+    "P2-D003",
+    "P2-D004",
+    "P2-D005"
   ],
   "assumptions": [
     "The current local environment can provide native Windows 11 non-admin evidence but cannot provide macOS or Windows 10 evidence."
   ],
   "knownBlockers": [
-    "No Windows 10 or clean Windows VM is available for later phase evidence."
+    "No Windows 10 host or VM is available for the Phase 2 cross-version gate.",
+    "The current Phase 2 candidate has not yet run in branch CI."
   ],
   "knownFailures": [
-    "The full native Windows Python discovery run executed 36 tests and ended with 2 failures and 3 errors.",
-    "The native Windows project checker passed 9 checks and failed the Bash and missing AppIcon.icns checks.",
-    "The Node.js port helper suite passed 7 of 7 tests.",
-    "Phase 1 contract and baseline-golden tests passed 12 of 12 on native Windows.",
-    "The current full Python discovery ran 170 tests and failed with 22 failures and 11 errors because the Windows adapter is intentionally unsupported before Phase 2, POSIX-only tests ran on Windows, and two tracked assets remain unavailable."
+    "The native Windows project checker passed 9 checks and failed only the existing Bash and missing AppIcon.icns host checks.",
+    "The frontend contract passed 13 of 14; the existing partial checkout lacks the original console-app-icon.png blob."
   ],
-  "nextAction": "Keep Phase 2–4 untouched until the next phase begins; Phase 2 must start from the documented storage, single-instance, and read-only monitoring scope.",
-  "lastVerifiedAt": "2026-08-13T10:03:55+08:00"
+  "verifiedResults": [
+    "The Phase 2 Windows suite passed 15 of 15 tests and the shared contract suite passed 12 of 12.",
+    "The real Windows 11 non-admin source-process smoke passed and rejected a second writer.",
+    "Ruff, compileall, the shared-core platform leak audit, git diff checks, Node port tests, and release/module checks passed."
+  ],
+  "nextAction": "Commit and push the single Phase 2 candidate, verify both branch CI jobs, then stop at IMPLEMENTED_UNVERIFIED until a real Windows 10 non-admin run closes the Phase 2 gate; do not start Phase 3.",
+  "lastVerifiedAt": "2026-08-13T16:54:25+08:00"
 }

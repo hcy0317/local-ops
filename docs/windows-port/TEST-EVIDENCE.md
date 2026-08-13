@@ -191,4 +191,62 @@ python -m unittest discover -s tests -p 'test_*.py' -v
 - `make check` passed, including all 170 Python tests and 7 Node tests.
 - Release build and verification passed twice, and the two archives were byte-for-byte identical.
 - The CI checkout materialized and verified the original tracked macOS assets; the local partial checkout remains unable to do so independently.
-- P1 is `PASS`; P2–4 were not started.
+- P1 is `PASS`; P2–4 had not started at the time of that run.
+
+---
+
+## Phase 2 evidence
+
+### Windows adapter and HTTP safety suite — PASS
+
+```powershell
+python -m unittest discover -s tests/windows -p 'test_*.py' -v
+```
+
+- Passed: 15
+- Failed/errors/skipped: 0
+- Latest combined Windows-suite duration: 7.872 seconds
+- Covered: Local AppData, current SID, protected DACL, drive/UNC/equivalent/junction paths, Chinese and spaces, Named Mutex exclusion/recovery, current-process owner, IPv4/IPv6 listeners, listener failure, AccessDenied/NoSuchProcess races, mocked native picker, Windows exclusive socket, state capabilities, ACL read-only protection, and destructive API rejection without process/config side effects.
+
+### Shared contracts — PASS
+
+```powershell
+python -m unittest discover -s tests/contract -p 'test_*.py' -v
+```
+
+- Passed: 12
+- Failed/errors/skipped: 0
+- The intentional state-contract delta is `platform` plus `capabilities`; schema remains v1.
+
+### Real Windows source-process smoke — PASS
+
+- Host: Windows 11 Home x64, non-admin, Python 3.13.13.
+- Started `server.py --no-browser` in a temporary Chinese/space-containing data/log directory.
+- Final isolated process smoke became ready on preferred port 9609 in 1.231 seconds; three repeated direct state builds completed in 1.360–1.773 seconds.
+- The final smoke returned 20 current-user listener service rows; protected process access produced explicit degraded evidence without crashing state construction.
+- A second process using the same data directory exited without becoming a writer; the first process remained live.
+- All lifecycle/control capability flags were false. The test terminated only the server process it created and removed the temporary directory.
+
+### Supporting checks
+
+- Node port helpers: 7/7 PASS.
+- Shared HTTP Host/Origin/session/Content-Type/CORS security tests: 6/6 PASS.
+- Release manifest and JavaScript binding tests: 6/6 PASS.
+- Frontend contract: 13/14; the only failure is the pre-existing unmaterialized `static/assets/console-app-icon.png` blob.
+- `ruff check`: PASS.
+- `python -m compileall`: PASS.
+- `python tools/check_platform_leaks.py`: PASS.
+- `git diff --check`: PASS.
+- `python tools/check_project.py --skip-tests`: 9 PASS / 2 FAIL; the existing host blockers are `/bin/bash` and the unmaterialized original `AppIcon.icns`.
+
+### Phase 2 not-run gate
+
+| Check | Status | Reason |
+| --- | --- | --- |
+| Windows 10 x64 non-admin | NOT_RUN | No Windows 10 host/VM is available |
+| Windows Python 3.12 branch CI | NOT_RUN | Requires pushing the candidate commit |
+| Current Phase 2 macOS regression/release CI | NOT_RUN | Requires pushing the candidate commit |
+| Windows lifecycle | SKIPPED | Intentionally disabled until Phase 4 |
+| Windows package/clean VM | SKIPPED | Packaging belongs to Phase 5 |
+
+Phase 2 status is `IMPLEMENTED_UNVERIFIED`, not `PASS`; Phase 3 must remain untouched.

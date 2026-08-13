@@ -109,11 +109,13 @@ def check_required_files() -> str:
         ".github/ISSUE_TEMPLATE/feature_request.yml",
         ".github/PULL_REQUEST_TEMPLATE.md",
         "requirements-dev.txt",
+        "requirements-windows.txt",
         "Makefile",
         "server.py",
         "localops/platform/contracts.py",
         "localops/platform/loader.py",
         "localops/platform/macos.py",
+        "localops/platform/windows.py",
         "tools/check_platform_leaks.py",
         "start.command",
         "tests/test_server.py",
@@ -410,19 +412,22 @@ def check_shell_and_plist() -> str:
 
 
 def check_dev_requirements() -> str:
-    path = ROOT / "requirements-dev.txt"
-    lines = [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
-    require(bool(lines), "requirements-dev.txt 为空")
-    unpinned = [
-        line for line in lines
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+==[A-Za-z0-9_.+!-]+", line)
-    ]
-    require(not unpinned, "开发依赖必须精确锁定: " + ", ".join(unpinned))
-    return f"{len(lines)} 个锁定依赖"
+    total = 0
+    for filename in ("requirements-dev.txt", "requirements-windows.txt"):
+        path = ROOT / filename
+        lines = [
+            line.strip()
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        require(bool(lines), f"{filename} 为空")
+        unpinned = [
+            line for line in lines
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+==[A-Za-z0-9_.+!-]+", line)
+        ]
+        require(not unpinned, f"{filename} 依赖必须精确锁定: " + ", ".join(unpinned))
+        total += len(lines)
+    return f"{total} 个锁定依赖"
 
 
 def check_themes() -> str:

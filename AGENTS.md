@@ -1,10 +1,11 @@
 # 总控台 (Console)
 
-本地服务监控与快速启动控制台。**零依赖**：Python 3 标准库后端（单文件）+ 无构建原生前端。推荐双击 `总控台.app` 后台运行（不显示 Terminal/Dock）；`start.command` 保留为终端调试入口。
+本地服务监控与快速启动控制台。共享 HTTP/配置核心使用 Python 3 标准库，macOS runtime 保持零第三方依赖；Windows adapter 使用 `requirements-windows.txt` 中精确锁定的 `psutil` 与 `pywin32`。前端仍为无构建原生 HTML/CSS/JavaScript。macOS 推荐双击 `总控台.app` 后台运行；Windows Phase 2 仅支持源码方式的只读监控。
 
 ## 结构
 
-- `server.py` — 后端（单文件，仅标准库，Python 3.12）
+- `server.py` — 共享 HTTP、配置与业务编排核心（Python 3.12）
+- `localops/platform/` — macOS/Windows 原生边界；Windows 运行依赖只允许从 `requirements-windows.txt` 安装
 - `static/index.html` / `static/app.js`（入口）/ `static/js/{core,launchpad,services,overlays,ports,widgets}.js`（原生 ES Modules，无构建）/ `static/icons.js` — 前端（原生，禁框架/CDN/构建）；`core.js` 承载工具/API/浮层/状态/主题注册，`launchpad.js` 卡片+拖拽+诊断+启动台 KPI/分区过滤，`services.js` 表格+监控 KPI 火花线，`overlays.js` 模态+抽屉，`ports.js` 端口归一化纯函数，`widgets.js` 右侧信息栏（实时动态/告警、TOP5、小贴士、快捷操作）与导航轨状态；模块间用 `window.__poll` 共享轮询入口
 - 布局 v2：左侧 `.rail` 图标导航轨（启动台/服务监控视图切换 + 日志中心/设置中心弹层入口）+ 顶栏 + 内容/右侧信息栏双栏网格（≤1280px 侧栏下沉到底部、≤900px 导航轨隐藏）；结构样式集中在 `static/base.css` 末尾「布局 v2」段（主题令牌驱动），主题包负责视觉皮肤
 - `static/themes/` — **单一主题**：当前仅内置 `ops`（指挥台，`DEFAULT_UI_THEME` 常量指定并在清单中固定排首位）。`{id}.css` 整包样式 + `{id}.json` 清单（`id/name/author/desc/colors[]`）的注册机制保留：`GET /api/state` 返回 `themes` 与 `uiTheme`；`POST /api/ui/theme {theme}` 校验 id 后落盘。产品不提供主题选择界面（已随多主题一并移除），深浅色切换仍保留。
@@ -12,6 +13,7 @@
 - `static/assets/` — 品牌素材：`console-app-icon.png` 为 App Icon 主图，`brand-mark.png` 为顶栏标识；`favicon-32.png` / `favicon.ico` / `apple-touch-icon.png` 与 `.app` 内 `AppIcon.icns` 由 `tools/gen_brand_assets.py` 生成
 - `~/Library/Application Support/总控台/config.json` — 用户配置；`icons/` 为应用图标。目录/ 文件权限分别为 0700/0600
 - `~/Library/Logs/总控台/{appId}.log` — 应用启动日志；`console.log` 为 `.app` 启动日志
+- `%LOCALAPPDATA%\LocalOps\` — Windows 配置、图标、日志与 runtime；目录和文件使用当前 SID + SYSTEM + Administrators 的受保护 DACL
 - `data/` — 旧版项目内数据，仅在新目标不存在的首次启动中复制迁移；保留不删除
 - `start.command` — macOS 双击启动脚本（chmod +x）
 - `总控台.app` — macOS 无终端窗口启动器（`LSUIElement` 后台应用；内部直接启动 `server.py`，输出写入 `~/Library/Logs/总控台/console.log`）
@@ -52,6 +54,7 @@
   "watchedKeywords": ["ffmpeg"],
   "consolePort": 9600, "consolePid": 123, "consoleCwd": "/path/to/总控台",
   "version": "1.0.0", "schemaVersion": 1,
+  "platform": "macos", "capabilities": {"monitor_processes": true},
   "degraded": false, "degradedReasons": []
 }
 ```

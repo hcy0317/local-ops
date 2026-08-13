@@ -17,13 +17,14 @@
 
 ## Current task state
 
-- Status: Phase 1 platform extraction passed its full macOS CI and release gate on `windows-port/phases-1-4`; Phase 2–4 have not started.
+- Status: Phase 1 platform extraction passed its full macOS CI and release gate on `windows-port/phases-1-4`. Phase 2 Windows storage, single-instance, and read-only monitoring is implemented and locally verified on Windows 11; it remains `IMPLEMENTED_UNVERIFIED` until the branch CI and a real Windows 10 non-admin run satisfy the complete gate. Phase 3–4 have not started.
 - Source specification: `docs/specs/windows-native-port.md`.
 - Execution plan: `docs/windows-port/PLAN.md`.
 - Recovery source: `docs/windows-port/STATE.json`; obtain macOS test evidence before advancing beyond Phase 1.
 - The local checkout was reconstructed as a verified shallow/partial checkout because GitHub large-object transfer was unavailable. Two macOS-only image blobs remain unmaterialized and must be fetched before macOS asset or release builds.
-- Native Windows baseline import currently stops at the top-level `fcntl` dependency. Preserve this as a platform-extraction seam rather than hiding it with skips or weakening tests.
-- The top-level `fcntl` blocker has been removed by the Phase 1 adapter boundary. Outside macOS, observation and control remain explicitly unsupported until their specified phases; never replace this fail-closed state with empty snapshots or fake lifecycle success.
+- The top-level `fcntl` blocker was removed by the Phase 1 adapter boundary. Windows Phase 2 now uses pinned `psutil` and `pywin32` for observation, Local AppData, SID/DACL, and Named Mutex behavior.
+- Windows lifecycle remains fail closed: launch, stop, force stop, external kill, external attach, and console restart are disabled in both capability metadata and HTTP route guards until the Phase 4 runner/Job Object identity gate passes.
+- Full-machine Windows command-line ancestry was too slow for the first state response. Phase 2 queries PPID ancestry only for observed listeners and keeps Windows origin badges best-effort; do not reintroduce per-poll PowerShell/WMI or full process `cmdline` enumeration.
 
 ## Memory hygiene
 

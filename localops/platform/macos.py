@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -88,6 +89,7 @@ def _parse_etime(value: str) -> int:
 
 class MacOSPlatform:
     name = "macos"
+    requires_verified_permissions = False
     capabilities = PlatformCapabilities(
         monitor_processes=True,
         launch_managed=True,
@@ -112,6 +114,24 @@ class MacOSPlatform:
 
     def current_principal(self) -> Principal:
         return self._principal
+
+    def validate_runtime_path(self, path: str, forbidden: set[str]) -> str:
+        normalized = os.path.abspath(path)
+        if normalized in forbidden:
+            raise ValueError("runtime path must be a dedicated subdirectory")
+        return normalized
+
+    @staticmethod
+    def ensure_private_directory(path: str) -> None:
+        os.chmod(path, 0o700)
+
+    @staticmethod
+    def ensure_private_file(path: str) -> None:
+        os.chmod(path, 0o600)
+
+    @staticmethod
+    def should_migrate_legacy_data() -> bool:
+        return True
 
     def acquire_instance_lock(self, identity: str) -> InstanceLock | None:
         import fcntl
@@ -283,7 +303,7 @@ class MacOSPlatform:
                 result[current] = line[1:]
         return CwdSnapshot(ScanStatus.OK, result)
 
-    def process_parents(self) -> ProcessSnapshot:
+    def process_parents(self, pids: set[int] | None = None) -> ProcessSnapshot:
         output, problem = self._run(
             ["ps", "-axo", "pid=,ppid=,args"], component="process_parents"
         )
@@ -536,3 +556,7 @@ end run"""
 
     def platform_metadata(self) -> Mapping[str, object]:
         return {"platform": self.name, "capabilities": asdict(self.capabilities)}
+
+    @staticmethod
+    def configure_server_socket(sock: object) -> None:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

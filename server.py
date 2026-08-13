@@ -3427,15 +3427,18 @@ class Handler(BaseHTTPRequestHandler):
 
     @serialized_app_operation
     def handle_app_attach(self, app_id):
-        data, err = self.read_json_body()
-        if err:
-            self.send_err(400, err)
-            return
-        if not self._require_capability(
-                "attach_external", "当前平台或阶段禁止认领外部进程"):
+        if not getattr(PLATFORM.capabilities, "attach_external", False):
+            self.discard_body()
+            self._require_capability(
+                "attach_external", "当前平台或阶段禁止认领外部进程"
+            )
             return
         _, app = self._get_app_or_404(app_id)
         if app is None:
+            return
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
             return
         pid = data.get("pid")
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:

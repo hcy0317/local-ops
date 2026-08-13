@@ -17,7 +17,7 @@
 
 ## Current task state
 
-- Status: Phase 1 platform extraction passed its full macOS CI and release gate on `windows-port/phases-1-4`. Phase 2 Windows storage, single-instance, and read-only monitoring is implemented and locally verified on Windows 11; it remains `IMPLEMENTED_UNVERIFIED` until the branch CI and a real Windows 10 non-admin run satisfy the complete gate. Phase 3–4 have not started.
+- Status: Phase 1 platform extraction passed its full macOS CI and release gate on `windows-port/phases-1-4`. Phase 2 Windows storage, single-instance, and read-only monitoring is implemented, locally verified on Windows 11, and passed both Windows Python 3.12 and macOS regression/release jobs in CI run `31684726400` for implementation commit `6ce2736`. It remains `IMPLEMENTED_UNVERIFIED` until a real Windows 10 non-admin run satisfies the complete gate. Phase 3–4 have not started.
 - Source specification: `docs/specs/windows-native-port.md`.
 - Execution plan: `docs/windows-port/PLAN.md`.
 - Recovery source: `docs/windows-port/STATE.json`; obtain macOS test evidence before advancing beyond Phase 1.

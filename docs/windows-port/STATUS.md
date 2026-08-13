@@ -2,11 +2,11 @@
 
 ## Current result
 
-**P2 IMPLEMENTED_UNVERIFIED — Windows 11 non-admin storage, single-instance, read-only monitoring, and fail-closed HTTP capability tests pass locally; Windows 10 and the current branch CI gate are not yet verified.**
+**P2 IMPLEMENTED_UNVERIFIED — Windows 11 non-admin storage, single-instance, read-only monitoring, fail-closed HTTP capability tests, Windows Python 3.12 CI, and the complete macOS regression/release gate pass; Windows 10 is not verified.**
 
 Phase 2 adds the Windows adapter, pinned runtime dependencies, Local AppData/SID/DACL enforcement, a per-user/data-directory Named Mutex, `psutil` snapshots, a native picker, Windows exclusive socket binding, capability metadata, and route-level control rejection. The real source-process checks showed state builds under two seconds, visible current-user listeners, explicit degradation for protected processes, and rejection of a second writer. Phase 3–4 have not started.
 
-The remaining Phase 2 gate is environmental rather than an invitation to continue coding: run the candidate on Windows 10 non-admin and complete the current branch macOS/Windows CI checks. Until both are green, `lastGreenPhase` remains P1 and Phase 3 must not begin.
+The remaining Phase 2 gate is environmental rather than an invitation to continue coding: run the candidate on Windows 10 non-admin. CI run `31684726400` passed both jobs for implementation commit `6ce2736e493dec795eae8df200487c1e4c54fef2`. Until the Windows 10 gate is green, `lastGreenPhase` remains P1 and Phase 3 must not begin.
 
 ## Phase 2 implemented scope
 

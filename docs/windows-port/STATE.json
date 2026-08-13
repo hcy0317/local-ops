@@ -2,11 +2,13 @@
   "schemaVersion": 1,
   "task": "local-ops-windows-port",
   "baselineCommit": "a5c3adae1f1fa0bd9f0ac7b090ec422e285d0c0f",
+  "implementationCommit": "6ce2736e493dec795eae8df200487c1e4c54fef2",
+  "ciRun": "31684726400",
   "branch": "windows-port/phases-1-4",
   "currentPhase": "P2",
   "phaseStatus": "IMPLEMENTED_UNVERIFIED",
   "lastGreenPhase": "P1",
-  "macosTests": "NOT_RUN",
+  "macosTests": "PASS",
   "windowsTests": "PASS",
   "windowsBetaReady": false,
   "changedFiles": [
@@ -69,8 +71,7 @@
     "The current local environment can provide native Windows 11 non-admin evidence but cannot provide macOS or Windows 10 evidence."
   ],
   "knownBlockers": [
-    "No Windows 10 host or VM is available for the Phase 2 cross-version gate.",
-    "The current Phase 2 candidate has not yet run in branch CI."
+    "No Windows 10 host or VM is available for the Phase 2 cross-version gate."
   ],
   "knownFailures": [
     "The native Windows project checker passed 9 checks and failed only the existing Bash and missing AppIcon.icns host checks.",
@@ -79,8 +80,9 @@
   "verifiedResults": [
     "The Phase 2 Windows suite passed 15 of 15 tests and the shared contract suite passed 12 of 12.",
     "The real Windows 11 non-admin source-process smoke passed and rejected a second writer.",
-    "Ruff, compileall, the shared-core platform leak audit, git diff checks, Node port tests, and release/module checks passed."
+    "Ruff, compileall, the shared-core platform leak audit, git diff checks, Node port tests, and release/module checks passed.",
+    "CI run 31684726400 passed the Windows Python 3.12 adapter job and the macOS complete check/release/reproducibility job for implementation commit 6ce2736."
   ],
-  "nextAction": "Commit and push the single Phase 2 candidate, verify both branch CI jobs, then stop at IMPLEMENTED_UNVERIFIED until a real Windows 10 non-admin run closes the Phase 2 gate; do not start Phase 3.",
-  "lastVerifiedAt": "2026-08-13T16:54:25+08:00"
+  "nextAction": "Stop at IMPLEMENTED_UNVERIFIED until a real Windows 10 non-admin run closes the Phase 2 gate; do not start Phase 3.",
+  "lastVerifiedAt": "2026-08-13T17:03:52+08:00"
 }

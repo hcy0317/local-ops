@@ -239,13 +239,13 @@ python -m unittest discover -s tests/contract -p 'test_*.py' -v
 - `git diff --check`: PASS.
 - `python tools/check_project.py --skip-tests`: 9 PASS / 2 FAIL; the existing host blockers are `/bin/bash` and the unmaterialized original `AppIcon.icns`.
 
-### Phase 2 not-run gate
+### Phase 2 gate matrix
 
 | Check | Status | Reason |
 | --- | --- | --- |
 | Windows 10 x64 non-admin | NOT_RUN | No Windows 10 host/VM is available |
-| Windows Python 3.12 branch CI | NOT_RUN | Requires pushing the candidate commit |
-| Current Phase 2 macOS regression/release CI | NOT_RUN | Requires pushing the candidate commit |
+| Windows Python 3.12 branch CI | PASS | Run `31684726400`, job `94398012579`, implementation commit `6ce2736` |
+| Current Phase 2 macOS regression/release CI | PASS | Run `31684726400`, job `94398012573`; `make check`, release verification, and reproducibility passed |
 | Windows lifecycle | SKIPPED | Intentionally disabled until Phase 4 |
 | Windows package/clean VM | SKIPPED | Packaging belongs to Phase 5 |
 

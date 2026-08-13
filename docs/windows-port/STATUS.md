@@ -2,9 +2,9 @@
 
 ## Current result
 
-**P1 IMPLEMENTED_UNVERIFIED — macOS `make check` is green; one release-safe documentation fix is awaiting an exact-commit rerun.**
+**P1 PASS — the platform boundary, complete macOS checks, release build, release verification, and reproducibility audit are green.**
 
-Phase 1 extracted the platform boundary and passed its focused contract, golden, lint, and platform-leak checks. macOS CI run `31659377461` passed the full `make check` gate, including all 170 Python tests. The workflow then stopped in release validation because the specification contained a literal macOS home-path example; the wording is now release-safe without weakening the scanner. Per the phase protocol, Phase 2–4 have not started.
+Phase 1 extracted the platform boundary and passed its focused contract, golden, lint, and platform-leak checks. macOS CI run `31659571268` passed the full `make check` gate, all 170 Python tests, the release build and verification, and a second byte-for-byte reproducibility build. Per the phase protocol, Phase 2–4 have not started.
 
 ## Phase 1 completed implementation
 
@@ -24,7 +24,7 @@ The full native Windows Python run is intentionally not green in P1: 170 tests r
 
 **P0 PASS — baseline frozen and risks registered.**
 
-This result does not mean that the product runs on Windows. Native Windows tests currently fail, lifecycle controls remain unimplemented, and `windowsBetaReady` remains `false`. Phase 1 has not started.
+This result does not mean that the product runs on Windows. Native Windows tests currently fail, lifecycle controls remain unimplemented, and `windowsBetaReady` remains `false`.
 
 ## Scope completed
 

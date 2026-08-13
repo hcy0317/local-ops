@@ -4,8 +4,8 @@
   "baselineCommit": "a5c3adae1f1fa0bd9f0ac7b090ec422e285d0c0f",
   "branch": "windows-port/phases-1-4",
   "currentPhase": "P1",
-  "phaseStatus": "IMPLEMENTED_UNVERIFIED",
-  "lastGreenPhase": "P0",
+  "phaseStatus": "PASS",
+  "lastGreenPhase": "P1",
   "macosTests": "PASS",
   "windowsTests": "FAIL",
   "windowsBetaReady": false,
@@ -51,19 +51,15 @@
     "The current local environment can provide native Windows 11 non-admin evidence but cannot provide macOS or Windows 10 evidence."
   ],
   "knownBlockers": [
-    "Two macOS brand asset blobs are not materialized in this verified partial checkout, so asset and release checks cannot pass locally.",
-    "No local macOS, Windows 10, clean Windows VM, or Python 3.12 environment is available for this phase evidence."
+    "No Windows 10 or clean Windows VM is available for later phase evidence."
   ],
   "knownFailures": [
     "The full native Windows Python discovery run executed 36 tests and ended with 2 failures and 3 errors.",
     "The native Windows project checker passed 9 checks and failed the Bash and missing AppIcon.icns checks.",
-    "The Node.js port helper suite passed 7 of 7 tests."
-    ,
-    "Phase 1 contract and baseline-golden tests passed 11 of 11 on native Windows.",
-    "The current full Python discovery ran 170 tests and failed with 22 failures and 11 errors because the Windows adapter is intentionally unsupported before Phase 2, POSIX-only tests ran on Windows, and two tracked assets remain unavailable.",
-    "macOS CI run 31659011083 ran 170 tests and failed with one assertion and one error; both regressions were fixed in commit 7889fb67d578107559c2ac8f07eda29271d2357e.",
-    "macOS CI run 31659377461 passed make check, then the release scan rejected a literal macOS home-path example in the port specification; the example is fixed locally pending rerun."
+    "The Node.js port helper suite passed 7 of 7 tests.",
+    "Phase 1 contract and baseline-golden tests passed 12 of 12 on native Windows.",
+    "The current full Python discovery ran 170 tests and failed with 22 failures and 11 errors because the Windows adapter is intentionally unsupported before Phase 2, POSIX-only tests ran on Windows, and two tracked assets remain unavailable."
   ],
-  "nextAction": "Commit and push the release-safe specification wording, verify the automatically triggered exact-commit CI run, and only after the full workflow is green change P1 to PASS.",
-  "lastVerifiedAt": "2026-08-13T10:01:17+08:00"
+  "nextAction": "Keep Phase 2–4 untouched until the next phase begins; Phase 2 must start from the documented storage, single-instance, and read-only monitoring scope.",
+  "lastVerifiedAt": "2026-08-13T10:03:55+08:00"
 }

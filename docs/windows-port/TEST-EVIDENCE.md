@@ -85,14 +85,14 @@ Covered contracts: port normalization, configured/actual port mapping, mismatch 
 
 | Environment / check | Status | Reason |
 | --- | --- | --- |
-| Current macOS authoritative suite (`make check`) | PASS | Run 31659377461 passed all project checks, including 170 Python tests |
-| Exact-commit GitHub Actions run | FAIL | Run 31659377461 failed in release validation on a literal home-path example; wording is fixed pending rerun |
+| Current macOS authoritative suite (`make check`) | PASS | Run 31659571268 passed all project checks, including 170 Python tests |
+| Exact-commit GitHub Actions run | PASS | Run 31659571268 passed checks, release verification, and reproducibility audit on commit 7768efaa1b805db5582c6867598f08d983a153f0 |
 | Windows 10 x64 non-admin | NOT_RUN | Environment unavailable |
 | Windows 11 Python 3.12 | NOT_RUN | Local interpreter is Python 3.13.13 |
 | Clean Windows VM without Python | NOT_RUN | Environment unavailable; belongs to the packaging gate |
 | Packaged Windows runtime | NOT_RUN | Packaging is Phase 5 work |
 | Lifecycle/destructive security matrix | NOT_RUN | Windows lifecycle is intentionally unavailable before Phase 4 |
-| macOS asset/release build | NOT_RUN | macOS tools and two original asset blobs are unavailable |
+| macOS asset/release build | PASS | Run 31659571268 checked out the original assets and passed build, verification, and reproducibility |
 
 ## Baseline artifact hashes
 
@@ -184,12 +184,11 @@ python -m unittest discover -s tests -p 'test_*.py' -v
 - Primary causes: the P1 Windows adapter intentionally rejects monitoring/lifecycle operations; macOS/POSIX tests assume Bash, POSIX modes, signals, process groups, and symlink privileges; two tracked asset blobs are unavailable.
 - Interpretation: this is valid Windows pre-P2 evidence, not a macOS regression result.
 
-### Required macOS Phase 1 suite — PASS / full workflow rerun pending
+### Required macOS Phase 1 suite — PASS
 
 - No local macOS host is available.
-- GitHub Actions run `31659377461` executed on `macos-15` against commit `7889fb67d578107559c2ac8f07eda29271d2357e`.
+- GitHub Actions run `31659571268` executed on `macos-15` against commit `7768efaa1b805db5582c6867598f08d983a153f0`.
 - `make check` passed, including all 170 Python tests and 7 Node tests.
-- Release validation then rejected a literal macOS home-path example in the port specification; the wording is fixed without weakening path-leak detection.
-- The focused release-path checks pass 2/2 locally and the specification now returns no path leak.
-- The two original tracked macOS asset blobs are not materialized locally.
-- P1 therefore remains `IMPLEMENTED_UNVERIFIED` until the full fixed workflow is green; P2–4 were not started.
+- Release build and verification passed twice, and the two archives were byte-for-byte identical.
+- The CI checkout materialized and verified the original tracked macOS assets; the local partial checkout remains unable to do so independently.
+- P1 is `PASS`; P2–4 were not started.

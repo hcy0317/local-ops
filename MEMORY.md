@@ -17,7 +17,7 @@
 
 ## Current task state
 
-- Status: Phase 1 platform extraction is implemented on `windows-port/phases-1-4`; the second macOS CI run passed `make check` and exposed one release-safe documentation example, now fixed locally pending an exact-commit rerun. Phase 2–4 have not started.
+- Status: Phase 1 platform extraction passed its full macOS CI and release gate on `windows-port/phases-1-4`; Phase 2–4 have not started.
 - Source specification: `docs/specs/windows-native-port.md`.
 - Execution plan: `docs/windows-port/PLAN.md`.
 - Recovery source: `docs/windows-port/STATE.json`; obtain macOS test evidence before advancing beyond Phase 1.

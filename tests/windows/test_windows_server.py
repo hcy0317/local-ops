@@ -367,6 +367,7 @@ class WindowsCiWorkflowTests(unittest.TestCase):
             "run: python tools/check_project.py --scope windows --skip-tests",
             workflow,
         )
+        self.assertIn('PYTHONIOENCODING: "utf-8"', self.windows_job())
 
     def test_windows_job_uses_native_tools_and_audits_one_unsigned_package(self):
         windows_job = self.windows_job()

@@ -41,7 +41,7 @@ macOS 总控台会以当前用户权限执行保存的 shell 命令，并提供�
 - 本项目不是多用户权限系统，也不是远程管理面板。
 - 只有受信任的本地用户才能添加和执行命令。
 - 本地回环绑定不能替代 Host、Origin、控制令牌、当前 UID/SID 和受控进程身份校验。
-- Windows 私有文件和目录必须由当前 SID 所有，仅向当前用户、SYSTEM 和 Administrators 授权；`chmod` 结果不能作为 Windows 权限证明。
+- Windows 私有文件和目录最终必须由当前用户 SID 所有，仅向当前用户、SYSTEM 和 Administrators 授权；`chmod` 结果不能作为 Windows 权限证明。Windows 新对象 owner 来自 access token 的 `TokenOwner`，平台只允许其为当前用户或 Builtin Administrators。仅 creation-time apply 路径可在观察到 token 的 Admin 默认 owner 时，通过一次安全描述符更新把 owner 归一为当前用户并同时应用原 protected DACL；verify-only 的既有记录必须已经是 current-user-owned，Admin-owned 记录也必须拒绝。
 - Windows Phase 4 的 `launch_managed/stop_managed/force_stop_managed` 只授权完整验证的 Local Ops Job；`kill_external/attach_external/restart_console` 必须保持 `false`。任一 runner、Job、IPC、回执、ACL 或 generation 证据不完整都必须 fail closed。
 - Windows 的 `commandSpec` 是原生命令执行边界；不得解析展示字符串，也不得把 POSIX shell 文本自动翻译成 cmd 或 PowerShell。目标必须先以 suspended 状态加入专属 Job 并持久化身份，才能恢复执行。
 - 公开 runtime identity 恰好包含 11 个非敏感字段。raw token、HMAC、pipe 名、runtime 路径和回执路径不得进入配置、API、命令行、日志、诊断或错误响应。

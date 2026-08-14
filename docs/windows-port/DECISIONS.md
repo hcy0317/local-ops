@@ -32,6 +32,15 @@
 - Reason: Configuration CAS may complete before physical record removal, and unlink/rmdir can partially fail after release. A single atomic commit point prevents identity restoration from racing partial deletion, while a committed tombstone can be finalized without treating filesystem residue as process authority.
 - Consequence: Failure before rename leaves the authenticated active generation intact. Failure after rename remains a committed release and is retryable. Unknown entries, widened ACLs, links/junctions, non-derived paths, live or ambiguous active generations, logs, and unrelated files remain untouched.
 
+## P4-D005 — Normalize only the administrator token's creation-time owner
+
+- Status: Accepted
+- Phase: P4
+- Decision: Read both `TokenUser` and `TokenOwner` at platform initialization and accept only a default owner equal to the current user or Builtin Administrators. Windows assigns a newly created object from `TokenOwner`; only the creation-time apply path may normalize the Admin default owner to `TokenUser`, in the same security-descriptor update that applies the protected current-user + SYSTEM + Administrators DACL. Verify-only paths require the existing owner to equal `TokenUser` and reject Admin-owned records without repair.
+- Alternatives rejected: Assuming `TokenUser` is always the new-object owner, accepting Admin ownership as private ownership, or repairing an existing record before trusting it.
+- Reason: Hosted administrator tokens may default new objects to Builtin Administrators, while persisted runtime records must remain bound to the exact current user. Creation must work under both token shapes without weakening reconnect or cleanup verification.
+- Consequence: Unsupported token owners fail platform initialization; creation can converge to the same current-user-owned protected descriptor, and every existing record remains verify-only and fail closed.
+
 ## P0-D001 — Enforce phase isolation
 
 - Status: Accepted

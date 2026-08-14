@@ -8,7 +8,7 @@ lifecycle-aware UI/API contract. The authorized local gate passed on Windows
 NT build 26200 (DisplayVersion 25H2), x64, at medium integrity without
 administrator membership, using Python 3.13.13:
 
-- gated real `tests/windows` discovery: 170/170 passed;
+- gated real `tests/windows` discovery: 174/174 passed in 406.426s;
 - `WIN-LIFE-001..012`: 12/12 passed, including actual HTTP console subprocess
   termination/reopen and 100 full launch/force/release cycles;
 - `WIN-SEC-001..014`: 14/14 explicit cases passed;
@@ -28,9 +28,20 @@ recovery handles only a private, nonlink allowlisted record subset and performs
 no process observation or control. The atomic request/receipt writers protect
 their temporary files before replacement.
 
-This is not the final Phase 4 PASS. `implementationCommit` and `ciRun` remain
-unset. Windows Python 3.12 and the complete macOS regression/release job must
-pass against the same exact commit before `lastGreenPhase` can move beyond P3.
+This is not the final Phase 4 PASS. Exact commit
+`fc29e5637d93b95026a5dbca5e46c638c51b5439` (`fc29e56`) produced failed CI
+run `31766584905`: Windows exposed the administrator-token `TokenOwner`
+new-object owner semantics, and macOS exposed lifecycle test fixtures that had
+not isolated the fake platform principal from the host principal. This is a
+historical failed attempt, not Phase 4 green evidence. `implementationCommit`
+and `ciRun` remain unset. The fixed candidate must be committed and both the
+Windows Python 3.12 and complete macOS regression/release jobs must pass on that
+new exact commit before `lastGreenPhase` can move beyond P3.
+
+The current Windows workflow separates lifecycle/Windows discovery, API
+contracts, and frontend/HTTP hardening into three independent fail-fast steps
+with no `continue-on-error`, so a failing group is attributed directly and
+later groups do not mask it.
 
 The isolated Edge 151 flow completed add → start → log marker → HTTP 200 →
 graceful stop → bad-cwd diagnostic → restore → start → restart with a changed
@@ -199,7 +210,7 @@ The machine-readable baseline is `docs/windows-port/BASELINE-CONTRACTS.json`. Th
 | Windows privacy cannot be proven with mode bits | Current checks rely on 0700/0600 | Future Windows ACL/SID evidence required |
 | Release checks are host-sensitive | Windows reports archive output mode differently; symlink creation needs privilege | Split common/platform release checks later; do not weaken assertions in P0 |
 | Local release source is incomplete | Two tracked asset blobs are not materialized | Fetch originals before asset/release validation; never synthesize substitutes |
-| Coverage gap | No current macOS run, Win10 run, clean-VM run, or exact-commit CI run exists | Explicitly `NOT_RUN`; prevents Beta readiness |
+| Coverage gap | At the P0 checkpoint no macOS run, Win10 run, clean-VM run, or exact-commit CI run existed | Explicitly `NOT_RUN`; prevented Beta readiness at that checkpoint |
 
 ## P0 Gate
 

@@ -107,7 +107,8 @@
     "P4-D001",
     "P4-D002",
     "P4-D003",
-    "P4-D004"
+    "P4-D004",
+    "P4-D005"
   ],
   "assumptions": [
     "The local Phase 4 gate ran on Windows NT build 26200 (DisplayVersion 25H2), x64, at medium integrity without administrator membership.",
@@ -119,14 +120,16 @@
     "Phase 4 passed the authorized fixture-only local Windows 11 gate but remains pending exact-commit Windows Python 3.12 and complete macOS CI.",
     "Windows packaging and clean-machine validation remain Phase 5."
   ],
-  "knownFailures": [],
+  "knownFailures": [
+    "Historical failed Phase 4 attempt: exact commit fc29e5637d93b95026a5dbca5e46c638c51b5439 (fc29e56), CI run 31766584905, failed on Windows TokenOwner new-object owner semantics and macOS lifecycle test principal isolation; it is not accepted Phase 4 evidence."
+  ],
   "verificationLimitations": [
     "Phase 4 local UI QA used isolated Edge 151; the native Windows picker and Windows Notification Center delivery remain NOT_RUN, while notification permission-denied/granted and object construction/close passed.",
     "One contract symlink rejection test is skipped because this non-admin Windows session cannot create symlinks.",
-    "No Phase 4 implementation commit, Windows Python 3.12 CI run, or macOS exact-commit regression/release run exists yet."
+    "No passing Phase 4 implementation commit or CI run exists yet; failed run 31766584905 is historical only, and the fixed candidate has not run exact-commit Windows Python 3.12 or macOS regression/release CI."
   ],
   "verifiedResults": [
-    "The gated real Windows test discovery passed 170 of 170 tests in 237.231 seconds using only fixture-created processes.",
+    "The gated real Windows test discovery passed 174 of 174 tests in 406.426 seconds using only fixture-created processes.",
     "WIN-LIFE-001 through WIN-LIFE-012 passed 12 of 12, including real HTTP console subprocess termination/reopen, Job reconnect, runner crash isolation, stale-generation refusal, and 100 full launch/force/release cycles.",
     "WIN-SEC-001 through WIN-SEC-014 passed all 14 explicit security cases.",
     "Frontend passed 24 of 24 and HTTP hardening passed 6 of 6 (30 of 30 combined); the lifecycle Node suite passed 30 of 30.",
@@ -135,8 +138,10 @@
     "The shared contract suite ran 32 tests: 31 passed and one privileged symlink case skipped.",
     "Ruff passed for the Phase 4 Python scope.",
     "Runtime release required exactly three private active-generation records, a signed terminal receipt, an empty Job, and an absent runner before atomic rename committed release; committed tombstone recovery accepted only a private, nonlink allowlisted record subset, performed no process observation or control, and failed closed on unknown entries, widened ACLs, or links.",
+    "Windows TokenOwner handling passed locally: default owner is limited to the current user or Builtin Administrators, only creation-time apply may atomically normalize the Admin default owner to the current user plus the protected DACL, and verify-only existing records reject Admin ownership.",
+    "The Windows CI workflow separates Windows/lifecycle discovery, API contracts, and frontend/HTTP hardening into three independent fail-fast steps without continue-on-error.",
     "Historical Phase 3 evidence only: implementation commit 97c417ef1491ac11fdb036c4e4102bfc190c88e6 passed CI run 31698371278 (Windows job 94441279178 and macOS job 94441279120); it is not Phase 4 evidence."
   ],
-  "nextAction": "Create the Phase 4 implementation commit, run Windows Python 3.12 and complete macOS regression/release CI against that exact commit, and record the run/job IDs before any Phase 4 PASS claim.",
-  "lastVerifiedAt": "2026-08-14T11:17:08+08:00"
+  "nextAction": "Create a new Phase 4 fix commit after fc29e56, run Windows Python 3.12 and complete macOS regression/release CI against that new exact commit, and record only a passing run before any Phase 4 PASS claim.",
+  "lastVerifiedAt": "2026-08-14T11:44:53+08:00"
 }

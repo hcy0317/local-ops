@@ -393,6 +393,12 @@ class WindowsLifecycleTransactionTests(unittest.TestCase):
             stop_result=StopResult(ok=True, status="exited"),
         )
         self.platform_patch = mock.patch.object(server, "PLATFORM", self.platform)
+        self.principal_patch = mock.patch.object(
+            server, "SELF_PRINCIPAL", self.platform.principal
+        )
+        self.uid_patch = mock.patch.object(
+            server, "SELF_UID", self.platform.principal.numeric_id
+        )
         self.logs_patch = mock.patch.object(
             server, "LOGS_DIR", os.path.join(self.directory.name, "logs")
         )
@@ -400,6 +406,8 @@ class WindowsLifecycleTransactionTests(unittest.TestCase):
             server.uuid, "uuid4", return_value=uuid.UUID(self.generation)
         )
         self.platform_patch.start()
+        self.principal_patch.start()
+        self.uid_patch.start()
         self.logs_patch.start()
         self.uuid_patch.start()
 
@@ -408,6 +416,8 @@ class WindowsLifecycleTransactionTests(unittest.TestCase):
             server._WINDOWS_PENDING_RELEASES.clear()
         self.uuid_patch.stop()
         self.logs_patch.stop()
+        self.uid_patch.stop()
+        self.principal_patch.stop()
         self.platform_patch.stop()
         self.directory.cleanup()
 
@@ -1324,10 +1334,18 @@ class WindowsLifecycleHttpTransactionTests(unittest.TestCase):
             stop_result=StopResult(ok=True, status="exited"),
         )
         self.platform_patch = mock.patch.object(server, "PLATFORM", self.platform)
+        self.principal_patch = mock.patch.object(
+            server, "SELF_PRINCIPAL", self.platform.principal
+        )
+        self.uid_patch = mock.patch.object(
+            server, "SELF_UID", self.platform.principal.numeric_id
+        )
         self.logs_patch = mock.patch.object(
             server, "LOGS_DIR", os.path.join(self.harness.temp_dir.name, "logs")
         )
         self.platform_patch.start()
+        self.principal_patch.start()
+        self.uid_patch.start()
         self.logs_patch.start()
         self.harness.cfg.update(lambda data: data["apps"].append({
             **server.Config.APP_DEFAULT,
@@ -1353,6 +1371,8 @@ class WindowsLifecycleHttpTransactionTests(unittest.TestCase):
         self.listeners.stop()
         self.health.stop()
         self.logs_patch.stop()
+        self.uid_patch.stop()
+        self.principal_patch.stop()
         self.platform_patch.stop()
         self.harness.close()
 

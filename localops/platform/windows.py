@@ -123,19 +123,27 @@ class WindowsPlatform:
         self.base_dir = os.path.abspath(base_dir)
         self.entrypoint = os.path.abspath(entrypoint)
         self.self_pid = os.getpid()
-        self._sid = self._current_sid()
+        self._sid, self._default_owner_sid = self._current_token_sids()
+        if self._default_owner_sid not in {self._sid, _ADMINISTRATORS_SID}:
+            raise PermissionError("current Windows token has an unsupported default owner")
         self._principal = Principal(self._sid)
 
     @staticmethod
-    def _current_sid() -> str:
+    def _current_token_sids() -> tuple[str, str]:
         token = win32security.OpenProcessToken(
             win32api.GetCurrentProcess(), win32con.TOKEN_QUERY
         )
         try:
-            sid = win32security.GetTokenInformation(
+            user_sid = win32security.GetTokenInformation(
                 token, win32security.TokenUser
             )[0]
-            return win32security.ConvertSidToStringSid(sid)
+            owner_sid = win32security.GetTokenInformation(
+                token, win32security.TokenOwner
+            )
+            return (
+                win32security.ConvertSidToStringSid(user_sid),
+                win32security.ConvertSidToStringSid(owner_sid),
+            )
         finally:
             token.Close()
 
@@ -232,15 +240,25 @@ class WindowsPlatform:
             existing_owner = win32security.ConvertSidToStringSid(
                 before.GetSecurityDescriptorOwner()
             )
+            owner = None
+            security_information = (
+                win32security.DACL_SECURITY_INFORMATION
+                | win32security.PROTECTED_DACL_SECURITY_INFORMATION
+            )
             if existing_owner != self._sid:
-                raise PermissionError("private Windows path has an unexpected owner")
+                # Administrator tokens default new objects to the group owner.
+                # Normalize only that creation case; verification stays user-owned.
+                if (existing_owner != self._default_owner_sid
+                        or existing_owner != _ADMINISTRATORS_SID):
+                    raise PermissionError("private Windows path has an unexpected owner")
+                owner = win32security.ConvertStringSidToSid(self._sid)
+                security_information |= win32security.OWNER_SECURITY_INFORMATION
             acl = self._private_acl(directory)
             win32security.SetNamedSecurityInfo(
                 path,
                 win32security.SE_FILE_OBJECT,
-                win32security.DACL_SECURITY_INFORMATION
-                | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
-                None,
+                security_information,
+                owner,
                 None,
                 acl,
                 None,

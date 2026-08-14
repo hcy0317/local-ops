@@ -6,6 +6,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import server
@@ -337,6 +338,25 @@ class WindowsServerTests(unittest.TestCase):
         apps = self.harness.cfg.snapshot()["apps"]
         self.assertEqual([app["id"] for app in apps], [update_id])
         self.assertIsNone(apps[0]["runtimeIdentity"])
+
+
+class WindowsCiWorkflowTests(unittest.TestCase):
+    def test_test_groups_are_separate_fail_fast_steps(self):
+        workflow_path = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+        workflow = workflow_path.read_text(encoding="utf-8").replace("\r\n", "\n")
+        windows_job = workflow.split("  windows-read-only:\n", 1)[1].split(
+            "\n  check-and-release:\n", 1
+        )[0]
+        commands = (
+            'run: python -m unittest discover -s tests/windows -p "test_*.py" -v',
+            'run: python -m unittest discover -s tests/contract -p "test_*.py" -v',
+            "run: python -m unittest tests.test_frontend "
+            "tests.test_hardening.HttpSecurityTests -v",
+        )
+        self.assertEqual(windows_job.count("python -m unittest"), len(commands))
+        for command in commands:
+            self.assertIn(command, windows_job)
+        self.assertNotIn("continue-on-error", windows_job)
 
 
 if __name__ == "__main__":

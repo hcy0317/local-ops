@@ -34,7 +34,7 @@
 - macOS 自带的 `ps`、`lsof`、`osascript` 等系统工具。
 - Safari、Chrome 或其他支持 ES Modules 的现代浏览器。
 
-Windows Phase 4 源码候选要求 Windows 11 x64、Python 3.12，以及 `requirements-windows.txt` 中锁定的依赖。当前 `LOCAL_PASS_CI_PENDING`：Windows NT build 26200（25H2）非管理员本地门禁已通过，但本地使用的是 Python 3.13.13；精确提交的 Windows Python 3.12 CI 与完整 macOS 回归尚未运行。状态以 `docs/windows-port/STATE.json` 为准。Windows 10、self-contained 打包和干净机器验收属于 Phase 5，因此不构成 Windows Beta 发布。
+Windows Phase 4 源码候选要求 Windows 11 x64、Python 3.12，以及 `requirements-windows.txt` 中锁定的依赖。当前 `LOCAL_PASS_CI_PENDING`：Windows NT build 26200（25H2）非管理员本地门禁已通过，但本地使用的是 Python 3.13.13。精确提交 `fc29e5637d93b95026a5dbca5e46c638c51b5439` 的 CI run `31766584905` 因 Windows owner semantics 与 macOS test principal isolation 失败；该 run 只是历史失败尝试，修复后的新 exact-commit Windows Python 3.12 CI 与完整 macOS 回归尚未运行。状态以 `docs/windows-port/STATE.json` 为准。Windows 10、self-contained 打包和干净机器验收属于 Phase 5，因此不构成 Windows Beta 发布。
 
 ## Windows Phase 4 生命周期源码候选
 
@@ -46,7 +46,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe server.py
 ```
 
-Windows 用户数据固定写入 `%LOCALAPPDATA%\LocalOps\`。程序使用当前用户 SID、SYSTEM 和 Administrators 的受保护 DACL；同一用户、同一数据目录通过 Named Mutex 保证只有一个写者。自定义数据或日志目录会拒绝盘符根、用户主目录、项目根目录、UNC 共享根以及 symlink/junction 路径。ACL 验证失败时配置进入只读保护。
+Windows 用户数据固定写入 `%LOCALAPPDATA%\LocalOps\`。最终私有对象必须由当前用户 SID 拥有，并只向当前用户、SYSTEM 和 Administrators 授予受保护 DACL。Windows 新对象 owner 来自 token 的 `TokenOwner`；若管理员 token 的默认 owner 是 Builtin Administrators，只有 creation-time apply 才会在一次安全描述符更新中把 owner 归一为当前用户并同时写入 protected DACL。既有记录是 verify-only，Admin-owned 或其他 owner 一律拒绝。同一用户、同一数据目录通过 Named Mutex 保证只有一个写者。自定义数据或日志目录会拒绝盘符根、用户主目录、项目根目录、UNC 共享根以及 symlink/junction 路径。ACL 验证失败时配置进入只读保护。
 
 本阶段保留 Phase 3 的 IPv4/IPv6 监听、进程信息、原生选择器、schema v2、结构化 `commandSpec`、项目识别和显式导入，并增加受 generation CAS 保护的启动、普通停止、显式强制停止与重启。旧 `command` 字段继续保留；POSIX 命令仍只会标记为 `needs_review`，不会被猜测性转换或执行。
 
@@ -58,7 +58,7 @@ request/receipt 原子写入会先保护临时文件的 DACL，再替换为公�
 
 Windows 仍不支持外部进程认领、外部进程结束和总控台重启。不要通过修改前端或直接调用接口绕过 capability 与每应用 `controlAvailable` 门禁。破坏性生命周期测试只能设置 `LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS=1` 后在隔离夹具作用域或 hosted runner 中运行，并且只能操作测试夹具创建的进程；禁止控制任何现有用户进程。
 
-本地 Phase 4 门禁已通过 Windows real discovery 170/170、frontend 24/24、HTTP hardening 6/6（合计 30/30）和 Node 30/30。其中包括 `WIN-LIFE-001..012` 的 12/12、`WIN-SEC-001..014` 的 14/14、HTTP 总控台测试子进程终止后重开，以及 100 次完整启动/Force/释放循环。该结果不是精确提交 CI，也不把 `windowsBetaReady` 改为 `true`。
+本地 Phase 4 门禁已通过 Windows real discovery 174/174（406.426s）、frontend 24/24、HTTP hardening 6/6（合计 30/30）和 Node 30/30。其中包括 `WIN-LIFE-001..012` 的 12/12、`WIN-SEC-001..014` 的 14/14、HTTP 总控台测试子进程终止后重开，以及 100 次完整启动/Force/释放循环。该结果不是精确提交 CI，也不把 `windowsBetaReady` 改为 `true`。
 
 `VERSION` 是项目版本的唯一权威来源。`Info.plist`、发行包名和发行说明应与它保持一致。
 

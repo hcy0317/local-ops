@@ -194,6 +194,79 @@ class WindowsPlatformTests(unittest.TestCase):
             setter.call_args.args[2] & win32security.OWNER_SECURITY_INFORMATION
         )
 
+    def test_private_acl_normalizes_administrator_default_owner(self):
+        before = mock.Mock()
+        before.GetSecurityDescriptorOwner.return_value = (
+            win32security.ConvertStringSidToSid("S-1-5-32-544")
+        )
+        after = mock.Mock()
+        after.GetSecurityDescriptorOwner.return_value = (
+            win32security.ConvertStringSidToSid(
+                self.platform.current_principal().identifier
+            )
+        )
+        after.GetSecurityDescriptorDacl.return_value = mock.Mock(
+            GetAceCount=mock.Mock(return_value=3),
+            GetAce=mock.Mock(side_effect=[
+                ((win32security.ACCESS_ALLOWED_ACE_TYPE, 0), 0x1F01FF,
+                 win32security.ConvertStringSidToSid(sid))
+                for sid in (
+                    self.platform.current_principal().identifier,
+                    "S-1-5-18",
+                    "S-1-5-32-544",
+                )
+            ]),
+        )
+        after.GetSecurityDescriptorControl.return_value = (
+            win32security.SE_DACL_PROTECTED, 0
+        )
+        with mock.patch.object(
+                self.platform, "_default_owner_sid", "S-1-5-32-544"), \
+                mock.patch.object(
+                    win32security, "GetNamedSecurityInfo",
+                    side_effect=[before, after],
+                ), mock.patch.object(
+                    win32security, "SetNamedSecurityInfo"
+                ) as setter, mock.patch.object(
+                    self.platform, "_private_acl", return_value=object()
+                ):
+            self.platform._apply_and_verify_acl("fixture", directory=False)
+
+        self.assertTrue(
+            setter.call_args.args[2] & win32security.OWNER_SECURITY_INFORMATION
+        )
+        self.assertEqual(
+            win32security.ConvertSidToStringSid(setter.call_args.args[3]),
+            self.platform.current_principal().identifier,
+        )
+
+    def test_verify_only_acl_rejects_administrator_owned_record(self):
+        descriptor = mock.Mock()
+        descriptor.GetSecurityDescriptorOwner.return_value = (
+            win32security.ConvertStringSidToSid("S-1-5-32-544")
+        )
+        descriptor.GetSecurityDescriptorDacl.return_value = (
+            self.platform._private_acl(False)
+        )
+        descriptor.GetSecurityDescriptorControl.return_value = (
+            win32security.SE_DACL_PROTECTED, 0
+        )
+        with mock.patch.object(
+                self.platform, "_default_owner_sid", "S-1-5-32-544"), \
+                mock.patch.object(
+                    win32security, "GetNamedSecurityInfo", return_value=descriptor
+                ):
+            with self.assertRaises(PermissionError):
+                self.platform.verify_private_file(__file__)
+
+    def test_platform_rejects_an_unexpected_token_default_owner(self):
+        current_sid = self.platform.current_principal().identifier
+        with mock.patch.object(
+                WindowsPlatform, "_current_token_sids",
+                return_value=(current_sid, "S-1-5-32-545")):
+            with self.assertRaises(PermissionError):
+                WindowsPlatform(os.getcwd(), "server.py")
+
     def test_private_acl_rejects_a_path_owned_by_another_sid(self):
         descriptor = mock.Mock()
         descriptor.GetSecurityDescriptorOwner.return_value = (

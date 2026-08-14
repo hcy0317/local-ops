@@ -37,11 +37,14 @@ jobs:
           python -m compileall -q server.py localops tools tests
           python -c "import server; import localops.command_spec; import localops.config_import; from localops.platform.windows import WindowsPlatform; assert server.PLATFORM.name == 'windows'; assert WindowsPlatform('.', 'server.py').name == 'windows'"
 
-      - name: Run Windows contracts and fixture-owned lifecycle tests
-        run: |
-          python -m unittest discover -s tests/windows -p "test_*.py" -v
-          python -m unittest discover -s tests/contract -p "test_*.py" -v
-          python -m unittest tests.test_frontend tests.test_hardening.HttpSecurityTests -v
+      - name: Run Windows and fixture-owned lifecycle tests
+        run: python -m unittest discover -s tests/windows -p "test_*.py" -v
+
+      - name: Run API contract tests
+        run: python -m unittest discover -s tests/contract -p "test_*.py" -v
+
+      - name: Run frontend and HTTP hardening tests
+        run: python -m unittest tests.test_frontend tests.test_hardening.HttpSecurityTests -v
 
   check-and-release:
     name: Check and release audit

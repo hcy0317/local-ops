@@ -11,19 +11,20 @@ This evidence does not close Phase 4. `implementationCommit` and `ciRun` remain
 `null`; Windows Python 3.12 and the complete macOS regression/release job must
 pass against the same exact commit before Phase 4 can be marked `PASS`.
 
-### Gated real Windows discovery — PASS (170/170)
+### Gated real Windows discovery — PASS (174/174)
 
 ```powershell
 $env:LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS = "1"
 python -B -m unittest discover -s tests\windows -p "test_*.py" -v
 ```
 
-- Passed: 170
+- Duration: 406.426 seconds
+- Passed: 174
 - Failed/errors/skipped: 0
 - `WIN-LIFE-001..012`: 12/12 test methods passed.
 - `WIN-SEC-001..014`: all 14 explicit cases passed.
-- Candidate commit: `null` (not created yet)
-- CI run/job: `null` (not run yet)
+- Accepted candidate commit: `null` (the fixed candidate is not committed yet)
+- Accepted CI run/job: `null` (the failed attempt is recorded below)
 
 ### WIN-LIFE mapping — PASS
 
@@ -109,10 +110,23 @@ All cases are in `tests/windows/test_windows_security_matrix.py`.
 - Limitation: headless QA did not invoke the native OS picker or prove delivery
   through Windows Notification Center. Those native paths remain `NOT_RUN`.
 
-### Exact-commit CI — PENDING
+### Exact-commit CI — PENDING AFTER FAILED ATTEMPT
 
-- Windows Python 3.12 exact-commit CI: `NOT_RUN`
-- Complete macOS regression/release/reproducibility CI: `NOT_RUN`
+- Historical failed attempt: exact commit
+  `fc29e5637d93b95026a5dbca5e46c638c51b5439` (`fc29e56`), run
+  `31766584905`, conclusion `FAILED`.
+- Windows failure: the hosted administrator token demonstrated that Windows
+  new-object ownership follows `TokenOwner`; the candidate incorrectly assumed
+  the current user would always be the initial owner.
+- macOS failure: Windows lifecycle fixtures did not isolate the fake platform
+  principal globals from the host principal.
+- The attempt does not populate `implementationCommit` or `ciRun` and does not
+  advance `lastGreenPhase` beyond P3.
+- Fixed-candidate Windows Python 3.12 exact-commit CI: `NOT_RUN`
+- Fixed-candidate complete macOS regression/release/reproducibility CI: `NOT_RUN`
+- The Windows workflow now runs Windows/lifecycle discovery, API contracts, and
+  frontend/HTTP hardening as three independent fail-fast steps without
+  `continue-on-error`.
 - Phase 4 local Edge lifecycle QA: `PASS_LOCAL`; native picker and Windows Notification Center delivery: `NOT_RUN`
 - `lastGreenPhase`: `P3`
 

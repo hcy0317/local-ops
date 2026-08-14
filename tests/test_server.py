@@ -667,7 +667,7 @@ class RuntimeStorageTests(unittest.TestCase):
                        CONSOLE_LOG_DIR=logs)
             result = subprocess.run(
                 [sys.executable, server.__file__, "--prepare-storage"],
-                cwd=td, env=env, capture_output=True, text=True, timeout=5)
+                cwd=td, env=env, capture_output=True, encoding="utf-8", timeout=5)
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(os.path.isdir(target))
@@ -687,7 +687,7 @@ class RuntimeStorageTests(unittest.TestCase):
                        CONSOLE_LOG_DIR=os.path.join(td, "logs"))
             result = subprocess.run(
                 [sys.executable, server.__file__, "--prepare-storage"],
-                cwd=td, env=env, capture_output=True, text=True, timeout=5)
+                cwd=td, env=env, capture_output=True, encoding="utf-8", timeout=5)
             self.assertNotEqual(result.returncode, 0)
             self.assertNotIn("总控台已启动", result.stdout + result.stderr)
 
@@ -714,6 +714,30 @@ class RuntimeStorageTests(unittest.TestCase):
             with open(log_path, encoding="utf-8") as f:
                 self.assertEqual(f.read(), "launcher-log-ready\n")
             self.assertEqual(os.stat(log_path).st_mode & 0o777, 0o600)
+
+    def test_redirected_legacy_stdio_does_not_crash_localized_startup(self):
+        with tempfile.TemporaryDirectory() as td:
+            script = "\n".join((
+                "import runpy, sys",
+                "path = sys.argv[1]",
+                "sys.argv = [path, '--prepare-storage']",
+                "runpy.run_path(path, run_name='__main__')",
+                "print('总控台已启动', flush=True)",
+            ))
+            environment = dict(
+                os.environ,
+                CONSOLE_DATA_DIR=os.path.join(td, "data"),
+                CONSOLE_LOG_DIR=os.path.join(td, "logs"),
+                PYTHONIOENCODING="cp1252:strict",
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-c", script, server.__file__],
+                cwd=server.BASE_DIR, env=environment, capture_output=True,
+                timeout=5)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("总控台已启动", result.stdout.decode("utf-8"))
 
 
 class ProcessIdentityTests(unittest.TestCase):

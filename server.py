@@ -5490,6 +5490,16 @@ def redirect_console_output():
             pass
 
 
+def configure_console_output():
+    """Keep localized CLI output safe when Windows redirects legacy stdio."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(
+                encoding="utf-8", errors="backslashreplace", line_buffering=True)
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 def main(preferred_port=None, open_browser=True, log_to_file=False):
     """Run exactly one console for this project/data directory."""
     migration = prepare_runtime_storage()
@@ -5518,6 +5528,7 @@ def main(preferred_port=None, open_browser=True, log_to_file=False):
 
 
 if __name__ == "__main__":
+    configure_console_output()
     if "--prepare-storage" in sys.argv:
         # 供安装/诊断流程预先验证迁移和目录权限，不启动 HTTP。
         storage = prepare_runtime_storage()

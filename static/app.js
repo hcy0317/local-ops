@@ -9,7 +9,7 @@ import { $, el, setText, setChildren, icon, escapeHtml,
   openLayer, closeLayer, activeLayer,
   currentMutationEpoch, taskNotificationsEnabled, toggleTaskNotifications,
   localServiceUrl, platformPresentation, shortcutLabel,
-  hasCapability } from './js/core.js';
+  hasCapability, currentPlatform } from './js/core.js';
 import { renderLaunchpad, toggleApp, closePortDiagnostic, closeAppDiagnosis } from './js/launchpad.js';
 import { renderServices, observePortDiscovery,
   suspendPortDiscovery } from './js/services.js';
@@ -18,9 +18,11 @@ import { initWidgets, renderWidgets, openLogsCenter, closeLogsCenter,
   resetFeedBaseline } from './js/widgets.js';
 import { buildGlyphGrid, initAppModal, initLogDrawer, openConfirm,
   openAppModal, closeAppModal, closeConfirm, openLogs, closeLogs,
-  openConsoleLog } from './js/overlays.js';
+  openConsoleLog, refreshLifecycleState,
+  offerForceStopAfterTimeout } from './js/overlays.js';
 import { configuredPort, actualPorts, portIsOpenable,
   preferredOpenPort } from './js/ports.js';
+import { lifecyclePayload, lifecycleSnapshot, runLifecycleMutation } from './js/lifecycle.js';
 
 /* ---------------- DOM 引用 ---------------- */
 const banner = $('#banner');
@@ -112,7 +114,7 @@ let pollTimer = null;
 let restartDeadlineTimer = null;
 
 function poll(force = false) {
-  if (document.hidden && !force) return Promise.resolve();
+  if (document.hidden && !force) return Promise.resolve(false);
   if (pollPromise) return pollPromise;
   const controller = new AbortController();
   pollController = controller;
@@ -138,7 +140,7 @@ function poll(force = false) {
          丢弃并立即补一轮，避免卡片短暂回退到旧状态。 */
       if (epochAtStart !== currentMutationEpoch()) {
         schedulePoll(0);
-        return;
+        return false;
       }
       reconcilePendingUiTheme(data);
       if (state.restartingFrom) {
@@ -161,6 +163,7 @@ function poll(force = false) {
         setConnected(true);
       }
       render();
+      return true;
     } catch (e) {
       suspendPortDiscovery();
       resetFeedBaseline();
@@ -170,6 +173,7 @@ function poll(force = false) {
         const denied = e.status === 401 || e.status === 403;
         setConnected(false, denied ? '控制台拒绝了当前页面的访问，请重新打开总控台。' : '');
       }
+      return false;
     } finally {
       clearTimeout(timeout);
       if (pollController === controller) pollController = null;
@@ -189,7 +193,12 @@ function schedulePoll(delay = POLL_INTERVAL_MS) {
   }, delay);
 }
 
-window.__poll = () => poll(true);   // 模块间共享轮询入口
+/* 写操作后的调用方必须拿到一份真正晚于在途旧请求的新快照。 */
+window.__poll = async () => {
+  const pending = pollPromise;
+  if (pending) await pending;
+  return poll(true);
+};
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     suspendPortDiscovery();
@@ -406,13 +415,19 @@ function openableAppPort(app) {
     ? preferredOpenPort(app) : null;
 }
 
-async function restartAppFromPalette(id) {
-  if (!hasCapability('stop_managed') || !hasCapability('launch_managed')) {
+async function restartAppFromPalette(id, intent, appName) {
+  if (!intent || !intent.canManage
+      || !hasCapability('stop_managed') || !hasCapability('launch_managed')) {
     toast(platformPresentation().lifecycleNotice);
     return;
   }
-  const result = await act(post('/api/apps/' + id + '/restart', {}));
-  if (result && result.ok !== false && window.__poll) window.__poll();
+  const { result, stateIsFresh } = await runLifecycleMutation(
+    () => act(post('/api/apps/' + id + '/restart', lifecyclePayload(intent))),
+    refreshLifecycleState,
+  );
+  offerForceStopAfterTimeout(result, intent, id, appName, stateIsFresh, () => {
+    toast('已强制停止，请再次启动应用');
+  });
 }
 
 function paletteActions() {
@@ -439,10 +454,13 @@ function paletteActions() {
   const apps = (state.data && state.data.apps) || [];
   for (const a of apps) {
     const running = !!a.running;
+    const intent = lifecycleSnapshot(a, currentPlatform());
     const isTask = (a.kind || 'service') === 'task';
     const port = openableAppPort(a);
     const name = a.name || '未命名';
-    const canToggle = hasCapability(running ? 'stop_managed' : 'launch_managed');
+    const canToggle = intent.canManage
+      ? hasCapability('stop_managed')
+      : intent.canStart && hasCapability('launch_managed');
     if (canToggle) {
       items.push({
         icon: running ? 'square' : 'play',
@@ -450,14 +468,14 @@ function paletteActions() {
           : (isTask ? '运行 ' : '启动 ')) + name,
         hint: isTask ? '任务' : appPortHint(a),
         on: running,
-        run: () => toggleApp(a.id),
+        run: () => toggleApp(a.id, null, intent),
       });
     }
-    if (running && !isTask && hasCapability('stop_managed') &&
+    if (intent.canManage && !isTask && hasCapability('stop_managed') &&
         hasCapability('launch_managed')) {
       items.push({
         icon: 'refresh-cw', title: '重启 ' + name, hint: '重新启动', on: true,
-        run: () => restartAppFromPalette(a.id),
+        run: () => restartAppFromPalette(a.id, intent, name),
       });
     }
     if (running && port) {

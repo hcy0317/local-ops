@@ -1,6 +1,130 @@
-# Phase 0 Test Evidence
+# Windows Port Test Evidence
 
-## Evidence identity
+## Phase 4 local gate — LOCAL_PASS_CI_PENDING
+
+The authorized local gate passed on 2026-08-14 on Windows NT build 26200
+(DisplayVersion 25H2), x64, at medium integrity without administrator
+membership. Local Python was 3.13.13 and Node.js was 24.16.0. All destructive
+operations were restricted to processes created by the test fixtures.
+
+This evidence does not close Phase 4. `implementationCommit` and `ciRun` remain
+`null`; Windows Python 3.12 and the complete macOS regression/release job must
+pass against the same exact commit before Phase 4 can be marked `PASS`.
+
+### Gated real Windows discovery — PASS (170/170)
+
+```powershell
+$env:LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS = "1"
+python -B -m unittest discover -s tests\windows -p "test_*.py" -v
+```
+
+- Passed: 170
+- Failed/errors/skipped: 0
+- `WIN-LIFE-001..012`: 12/12 test methods passed.
+- `WIN-SEC-001..014`: all 14 explicit cases passed.
+- Candidate commit: `null` (not created yet)
+- CI run/job: `null` (not run yet)
+
+### WIN-LIFE mapping — PASS
+
+| ID | Test module and method |
+| --- | --- |
+| `WIN-LIFE-001` | `tests/windows/test_windows_lifecycle.py::test_win_life_001_python_http_listener_log_and_job_state` |
+| `WIN-LIFE-002` | `tests/windows/test_windows_lifecycle.py::test_win_life_002_node_npm_listener_log_and_state` |
+| `WIN-LIFE-003` | `tests/windows/test_windows_lifecycle.py::test_win_life_003_background_child_survives_root_exit` |
+| `WIN-LIFE-004` | `tests/windows/test_windows_lifecycle.py::test_win_life_004_005_console_close_and_reopen_reconnect` |
+| `WIN-LIFE-005` | `tests/windows/test_windows_lifecycle.py::test_win_life_004_005_http_console_process_restart` |
+| `WIN-LIFE-006` | `tests/windows/test_windows_lifecycle.py::test_win_life_006_graceful_success_and_generation_release` |
+| `WIN-LIFE-007` | `tests/windows/test_windows_lifecycle.py::test_win_life_007_008_timeout_then_explicit_owned_job_force` |
+| `WIN-LIFE-008` | `tests/windows/test_windows_lifecycle.py::test_win_life_007_008_timeout_then_explicit_owned_job_force` |
+| `WIN-LIFE-009` | `tests/windows/test_windows_lifecycle.py::test_win_life_009_suspended_has_no_side_effect_before_resume` and `test_win_life_009_launch_failure_has_no_side_effect_or_runtime_records` |
+| `WIN-LIFE-010` | `tests/windows/test_windows_lifecycle.py::test_win_life_010_runner_identity_mismatch_fails_closed` |
+| `WIN-LIFE-011` | `tests/windows/test_windows_lifecycle.py::test_win_life_011_runner_crash_kills_only_its_job` |
+| `WIN-LIFE-012` | `tests/windows/test_windows_lifecycle.py::test_win_life_012_one_hundred_cycles_leave_no_runtime_records` |
+
+The two `WIN-LIFE-004/005` methods cover both a cold adapter reconnect after
+the original controller exits and an actual HTTP console subprocess
+termination/reopen while the managed service remains live. `WIN-LIFE-012`
+performs 100 complete launch, activate, force-stop, and release cycles.
+
+### WIN-SEC mapping — PASS
+
+All cases are in `tests/windows/test_windows_security_matrix.py`.
+
+| ID | Test method |
+| --- | --- |
+| `WIN-SEC-001` | `test_win_sec_001_pid_create_time_mismatch_refuses_control` |
+| `WIN-SEC-002` | `test_win_sec_002_other_listener_is_not_claimed_or_stopped` |
+| `WIN-SEC-003` | `test_win_sec_003_same_name_and_cwd_are_not_ownership_proof` |
+| `WIN-SEC-004` | `test_win_sec_004_other_sid_rejected_before_cwd_or_control` |
+| `WIN-SEC-005` | `test_win_sec_005_wrong_host_or_origin_is_rejected` |
+| `WIN-SEC-006` | `test_win_sec_006_missing_or_wrong_cookie_and_hmac_are_rejected` |
+| `WIN-SEC-007` | `test_win_sec_007_exclusive_socket_rejects_port_takeover` |
+| `WIN-SEC-008` | `test_win_sec_008_widened_acl_is_verify_only_and_control_fails_closed` |
+| `WIN-SEC-009` | `test_win_sec_009_junction_runtime_path_is_rejected` |
+| `WIN-SEC-010` | `test_win_sec_010_cmd_and_powershell_special_args_do_not_inject` |
+| `WIN-SEC-011` | `test_win_sec_011_concurrent_generation_cas_has_one_winner` |
+| `WIN-SEC-012` | `test_win_sec_012_partial_scan_is_degraded_and_control_fails_closed` |
+| `WIN-SEC-013` | `test_win_sec_013_stale_generation_cannot_stop_new_instance` |
+| `WIN-SEC-014` | `test_win_sec_014_assign_or_persist_failure_never_resumes` |
+
+### Frontend, HTTP hardening, contracts, and lint — PASS
+
+- `python -B -m unittest tests.test_frontend -v`: 24/24 passed.
+- `python -B -m unittest tests.test_hardening.HttpSecurityTests -v`: 6/6 passed (30/30 combined with frontend).
+- `python -B -m unittest discover -s tests\contract -p "test_*.py" -v`: 31 passed, one privileged symlink case skipped because this non-admin session cannot create symlinks.
+- `node --test tests\js\lifecycle.test.mjs`: 30/30 passed.
+- Ruff: passed for the Phase 4 Python scope.
+- Atomic request/receipt coverage proves the temporary file receives its
+  private ACL before replacement becomes visible.
+- Active-generation release requires exactly the three private runtime records,
+  a valid signed terminal receipt, exact identity, an empty Job, and an absent
+  runner. Atomic rename to the strictly derived cleanup tombstone is the
+  release commit; a rename failure leaves the active generation intact.
+- Committed tombstone recovery deletes only a private, nonlink allowlisted
+  subset of the three runtime records and performs no process observation or
+  control. Unknown entries, widened ACLs, links, and non-derived paths fail
+  closed and remain untouched.
+
+### Isolated Edge UI lifecycle flow — PASS_LOCAL
+
+- Host/browser: isolated Windows 11 fixture, Edge 151, console port 9601, CDP
+  port 9224. The existing user console and processes were outside the fixture.
+- Core journey: add → start → log marker → HTTP 200 → graceful stop → bad-cwd
+  diagnostic → restore → start → restart with a changed generation → final
+  stop → delete.
+- Final state: `runtimeIdentity` was `null`, runtime records were absent, and
+  all fixture PIDs and ports were gone.
+- Responsive checks: 1280 px and 360 px viewports had no horizontal overflow.
+- Notifications: permission-denied and permission-granted paths passed; the
+  granted path constructed and closed a `Notification` object.
+- Compatibility-edit follow-up: a blocked app initially kept Save disabled;
+  entering a valid cwd immediately enabled Save, cleared its disabled title
+  and stale compatibility text, and preserved the structured command. A real
+  save then returned backend compatibility `ready`, health `ok`, and the same
+  direct command spec.
+- Overlay follow-up: z-index order was banner 400, drawer mask 410, drawer 415,
+  and toast 420. `elementFromPoint` at the prior overlap resolved to the drawer
+  close control; a real click closed the drawer with `aria-hidden="true"`.
+- Limitation: headless QA did not invoke the native OS picker or prove delivery
+  through Windows Notification Center. Those native paths remain `NOT_RUN`.
+
+### Exact-commit CI — PENDING
+
+- Windows Python 3.12 exact-commit CI: `NOT_RUN`
+- Complete macOS regression/release/reproducibility CI: `NOT_RUN`
+- Phase 4 local Edge lifecycle QA: `PASS_LOCAL`; native picker and Windows Notification Center delivery: `NOT_RUN`
+- `lastGreenPhase`: `P3`
+
+### Deferred beyond Phase 4
+
+- Windows 10 non-admin validation: `DEFERRED`
+- Self-contained package / clean VM without Python: `NOT_RUN` (Phase 5)
+- `windowsBetaReady`: `false`
+
+---
+
+## Phase 0 evidence identity
 
 - Baseline commit: `a5c3adae1f1fa0bd9f0ac7b090ec422e285d0c0f`
 - Branch: `windows-port/phase-0-baseline`
@@ -91,7 +215,7 @@ Covered contracts: port normalization, configured/actual port mapping, mismatch 
 | Windows 11 Python 3.12 | NOT_RUN | Local interpreter is Python 3.13.13 |
 | Clean Windows VM without Python | NOT_RUN | Environment unavailable; belongs to the packaging gate |
 | Packaged Windows runtime | NOT_RUN | Packaging is Phase 5 work |
-| Lifecycle/destructive security matrix | NOT_RUN | Windows lifecycle is intentionally unavailable before Phase 4 |
+| Lifecycle/destructive security matrix at the Phase 0 checkpoint | NOT_RUN | Windows lifecycle was intentionally unavailable before Phase 4 |
 | macOS asset/release build | PASS | Run 31659571268 checked out the original assets and passed build, verification, and reproducibility |
 
 ## Baseline artifact hashes
@@ -324,7 +448,7 @@ The Windows 11 Phase 2 target was `PASS`. The original cross-version Phase 2 gat
 | --- | --- | --- |
 | Phase 3 browser screenshot/click QA | NOT_RUN | `browser-harness --doctor` reports Chrome running but daemon/active CDP connections unavailable (0); no visual PASS is claimed |
 | Windows 10 non-admin | DEFERRED | Explicit user scope; no Win10 claim |
-| Phase 4 lifecycle | NOT_STARTED | No runner, Job Object, generation, runtime identity, or lifecycle side effect was added |
-| Windows Python 3.12 exact-commit CI | PASS | Commit `97c417ef1491ac11fdb036c4e4102bfc190c88e6`, run `31698371278`, job `94441279178` |
-| macOS complete regression/release CI | PASS | Commit `97c417ef1491ac11fdb036c4e4102bfc190c88e6`, run `31698371278`, job `94441279120`; project checks, release build/verify, and reproducibility passed |
+| Phase 4 lifecycle at the Phase 3 checkpoint | NOT_STARTED | No runner, Job Object, generation, runtime identity, or lifecycle side effect was present in the Phase 3 candidate |
+| Phase 3 Windows Python 3.12 exact-commit CI | PASS | Historical Phase 3 commit `97c417ef1491ac11fdb036c4e4102bfc190c88e6`, run `31698371278`, job `94441279178`; not Phase 4 evidence |
+| Phase 3 macOS complete regression/release CI | PASS | Historical Phase 3 commit `97c417ef1491ac11fdb036c4e4102bfc190c88e6`, run `31698371278`, job `94441279120`; not Phase 4 evidence |
 | Windows package / clean VM | NOT_RUN | Phase 5 scope |

@@ -228,12 +228,52 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
     def test_health_notice_does_not_report_connection_loss(self):
         app = (ROOT / "static/app.js").read_text(encoding="utf-8")
         widgets = (ROOT / "static/js/widgets.js").read_text(encoding="utf-8")
+        ops = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
 
         self.assertIn("banner.dataset.connection = ok ? 'up' : 'down'", app)
         self.assertIn("banner.dataset.connection === 'down'", widgets)
         self.assertIn("attributeFilter: ['data-connection']", widgets)
         self.assertNotIn("banner.classList.contains('show')", widgets)
         self.assertEqual(app.count("banner.dataset.connection = 'down'"), 2)
+        self.assertIn(".banner.show ~ .shell > .rail", ops)
+        self.assertIn(".banner.show ~ .shell > .shell-col { padding-top: 38px; }", ops)
+
+    def test_cwd_changes_discard_only_stale_command_compatibility(self):
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+
+        helper = re.search(
+            r"function invalidateCommandCompatibility\(\) \{(?P<body>.*?)\n\}",
+            overlays,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(helper)
+        self.assertIn("selectedCompatibility = null;", helper.group("body"))
+        self.assertNotIn("selectedCommandSpec =", helper.group("body"))
+        self.assertIn(
+            "fCwd.value = r.path;\n        invalidateCommandCompatibility();",
+            overlays,
+        )
+        self.assertIn(
+            "fCwd.addEventListener('input', () => {\n"
+            "    invalidateCommandCompatibility();",
+            overlays,
+        )
+
+    def test_log_drawer_layers_above_banner_and_below_toast(self):
+        ops = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
+
+        def z_index(selector):
+            match = re.search(r"z-index:\s*(\d+)", theme_block(ops, selector))
+            self.assertIsNotNone(match, f"Missing z-index for {selector}")
+            return int(match.group(1))
+
+        banner = z_index(".banner")
+        drawer_mask = z_index(".drawer-mask")
+        drawer = z_index(".drawer")
+        toast = z_index(".toast")
+        self.assertLess(banner, drawer_mask)
+        self.assertLess(drawer_mask, drawer)
+        self.assertLess(drawer, toast)
 
     def test_console_controls_follow_platform_capability(self):
         app = (ROOT / "static/app.js").read_text(encoding="utf-8")
@@ -293,17 +333,59 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         services = (ROOT / "static/js/services.js").read_text(encoding="utf-8")
         widgets = (ROOT / "static/js/widgets.js").read_text(encoding="utf-8")
 
-        self.assertIn("hasCapability(running ? 'stop_managed' : 'launch_managed')", app)
-        self.assertIn("!hasCapability('stop_managed') || !hasCapability('launch_managed')", app)
-        self.assertIn("const capability = app.running ? 'stop_managed' : 'launch_managed'", launchpad)
+        self.assertIn("intent.canManage", app)
+        self.assertIn("hasCapability('stop_managed')", app)
+        self.assertIn("const capability = starting ? 'launch_managed' : 'stop_managed'", launchpad)
         self.assertIn("diagAttach.hidden = !hasCapability('attach_external')", launchpad)
-        self.assertIn("? hasCapability('stop_managed') : hasCapability('kill_external')", launchpad)
+        self.assertIn("ownerLifecycle.canManage", launchpad)
+        self.assertIn(": hasCapability('kill_external')", launchpad)
         self.assertGreaterEqual(overlays.count("hasCapability('kill_external')"), 2)
         self.assertIn("pendingAttach = hasCapability('attach_external')", overlays)
         self.assertIn("r.kill.hidden = !hasCapability('kill_external')", services)
         self.assertIn("if (!hasCapability('kill_external')) return;", services)
         self.assertIn("batchStop.hidden = !canStop", widgets)
         self.assertGreaterEqual(widgets.count("if (!hasCapability('stop_managed'))"), 2)
+
+    def test_phase4_lifecycle_mutations_freeze_generation_and_fail_closed(self):
+        app = (ROOT / "static/app.js").read_text(encoding="utf-8")
+        core = (ROOT / "static/js/core.js").read_text(encoding="utf-8")
+        lifecycle = (ROOT / "static/js/lifecycle.js").read_text(encoding="utf-8")
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+        widgets = (ROOT / "static/js/widgets.js").read_text(encoding="utf-8")
+
+        self.assertIn("return Object.freeze({", lifecycle)
+        self.assertIn("expectedGeneration: status === 'stopped' ? null : generation", lifecycle)
+        self.assertIn("const hasExplicitStatus", lifecycle)
+        self.assertIn("const hasExplicitControl", lifecycle)
+        self.assertIn("status === 'orphaned' || status === 'unknown'", lifecycle)
+        self.assertIn("const pending = pollPromise", app)
+        self.assertIn("if (pending) await pending", app)
+        self.assertIn("return poll(true)", app)
+        self.assertIn("return Promise.resolve(false)", app)
+
+        self.assertIn("toggleApp(a.id, null, intent)", app)
+        self.assertIn("restartAppFromPalette(a.id, intent, name)", app)
+        self.assertIn("lifecyclePayload(intent)", app)
+        self.assertIn("capturedIntent || lifecycleSnapshot", launchpad)
+        self.assertIn("lifecycle.status === 'orphaned'", launchpad)
+        self.assertIn("lifecycle.status === 'unknown'", launchpad)
+        self.assertIn("lifecycleState === 'unavailable' ? '不可用'", launchpad)
+        self.assertIn("lifecyclePayload(intent, starting ? {} : { force: false })", launchpad)
+        self.assertIn("del('/api/apps/' + app.id, lifecyclePayload(intent))", launchpad)
+        self.assertIn("'/api/apps/' + owner.appId + '/stop'", launchpad)
+        self.assertIn("lifecyclePayload(intent, { force: false })", launchpad)
+
+        self.assertIn("body.expectedGeneration = editingAppOriginal.lifecycle.expectedGeneration", overlays)
+        self.assertIn("await refreshLifecycleState(app)", overlays)
+        self.assertIn("sameLifecycleGeneration(intent, latest, currentPlatform())", overlays)
+        self.assertIn("if (!stateIsFresh || !hasCapability('force_stop_managed')", overlays)
+        self.assertIn("return stateIsFresh", overlays)
+        self.assertIn("lifecyclePayload(forceIntent, { force: true })", overlays)
+        self.assertIn("isGenerationMismatch(result)", overlays)
+        self.assertIn("item.intent.canManage", widgets)
+        self.assertIn("lifecyclePayload(item.intent, { force: false })", widgets)
+        self.assertIn("const del = (p, b) => req('DELETE', p, b)", core)
 
     def test_windows_import_wizard_follows_preview_commit_rollback_contract(self):
         html = (ROOT / "static/index.html").read_text(encoding="utf-8")

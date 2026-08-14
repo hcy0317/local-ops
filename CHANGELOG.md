@@ -10,6 +10,8 @@
 
 ### Added
 
+- 增加 Windows Phase 4 生命周期源码候选：per-app runner、受保护 Named Pipe/回执、`CREATE_SUSPENDED` 启动、Named Job Object、generation compare-and-swap，以及普通停止与显式 Force 的分离流程。
+- 增加 `docs/windows-port/API-CONTRACT-v3.md`，冻结 11 字段公开 runtime identity、生命周期状态、稳定错误码和前端 generation 规则；隔离 Windows CI 仅运行测试夹具进程。
 - 增加 Windows Phase 3 兼容性源码预览：schema v2、`commandSpec`、静态命令预检、Windows 脚本/PATHEXT/npm/pnpm/Python 3.12 项目候选，以及平台化快捷键、路径和能力说明。
 - 设置中心增加显式 macOS 配置导入向导，支持零写入预览、路径映射、逐项选择、原子提交、幂等重试与 CAS 回滚；旧运行身份和进程状态不会被导入。
 - 增加 `docs/windows-port/API-CONTRACT-v2.md`，冻结 Phase 3 的配置、命令、路径选择、导入和稳定错误码契约。
@@ -34,7 +36,8 @@
 
 ### Changed
 
-- Windows 浏览器界面现在完全按后端 platform/capabilities 呈现操作，并移除客户端 POSIX quote、macOS home-path 推断和外部进程控制入口；生命周期仍保持禁用。
+- Windows capability 现在只为完整验证的 Local Ops Job 开启 `launch_managed/stop_managed/force_stop_managed`；`kill_external/attach_external/restart_console` 保持关闭。
+- Windows 浏览器界面现在同时按全局 capability 与每应用 `lifecycleStatus/controlAvailable` 呈现操作，并为每次启动、停止、重启、运行中修改和删除冻结 `expectedGeneration`；外部进程控制入口仍保持禁用。
 - 默认将配置/图标移至 `~/Library/Application Support/总控台`，日志移至 `~/Library/Logs/总控台`。新目标不存在时仅首次复制旧 `data/`，不删除原文件。
 - `config.json.bak` 现保留修改前的上一份良好配置，而不是与主配置相同的副本。
 - 运行目录权限收紧为 `0700`，配置、图标和日志文件为 `0600`。
@@ -65,9 +68,12 @@
 
 ### Security
 
+- Windows 受管生命周期仅信任当前 SID、generation、runner/root PID 创建时间、HMAC 回执和 Job Object 成员关系；普通停止不会自动升级为 Force，强制停止只终止验证通过的专属 Job。
+- raw control token 仅保存在受保护 runtime 文件和 runner 内存中，不进入配置、前端、命令行、日志或诊断；runner 异常退出通过 Job kill-on-close 仅清理自己的进程树。
+- request/receipt 原子写入在替换为权威记录前先保护临时文件 DACL；清理恢复只接受签名有效、Job 已空且目录内容精确匹配的 terminal generation，不删除模糊记录、日志或无关文件。
 - Phase 3 静态预检和配置导入在任何文件系统探针前拒绝 UNC/设备命名空间；导入源限制为 1 MiB 本地常规文件，事务回执可从 prepared 状态恢复，配置在原子替换后的 ACL 校验失败时保持内存/磁盘一致并转入只读保护。
 - Windows 私有目录和文件使用仅当前 SID、SYSTEM 与 Administrators 可访问的受保护 DACL；验证失败时配置进入只读保护。
-- Windows Phase 2 在 adapter 与 HTTP 路由双重禁用外部认领、进程结束、应用启停/重启和总控台重启，拒绝发生在配置或进程副作用之前。
+- Windows Phase 2 检查点曾在 adapter 与 HTTP 路由双重禁用外部认领、进程结束、应用启停/重启和总控台重启；Phase 4 只放开已验证 Job 的受管启停/Force，外部控制与总控台重启继续关闭。
 - 将用户配置、日志、图标、token 和临时发行产物排除出版本控制默认范围。
 - 主配置与备份均无法验证时进入只读保护，防止用空默认配置覆盖尚可恢复的用户数据。
 - 增加私密漏洞报告、Issue/PR 脱敏和公开仓库安全披露门禁。

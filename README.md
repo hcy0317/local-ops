@@ -2,11 +2,11 @@
 
 **Preview / Alpha · 源码预览**
 
-总控台是一个本地服务与批处理任务快速启动、运行监测工具。macOS 版本保留完整现有功能；Windows 当前处于 Phase 3 兼容性源码预览，提供安全的本地监听与进程观察、结构化命令配置和显式 macOS 配置导入，但仍不提供进程控制。共享核心只绑定回环地址；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
+总控台是一个本地服务与批处理任务快速启动、运行监测工具。macOS 版本保留完整现有功能；Windows 当前处于 Phase 4 生命周期源码候选，提供安全的本地监听与进程观察、结构化命令配置、显式 macOS 配置导入，以及仅面向 Local Ops 自己创建的 Job Object 进程树控制。共享核心只绑定回环地址；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
 
 > 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整；`总控台.app` 目前不是可单独复制的自包含应用，也尚不代表经过签名、公证的最终 macOS 发行版。
 
-总控台只服务当前机器和当前用户，不是远程运维、多人协作或公网管理面板。macOS 完整版能够以当前用户权限执行保存的 shell 命令；Windows Phase 3 只描述和静态校验命令，明确禁用命令执行和进程控制。不要将监听地址、反向代理、SSH 隧道或端口映射暴露到不受信任的网络。
+总控台只服务当前机器和当前用户，不是远程运维、多人协作或公网管理面板。macOS 完整版能够以当前用户权限执行保存的 shell 命令；Windows Phase 4 只允许控制经 SID、generation、PID 创建时间、HMAC/受保护回执和 Job Object 完整验证的自建进程树。外部进程认领与结束仍禁用。不要将监听地址、反向代理、SSH 隧道或端口映射暴露到不受信任的网络。
 
 ## 功能
 
@@ -15,7 +15,7 @@
 - 在当前页面会话中发现新出现的、尚未管理的监听端口，可直接加入启动台或忽略隐藏。
 - 运行前检查工作目录、脚本和运行时；明确失效时直接给出修复入口，不必先失败一次。
 - 从项目文件夹识别常用启动命令，但不安装依赖、不执行项目代码。
-- 通过运行 token、进程组和当前 UID 联合识别受控进程，不会因端口相同就杀死外部进程。
+- macOS 通过运行 token、进程组和当前 UID 联合识别受控进程；Windows 通过 SID、generation、PID 创建时间、签名回执和 Job 成员关系识别受管 Job。两个平台都不会因端口相同就结束外部进程。
 - Ops 指挥台单一主题：深空蓝黑/雾灰双色，左侧导航轨、KPI 概览卡、实时动态侧栏，浅色、深色和跟随系统。
 - 全局命令面板可直接添加服务或批处理任务；启动台卡片支持鼠标拖拽和键盘排序。
 
@@ -34,9 +34,9 @@
 - macOS 自带的 `ps`、`lsof`、`osascript` 等系统工具。
 - Safari、Chrome 或其他支持 ES Modules 的现代浏览器。
 
-Windows Phase 3 源码预览要求 Windows 10/11 x64、Python 3.12，以及 `requirements-windows.txt` 中锁定的依赖。当前提交仅在 Windows 11 非管理员会话完成本机验证；Windows 10 尚未完成真实机验收，因此不构成 Windows Beta 发布。
+Windows Phase 4 源码候选要求 Windows 11 x64、Python 3.12，以及 `requirements-windows.txt` 中锁定的依赖。当前 `LOCAL_PASS_CI_PENDING`：Windows NT build 26200（25H2）非管理员本地门禁已通过，但本地使用的是 Python 3.13.13；精确提交的 Windows Python 3.12 CI 与完整 macOS 回归尚未运行。状态以 `docs/windows-port/STATE.json` 为准。Windows 10、self-contained 打包和干净机器验收属于 Phase 5，因此不构成 Windows Beta 发布。
 
-## Windows Phase 3 兼容性源码预览
+## Windows Phase 4 生命周期源码候选
 
 在 PowerShell 中从项目根目录运行：
 
@@ -48,11 +48,17 @@ py -3.12 -m venv .venv
 
 Windows 用户数据固定写入 `%LOCALAPPDATA%\LocalOps\`。程序使用当前用户 SID、SYSTEM 和 Administrators 的受保护 DACL；同一用户、同一数据目录通过 Named Mutex 保证只有一个写者。自定义数据或日志目录会拒绝盘符根、用户主目录、项目根目录、UNC 共享根以及 symlink/junction 路径。ACL 验证失败时配置进入只读保护。
 
-本阶段可用：当前用户可访问的 IPv4/IPv6 本地监听、进程信息、原生目录/文件选择、配置的非生命周期编辑、schema v2、结构化 `commandSpec`、Windows 项目命令候选与静态预检。旧 `command` 字段继续保留；POSIX 命令只会标记为 `needs_review`，不会被猜测性转换或执行。
+本阶段保留 Phase 3 的 IPv4/IPv6 监听、进程信息、原生选择器、schema v2、结构化 `commandSpec`、项目识别和显式导入，并增加受 generation CAS 保护的启动、普通停止、显式强制停止与重启。旧 `command` 字段继续保留；POSIX 命令仍只会标记为 `needs_review`，不会被猜测性转换或执行。
 
 Windows 不会自动发现或导入项目内旧 `data/` 或 macOS 配置。设置中心的导入向导只接受用户明确选择的本地 JSON 文件，并按“预览 → 路径映射 → 选择 → 提交”执行；预览零写入，提交不覆盖同 ID 应用、清空旧运行身份，并可在目标未发生后续修改时回滚。UNC/设备路径不会被探测或导入。
 
-以下接口在 Windows 上仍明确返回拒绝且不产生副作用：外部进程结束、外部认领、应用启动、停止、重启、运行中生命周期修改和总控台重启。浏览器会按后端 capability 隐藏或禁用对应入口。不要通过改前端或直接调用接口绕过限制；Windows runner、Job Object 和完整生命周期属于 Phase 4。
+Windows runner 是每个受管应用 Job Object 的唯一长期句柄持有者。目标进程先以 `CREATE_SUSPENDED` 创建，加入受保护 Job 并持久化精确 runtime identity 后才允许恢复；普通停止超时会保留身份，只有用户明确确认的 Force 操作才能通过 `TerminateJobObject` 结束该 Job。控制台关闭不会关闭 Job，runner 异常退出则通过 kill-on-close 清理自己的 Job。
+
+request/receipt 原子写入会先保护临时文件的 DACL，再替换为公开可见的最终文件。释放 active generation 前必须验证目录恰好包含三个私有 runtime records、terminal receipt 签名有效、Job 已空且 runner 不再存在；随后将 active 目录原子 rename 为严格派生的 cleanup tombstone，这次 rename 是 release commit。commit 后的恢复只删除 private、nonlink tombstone 中三个 runtime record 的 allowlisted subset，不做任何进程观察或控制；未知项、宽 ACL 或 link 会 fail closed 并保留 tombstone。
+
+Windows 仍不支持外部进程认领、外部进程结束和总控台重启。不要通过修改前端或直接调用接口绕过 capability 与每应用 `controlAvailable` 门禁。破坏性生命周期测试只能设置 `LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS=1` 后在隔离夹具作用域或 hosted runner 中运行，并且只能操作测试夹具创建的进程；禁止控制任何现有用户进程。
+
+本地 Phase 4 门禁已通过 Windows real discovery 170/170、frontend 24/24、HTTP hardening 6/6（合计 30/30）和 Node 30/30。其中包括 `WIN-LIFE-001..012` 的 12/12、`WIN-SEC-001..014` 的 14/14、HTTP 总控台测试子进程终止后重开，以及 100 次完整启动/Force/释放循环。该结果不是精确提交 CI，也不把 `windowsBetaReady` 改为 `true`。
 
 `VERSION` 是项目版本的唯一权威来源。`Info.plist`、发行包名和发行说明应与它保持一致。
 
@@ -99,7 +105,7 @@ python3 server.py --preferred-port 9603  # 在 9600-9609 内指定优先端口
 
 **实际地址在哪里看**：顶栏「重启 :9600」按钮上直接显示当前端口；或看终端输出 / `~/Library/Logs/总控台/console.log`。浏览器手动访问 `http://127.0.0.1:端口号/` 即可。
 
-**停止与重启**：顶栏「重启 / 停止」控制的是总控台自身（网页服务）。停止总控台**不会**停止启动台里已经运行的应用——它们是独立进程组，会继续运行；下次打开总控台时会自动重新识别。重启总控台会加载磁盘上的最新代码，同样不影响运行中的应用。
+**停止与重启**：macOS 顶栏「重启 / 停止」控制的是总控台自身（网页服务）。停止总控台**不会**停止启动台里已经运行的应用——它们是独立进程组，会继续运行；下次打开总控台时会自动重新识别。重启总控台会加载磁盘上的最新代码，同样不影响运行中的应用。Windows Phase 4 的总控台重启/停止控制保持禁用；受管 Job 由独立 runner 持有，因此测试创建的总控台进程退出并重开后仍可重新验证和控制同一 generation。
 
 ## 使用
 
@@ -203,7 +209,7 @@ python3 server.py
 4. 运行 `make check`。
 5. 启动后检查应用数量、主题、关注关键字和一个可控服务的完整启停。
 
-当前配置为 schema v2，启动时逐版执行显式、幂等迁移。v2 保留旧 `command`，并增加只用于结构化兼容描述的 `commandSpec`；Windows Phase 3 不会据此执行命令。新程序不会静默降级它不认识的更高 schema；回退程序时仍应同时恢复与该版本匹配的数据备份。
+当前配置为 schema v2，启动时逐版执行显式、幂等迁移。v2 保留旧 `command`，Windows Phase 4 只会执行通过静态预检的结构化 `commandSpec`；POSIX/待复核命令仍不可执行。新程序不会静默降级它不认识的更高 schema；回退程序时仍应同时恢复与该版本匹配的数据备份。
 
 ## 卸载
 

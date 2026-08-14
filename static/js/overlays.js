@@ -5,7 +5,10 @@
 import { $, el, setText, setChildren, icon, escapeHtml,
   post, put, del, act, toast, openLayer, closeLayer,
   GLYPHS, findApp, bumpMutationEpoch, hasCapability,
-  platformPresentation } from './core.js';
+  platformPresentation, currentPlatform } from './core.js';
+import { lifecyclePayload, lifecycleSnapshot, sameLifecycleGeneration,
+  isGenerationMismatch, isStopTimeout, runLifecycleMutation,
+  runConfirmedForceStop } from './lifecycle.js';
 
 /* ---------------- DOM 引用 ---------------- */
 const appModalMask = $('#appModalMask'), appModal = $('#appModal'), appModalTitle = $('#appModalTitle');
@@ -90,6 +93,62 @@ export function confirmKill(svc) {
   });
 }
 
+export async function refreshLifecycleState(result) {
+  const stateIsFresh = window.__poll ? await window.__poll() === true : false;
+  if (isGenerationMismatch(result)) {
+    toast('应用状态已变化，本次操作未执行；已刷新最新状态');
+  }
+  return stateIsFresh;
+}
+
+/* Graceful timeout never escalates on its own. A fresh same-generation state
+   is required before presenting a separate force confirmation. */
+export function offerForceStopAfterTimeout(
+  result, intent, appId, appName, stateIsFresh, onStopped,
+) {
+  if (!isStopTimeout(result)) return false;
+  const latest = findApp(appId);
+  if (!stateIsFresh || !hasCapability('force_stop_managed')
+      || !sameLifecycleGeneration(intent, latest, currentPlatform())) {
+    toast('停止超时；当前状态已变化或无法安全强制停止，请查看诊断');
+    return true;
+  }
+  const forceIntent = lifecycleSnapshot(latest, currentPlatform());
+  openConfirm({
+    title: '强制停止应用',
+    bodyHtml: '<b>' + escapeHtml(appName || '应用') + '</b> 未能在限定时间内停止。' +
+      '<div class="confirm-detail">强制停止只会终止已重新验证、仍属于同一代的受管 Job。</div>',
+    okText: '强制停止',
+    onOk: async () => {
+      const current = findApp(appId);
+      const forceOutcome = await runConfirmedForceStop({
+        confirmed: true,
+        timeoutResult: result,
+        intent: forceIntent,
+        currentApp: current,
+        platform: currentPlatform(),
+        stateIsFresh,
+        forceCapable: hasCapability('force_stop_managed'),
+        mutate: payload => act(post('/api/apps/' + appId + '/stop', payload)),
+        refresh: refreshLifecycleState,
+      });
+      if (!forceOutcome.forced) {
+        toast('应用状态已变化，未执行强制停止');
+        await refreshLifecycleState(null);
+        return;
+      }
+      /* runConfirmedForceStop creates lifecyclePayload(forceIntent, { force: true })
+         only after the confirmation-time generation check succeeds. */
+      const forceResult = forceOutcome.result;
+      if (forceResult && forceResult.ok !== false) {
+        toast('已强制停止 ' + (appName || '应用'));
+        if (onStopped) onStopped(findApp(appId));
+      }
+    },
+  });
+  return true;
+}
+
 /* ============================================================
    添加 / 编辑应用模态（图标库 + 上传）
    ============================================================ */
@@ -135,6 +194,11 @@ function setStructuredCommand(commandSpec, compatibility) {
   selectedCommandSpec = commandSpec && typeof commandSpec === 'object' ? commandSpec : null;
   selectedCompatibility = compatibility && typeof compatibility === 'object'
     ? compatibility : null;
+  renderCommandCompatibility();
+}
+
+function invalidateCommandCompatibility() {
+  selectedCompatibility = null;
   renderCommandCompatibility();
 }
 
@@ -245,30 +309,37 @@ function modalLifecycleChanged() {
 }
 
 function refreshEditSaveMode() {
-  const running = !!(editingAppOriginal && editingAppOriginal.running);
+  const lifecycle = editingAppOriginal && editingAppOriginal.lifecycle;
+  const running = !!(lifecycle && lifecycle.status === 'running');
+  const lifecycleUnavailable = !!(lifecycle && !lifecycle.canStart && !lifecycle.canManage);
   const needsStop = running && modalLifecycleChanged();
   const isTask = modalKind === 'task';
   const stopVerb = isTask ? '中止任务' : '停止服务';
   const canStop = hasCapability('stop_managed');
   const commandBlocked = compatibilityStatus(selectedCompatibility) === 'blocked';
-  editRunningNotice.hidden = !running;
-  if (running) {
+  editRunningNotice.hidden = !running && !lifecycleUnavailable;
+  if (lifecycleUnavailable) {
+    setText(editRunningNotice, '运行身份暂时无法验证；生命周期配置和进程控制已安全禁用。');
+  } else if (running) {
     setText(editRunningNotice, !canStop ? platformPresentation().lifecycleNotice
       : needsStop ? '修改内容已保留。请先' + stopVerb + '，再继续保存。'
         : (isTask ? '任务' : '服务') + '正在运行。可在这里先' + stopVerb +
           '，编辑面板不会关闭，当前填写内容也不会丢失。');
   }
   setText(appStopEdit, stopVerb);
-  appStopEdit.hidden = !running || !canStop;
-  appStopEdit.disabled = appSaving || !canStop;
+  appStopEdit.hidden = !running || !canStop || !lifecycle.canManage;
+  appStopEdit.disabled = appSaving || !canStop || !lifecycle || !lifecycle.canManage;
   appSave.hidden = false;
   const willAttach = !editingAppId && pendingAttach && modalKind === 'service'
     && readPortValue() === pendingAttach.port;
   setText(appSave, willAttach ? '保存并认领' : '保存');
   appSave.disabled = appSaving || needsStop || commandBlocked
+    || (lifecycleUnavailable && modalLifecycleChanged())
     || (willAttach && detectingProject);
   appSave.title = commandBlocked ? '当前命令或路径不可用，请先修正'
-    : needsStop ? (canStop ? '请先在当前面板' + stopVerb
+    : lifecycleUnavailable && modalLifecycleChanged()
+      ? '运行身份无法验证，不能修改生命周期配置'
+      : needsStop ? (canStop ? '请先在当前面板' + stopVerb
       : platformPresentation().lifecycleNotice)
       : (willAttach && detectingProject ? '正在识别可靠的项目启动命令' : '');
 }
@@ -310,6 +381,7 @@ export function openAppModal(app, presetKind, focusAction = '') {
     command: app.command || '', cwd: app.cwd || null,
     port: app.port == null ? null : app.port,
     kind: app.kind || 'service', running: !!app.running,
+    lifecycle: lifecycleSnapshot(app, currentPlatform()),
   } : null;
   resetDetection();
   clearPendingIcon();
@@ -479,7 +551,12 @@ function clearFieldError(input) {
 }
 
 async function stopEditingApp() {
-  if (!editingAppId || !editingAppOriginal || !editingAppOriginal.running) return;
+  if (!editingAppId || !editingAppOriginal || !editingAppOriginal.lifecycle) return;
+  const intent = editingAppOriginal.lifecycle;
+  if (!intent.canManage) {
+    toast('运行身份无法验证，已禁止停止；请查看诊断');
+    return;
+  }
   if (!hasCapability('stop_managed')) {
     toast(platformPresentation().lifecycleNotice);
     return;
@@ -489,12 +566,35 @@ async function stopEditingApp() {
   const isTask = modalKind === 'task';
   toast((isTask ? '正在中止任务' : '正在停止服务') + '，编辑内容会保留…');
   try {
-    const result = await act(post('/api/apps/' + editingAppId + '/stop'));
-    await window.__poll();
+    const { result, stateIsFresh } = await runLifecycleMutation(
+      () => act(post(
+        '/api/apps/' + editingAppId + '/stop',
+        lifecyclePayload(intent, { force: false }),
+      )),
+      refreshLifecycleState,
+    );
     const latest = findApp(editingAppId);
-    if ((result && result.ok !== false) || (latest && !latest.running)) {
-      editingAppOriginal.running = false;
+    if (latest) {
+      editingAppOriginal.running = !!latest.running;
+      editingAppOriginal.lifecycle = lifecycleSnapshot(latest, currentPlatform());
+    }
+    if ((result && result.ok !== false) || (latest && !latest.running
+        && editingAppOriginal.lifecycle.status === 'stopped')) {
       toast((isTask ? '任务已中止' : '服务已停止') + '，可以继续编辑并保存');
+    } else {
+      offerForceStopAfterTimeout(
+        result,
+        intent,
+        editingAppId,
+        latest && latest.name,
+        stateIsFresh,
+        stopped => {
+          if (!stopped) return;
+          editingAppOriginal.running = !!stopped.running;
+          editingAppOriginal.lifecycle = lifecycleSnapshot(stopped, currentPlatform());
+          refreshEditSaveMode();
+        },
+      );
     }
   } finally {
     appSaving = false;
@@ -510,6 +610,7 @@ function rememberSavedApp(app, id, body) {
     port: body.port,
     kind: body.kind,
     running: !!app.running,
+    lifecycle: lifecycleSnapshot(app, currentPlatform()),
   };
   setStructuredCommand(app.commandSpec || body.commandSpec, app.platformCompatibility);
   setModalKind(body.kind);
@@ -532,6 +633,9 @@ async function saveApp() {
     kind: modalKind,
   };
   if (selectedCommandSpec) body.commandSpec = selectedCommandSpec;
+  if (editingAppOriginal && editingAppOriginal.lifecycle) {
+    body.expectedGeneration = editingAppOriginal.lifecycle.expectedGeneration;
+  }
   const wasCreating = !editingAppId;
   const attachRequest = wasCreating && hasCapability('attach_external') && pendingAttach
     && modalKind === 'service'
@@ -541,13 +645,23 @@ async function saveApp() {
   refreshEditSaveMode();
   try {
     const app = editingAppId
-      ? await act(put('/api/apps/' + editingAppId, body))
+      ? (await runLifecycleMutation(
+        () => act(put('/api/apps/' + editingAppId, body)),
+        async app => await refreshLifecycleState(app),
+      )).result
       : await act(post('/api/apps', body));
     if (!app || app.ok === false) {
+      if (!wasCreating) {
+        const latest = findApp(editingAppId);
+        if (latest) {
+          editingAppOriginal.running = !!latest.running;
+          editingAppOriginal.lifecycle = lifecycleSnapshot(latest, currentPlatform());
+        }
+      }
       if (app && app.requiresStop && editingAppOriginal) {
         editingAppOriginal.running = true;
-        refreshEditSaveMode();
       }
+      refreshEditSaveMode();
       return;
     }
     const id = app.id || editingAppId;
@@ -643,6 +757,7 @@ export function initAppModal({ onAddService, onAddTask }) {
       const r = await act(post('/api/pick', { what: 'dir' }));
       if (r && !r.canceled && r.path) {
         fCwd.value = r.path;
+        invalidateCommandCompatibility();
         if (!fName.value.trim() && r.stem) fName.value = r.stem;
         fCwd.classList.remove('invalid');
         refreshEditSaveMode();
@@ -653,7 +768,10 @@ export function initAppModal({ onAddService, onAddTask }) {
     }
   });
   btnDetectProject.addEventListener('click', detectProject);
-  fCwd.addEventListener('input', () => resetDetection(true));
+  fCwd.addEventListener('input', () => {
+    invalidateCommandCompatibility();
+    resetDetection(true);
+  });
   [fName, fCwd, fPort].forEach(input =>
     input.addEventListener('input', () => {
       clearFieldError(input);

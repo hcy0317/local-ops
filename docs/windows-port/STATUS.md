@@ -1,8 +1,68 @@
 # Windows Port Status
 
+## Phase 4 local gate — LOCAL_PASS_CI_PENDING
+
+The Phase 4 source candidate implements the runner/Job ownership model,
+protected Named Pipe IPC and receipts, generation compare-and-swap, and the
+lifecycle-aware UI/API contract. The authorized local gate passed on Windows
+NT build 26200 (DisplayVersion 25H2), x64, at medium integrity without
+administrator membership, using Python 3.13.13:
+
+- gated real `tests/windows` discovery: 170/170 passed;
+- `WIN-LIFE-001..012`: 12/12 passed, including actual HTTP console subprocess
+  termination/reopen and 100 full launch/force/release cycles;
+- `WIN-SEC-001..014`: 14/14 explicit cases passed;
+- frontend: 24/24 passed; HTTP hardening: 6/6 passed (30/30 combined);
+- lifecycle Node contracts: 30/30 passed;
+- isolated headless Edge 151 UI flow passed at 1410x905 and 750x485;
+- shared contracts: 31 passed and one privileged symlink case skipped;
+- Ruff: passed.
+
+The lifecycle gate controlled only fixture processes created by the tests.
+Managed launch, graceful stop, and explicit force are enabled only for a fully
+verified Local Ops Job. External attach/kill and console restart remain
+disabled. Active-generation release requires exactly three private records, a
+signed terminal receipt, an empty Job, and an absent runner. Atomic rename to a
+strictly derived cleanup tombstone is the release commit; committed tombstone
+recovery handles only a private, nonlink allowlisted record subset and performs
+no process observation or control. The atomic request/receipt writers protect
+their temporary files before replacement.
+
+This is not the final Phase 4 PASS. `implementationCommit` and `ciRun` remain
+unset. Windows Python 3.12 and the complete macOS regression/release job must
+pass against the same exact commit before `lastGreenPhase` can move beyond P3.
+
+The isolated Edge 151 flow completed add → start → log marker → HTTP 200 →
+graceful stop → bad-cwd diagnostic → restore → start → restart with a changed
+generation → final stop → delete. Final state had no runtime identity or runtime
+records, and all fixture PIDs and ports were gone. The 1280 px and 360 px
+viewports had no horizontal overflow. Notification permission-denied and
+permission-granted paths both passed, including construction and close of the
+notification object. Headless QA did not invoke the native OS picker or prove
+delivery through Windows Notification Center, so those native paths remain
+`NOT_RUN`.
+
+The focused Edge follow-up closed both UI acceptance findings. Editing a
+compatibility-blocked app initially kept Save disabled; entering a valid cwd
+immediately enabled Save, cleared the disabled title and stale compatibility
+copy, and left the structured command unchanged. After the real save, backend
+state reported compatibility `ready` and health `ok` with the direct command
+spec preserved. The verified overlay order is banner 400, drawer mask 410,
+drawer 415, and toast 420. At the prior overlap point `elementFromPoint`
+resolved to the drawer close control, and a real click closed the drawer and
+set `aria-hidden="true"`.
+
+Windows 10, self-contained packaging, a clean machine without Python, and Beta
+readiness remain Phase 5 scope. `windowsBetaReady=false`.
+
 ## Current result
 
-**P3 WIN11 PASS / WIN10 DEFERRED / PHASE 4 UNTOUCHED.**
+**P4 LOCAL_PASS_CI_PENDING / WIN11 LOCAL FIXTURES PASS / WIN10 DEFERRED.**
+
+No final Phase 4 PASS, implementation commit, or CI run is claimed in this
+document.
+
+## Phase 3 last-green result
 
 Phase 3 adds the frozen API Contract v2, additive schema v1→v2 migration, a non-executing `CommandSpec` model, Windows project detection/static preflight, explicit receipt-backed macOS configuration import, and platform/capability-driven UI. It does not add a runner, Job Object, generation, runtime identity, external attach, or any lifecycle side effect.
 
@@ -10,9 +70,9 @@ The Windows 11 non-admin local gate passed 50/50 Windows tests and ran 32 shared
 
 Phase 3 visual browser interaction is `NOT_RUN`: `browser-harness --doctor` reports a running Chrome but no active CDP connection. Static frontend contracts pass 20/21; the only failure is the pre-existing unmaterialized `static/assets/console-app-icon.png` blob. This limitation is not presented as a visual PASS. Phase 2's exact-candidate Chromium evidence remains historical only.
 
-Implementation commit `97c417ef1491ac11fdb036c4e4102bfc190c88e6` passed exact-commit CI run `31698371278`: Windows Python 3.12 job `94441279178` and macOS complete check/release/reproducibility job `94441279120` both passed.
+Historical Phase 3 implementation commit `97c417ef1491ac11fdb036c4e4102bfc190c88e6` passed exact-commit CI run `31698371278`: Windows Python 3.12 job `94441279178` and macOS complete check/release/reproducibility job `94441279120` both passed. These IDs are not Phase 4 evidence.
 
-The user explicitly deferred Windows 10. This does not fabricate the original cross-version or release gate: `windowsBetaReady=false`, packaging remains Phase 5, and Phase 4 has not started.
+The user explicitly deferred Windows 10. This did not fabricate the original cross-version or release gate: `windowsBetaReady=false`, packaging remains Phase 5, and Phase 4 had not started at this Phase 3 checkpoint.
 
 ## Phase 3 implemented scope
 
@@ -24,13 +84,13 @@ The user explicitly deferred Windows 10. This does not fabricate the original cr
 - Gated Windows lifecycle/external-process actions at adapter, HTTP, rendered UI, and event-handler boundaries.
 - Kept atomic configuration memory/disk state aligned when post-replace ACL verification fails, then entered read-only protection.
 
-## Phase 2 implemented scope
+## Phase 2 implemented scope (historical checkpoint)
 
 - Added `localops/platform/windows.py` with Known Folder paths, current SID identity, protected DACL application/verification, Named Mutex locking, read-only snapshots, native picker, and exclusive socket configuration.
 - Added exact Windows runtime pins: `psutil==7.2.2` and `pywin32==312`.
 - Added native owner matching in the shared core without changing macOS numeric UID behavior.
 - Added `platform` and `capabilities` to the state contract as an intentional additive Phase 2 API change.
-- Disabled Windows launch, managed stop, force stop, external kill, external attach, console restart, and console stop at capability, HTTP, and browser-control boundaries.
+- At the Phase 2 checkpoint, Windows launch, managed stop, force stop, external kill, external attach, console restart, and console stop were disabled at capability, HTTP, and browser-control boundaries. Phase 4 now enables only authenticated Local Ops Job launch/stop/force; the external and console-control restrictions remain.
 - Separated connection state from degraded/configuration notices so a healthy HTTP connection is not mislabeled as disconnected.
 - Added Windows tests for roots/UNC/junctions, Chinese/spaces paths, DACL principals, mutex recovery, IPv4/IPv6, protected/racing processes, picker cancellation, exclusive address use, read-only ACL failure, and no-side-effect route rejection.
 - Added a direct Windows CI job using Python 3.12 without Make/Bash.

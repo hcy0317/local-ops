@@ -188,7 +188,7 @@ async function req(method, path, body) {
 }
 export const post = (p, b = {}) => req('POST', p, b);
 export const put = (p, b) => req('PUT', p, b);
-export const del = p => req('DELETE', p);
+export const del = (p, b) => req('DELETE', p, b);
 
 /* 动作请求统一错误提示 */
 export async function act(p) {

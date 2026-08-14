@@ -9,8 +9,11 @@ import { $, el, setText, setChildren, icon, state, fmtClock, taskExitStatus,
   openLayer, closeLayer, act, post, toast, escapeHtml, applyTheme,
   taskNotificationsEnabled, toggleTaskNotifications, currentPlatform,
   platformPresentation, shortcutLabel, hasCapability } from './core.js';
-import { openAppModal, openLogs, openConsoleLog, openConfirm } from './overlays.js';
+import { openAppModal, openLogs, openConsoleLog, openConfirm,
+  offerForceStopAfterTimeout, refreshLifecycleState } from './overlays.js';
 import { configuredPort } from './ports.js';
+import { lifecyclePayload, lifecycleSnapshot, isGenerationMismatch,
+  isStopTimeout, runLifecycleMutation } from './lifecycle.js';
 
 const FEED_CAP = 50;
 let feedSeq = 0;
@@ -766,12 +769,14 @@ function batchStopApps() {
     toast(platformPresentation().lifecycleNotice);
     return;
   }
-  const running = ((state.data && state.data.apps) || []).filter(a => a.running);
+  const running = ((state.data && state.data.apps) || [])
+    .map(app => ({ app, intent: lifecycleSnapshot(app, currentPlatform()) }))
+    .filter(item => item.intent.canManage);
   if (!running.length) {
     toast('当前没有运行中的应用');
     return;
   }
-  const names = running.map(a => a.name || '未命名').join('、');
+  const names = running.map(item => item.app.name || '未命名').join('、');
   openConfirm({
     title: '批量停止服务',
     bodyHtml: '确定要停止全部 <b>' + running.length + '</b> 个运行中的应用吗？' +
@@ -785,12 +790,34 @@ function batchStopApps() {
         return;
       }
       let stopped = 0;
-      for (const app of running) {
-        const result = await act(post('/api/apps/' + app.id + '/stop', {}));
-        if (result && result.ok !== false) stopped += 1;
+      let changed = 0;
+      const timedOut = [];
+      const { stateIsFresh } = await runLifecycleMutation(async () => {
+        for (const item of running) {
+          const result = await act(post(
+            '/api/apps/' + item.app.id + '/stop',
+            lifecyclePayload(item.intent, { force: false }),
+          ));
+          if (result && result.ok !== false) stopped += 1;
+          else if (isGenerationMismatch(result)) changed += 1;
+          else if (isStopTimeout(result)) timedOut.push({ ...item, result });
+        }
+        return null;
+      }, refreshLifecycleState);
+      const details = [
+        changed ? changed + ' 个状态已变化、未重试' : '',
+        timedOut.length ? timedOut.length + ' 个停止超时' : '',
+      ].filter(Boolean).join('；');
+      toast('已停止 ' + stopped + ' 个应用' + (details ? '；' + details : ''));
+      if (timedOut.length === 1) {
+        const item = timedOut[0];
+        offerForceStopAfterTimeout(
+          item.result, item.intent, item.app.id, item.app.name,
+          stateIsFresh,
+        );
+      } else if (timedOut.length > 1) {
+        toast('多个应用停止超时；请在对应卡片逐一确认强制停止');
       }
-      toast('已停止 ' + stopped + ' 个应用');
-      if (window.__poll) window.__poll();
     },
   });
 }

@@ -75,6 +75,8 @@ class LaunchRequest:
     command: str
     cwd: str
     log_path: str
+    command_spec: Mapping[str, object] | None = None
+    generation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,9 @@ class ManagedRuntime:
     process_id: int | None = None
     group_id: int | None = None
     token: str | None = None
+    runtime_identity: RuntimeIdentity | None = None
+    status: str | None = None
+    code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +100,63 @@ class RuntimeIdentity:
     owner: str
     members: tuple[int, ...] = ()
     token: str | None = None
+    app_id: str | None = None
+    generation_id: str | None = None
+    runner_pid: int | None = None
+    runner_create_time: float | None = None
+    root_pid: int | None = None
+    root_create_time: float | None = None
+    job_name: str | None = None
+    token_digest: str | None = None
+    started_at: int | None = None
+
+
+WINDOWS_RUNTIME_IDENTITY_FIELDS = (
+    "platform",
+    "kind",
+    "ownerSid",
+    "generationId",
+    "runnerPid",
+    "runnerCreateTime",
+    "rootPid",
+    "rootCreateTime",
+    "jobName",
+    "tokenDigest",
+    "startedAt",
+)
+
+
+def windows_runtime_identity_public(identity: RuntimeIdentity) -> dict[str, object]:
+    """Return the exact public Windows identity; never serialize internal context."""
+    if identity.platform != "windows" or identity.kind != "job":
+        raise ValueError("not a Windows Job identity")
+    if identity.token is not None:
+        raise ValueError("Windows runtime identities must not contain raw tokens")
+    values: dict[str, object | None] = {
+        "platform": identity.platform,
+        "kind": identity.kind,
+        "ownerSid": identity.owner,
+        "generationId": identity.generation_id,
+        "runnerPid": identity.runner_pid,
+        "runnerCreateTime": identity.runner_create_time,
+        "rootPid": identity.root_pid,
+        "rootCreateTime": identity.root_create_time,
+        "jobName": identity.job_name,
+        "tokenDigest": identity.token_digest,
+        "startedAt": identity.started_at,
+    }
+    if any(value is None for value in values.values()):
+        raise ValueError("Windows runtime identity is incomplete")
+    return {name: values[name] for name in WINDOWS_RUNTIME_IDENTITY_FIELDS}
+
+
+@dataclass(frozen=True)
+class ManagedActivation:
+    ok: bool
+    error: str | None = None
+    status: str | None = None
+    code: str | None = None
+    process_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +165,11 @@ class ManagedInspection:
     verified: bool
     members: tuple[int, ...] = ()
     issue: PlatformIssue | None = None
+    status: str = "unknown"
+    identity: RuntimeIdentity | None = None
+    code: str | None = None
+    exit_code: int | None = None
+    updated_at: int | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +177,8 @@ class StopResult:
     ok: bool
     error: str | None = None
     still_running: bool = False
+    status: str | None = None
+    code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -162,9 +231,13 @@ class PlatformBackend(Protocol):
     def process_parents(self, pids: set[int] | None = None) -> ProcessSnapshot: ...
     def process_groups(self) -> ProcessSnapshot: ...
     def launch(self, app: LaunchRequest) -> ManagedRuntime: ...
+    def activate_managed(self, identity: RuntimeIdentity) -> ManagedActivation: ...
+    def abort_managed(self, identity: RuntimeIdentity) -> StopResult: ...
+    def release_managed(self, identity: RuntimeIdentity) -> StopResult: ...
+    def recover_managed_cleanups(self) -> tuple[RuntimeIdentity, ...]: ...
     def inspect_managed(self, identity: RuntimeIdentity) -> ManagedInspection: ...
     def stop_managed(
-        self, identity: RuntimeIdentity, force: bool = False,
+        self, identity: RuntimeIdentity, force: bool = False, timeout: float = 5.0,
     ) -> StopResult: ...
     def stop_external_process(self, pid: int, force: bool = False) -> StopResult: ...
     def process_group_id(self, pid: int) -> int | None: ...

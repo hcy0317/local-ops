@@ -1,12 +1,13 @@
 # 总控台 (Console)
 
-本地服务监控与快速启动控制台。共享 HTTP/配置核心使用 Python 3 标准库，macOS runtime 保持零第三方依赖；Windows adapter 使用 `requirements-windows.txt` 中精确锁定的 `psutil` 与 `pywin32`。前端仍为无构建原生 HTML/CSS/JavaScript。macOS 推荐双击 `总控台.app` 后台运行；Windows Phase 2 仅支持源码方式的只读监控。
+本地服务监控与快速启动控制台。共享 HTTP/配置核心使用 Python 3 标准库，macOS runtime 保持零第三方依赖；Windows adapter 使用 `requirements-windows.txt` 中精确锁定的 `psutil` 与 `pywin32`。前端仍为无构建原生 HTML/CSS/JavaScript。macOS 推荐双击 `总控台.app` 后台运行；Windows Phase 4 以源码方式提供监控和仅针对 Local Ops 自建 Job 的受管生命周期。当前状态为 `LOCAL_PASS_CI_PENDING`，不得在精确提交 Windows Python 3.12 与完整 macOS CI 前写成 Phase 4 PASS。
 
 ## 结构
 
 - `server.py` — 共享 HTTP、配置与业务编排核心（Python 3.12）
 - `localops/platform/` — macOS/Windows 原生边界；Windows 运行依赖只允许从 `requirements-windows.txt` 安装
-- `static/index.html` / `static/app.js`（入口）/ `static/js/{core,launchpad,services,overlays,ports,widgets}.js`（原生 ES Modules，无构建）/ `static/icons.js` — 前端（原生，禁框架/CDN/构建）；`core.js` 承载工具/API/浮层/状态/主题注册，`launchpad.js` 卡片+拖拽+诊断+启动台 KPI/分区过滤，`services.js` 表格+监控 KPI 火花线，`overlays.js` 模态+抽屉，`ports.js` 端口归一化纯函数，`widgets.js` 右侧信息栏（实时动态/告警、TOP5、小贴士、快捷操作）与导航轨状态；模块间用 `window.__poll` 共享轮询入口
+- `localops/windows/` — Windows runner、Job Object 和 HMAC/receipt 协议；runner 是每个 Job 的唯一长期句柄持有者，不写主配置
+- `static/index.html` / `static/app.js`（入口）/ `static/js/{core,launchpad,lifecycle,services,overlays,ports,widgets}.js`（原生 ES Modules，无构建）/ `static/icons.js` — 前端（原生，禁框架/CDN/构建）；`core.js` 承载工具/API/浮层/状态/主题注册，`lifecycle.js` 冻结 generation 意图并执行 fail-closed 状态判断，`launchpad.js` 卡片+拖拽+诊断+启动台 KPI/分区过滤，`services.js` 表格+监控 KPI 火花线，`overlays.js` 模态+抽屉，`ports.js` 端口归一化纯函数，`widgets.js` 右侧信息栏（实时动态/告警、TOP5、小贴士、快捷操作）与导航轨状态；模块间用 `window.__poll` 共享轮询入口
 - 布局 v2：左侧 `.rail` 图标导航轨（启动台/服务监控视图切换 + 日志中心/设置中心弹层入口）+ 顶栏 + 内容/右侧信息栏双栏网格（≤1280px 侧栏下沉到底部、≤900px 导航轨隐藏）；结构样式集中在 `static/base.css` 末尾「布局 v2」段（主题令牌驱动），主题包负责视觉皮肤
 - `static/themes/` — **单一主题**：当前仅内置 `ops`（指挥台，`DEFAULT_UI_THEME` 常量指定并在清单中固定排首位）。`{id}.css` 整包样式 + `{id}.json` 清单（`id/name/author/desc/colors[]`）的注册机制保留：`GET /api/state` 返回 `themes` 与 `uiTheme`；`POST /api/ui/theme {theme}` 校验 id 后落盘。产品不提供主题选择界面（已随多主题一并移除），深浅色切换仍保留。
 - `static/fonts/GeistMono-Variable.woff2` — vendored 数据/代码字体；中文与正文使用 macOS 系统字体栈；`static/icons/*.svg` — Lucide 图标源文件（vendored）；`tools/gen_icons.py` — 由 svg 重新生成 `icons.js`（勿手改 icons.js）
@@ -82,10 +83,10 @@
 - `POST /api/project/detect` `{cwd}` → `{ok, cwd, name, files, candidates:[{command,label,source,port,kind,detail}]}`（只读分析项目根目录，不执行项目代码；识别 package.json scripts 与包管理器锁文件、Hexo/Hugo/Jekyll、Django/FastAPI/Flask/Streamlit、Docker Compose、Go、Rust、常用启动脚本及纯静态站点。Hexo 无 scripts 时仍返回 `hexo s` 服务与 `hexo cl` 任务）
 - `POST /api/apps/reorder` `{ids: [...]}` → `{ok}`（按 ids 重排 apps 数组；Python sort 稳定，未涉及的 id 相对顺序不变，服务/任务两区可独立拖拽排序互不干扰）
 - `PUT /api/apps/{id}`（部分更新同字段，可带 `stopBeforeUpdate:true`）→ app 对象；运行中修改 command/cwd/port/kind 时，缺少该标记返回 `{ok:false, requiresStop:true}`，带标记则安全停止后原子保存
-- `DELETE /api/apps/{id}` → `{ok}`（先停止再删，连同图标/日志）
-- `POST /api/apps/{id}/start` → `{ok, pid}` / `{ok:false, error, health?}`（已运行则报错；启动前复查配置健康，明确失效返回 422；批处理启动后立即返回，由退出监视线程记录结果，快速成功任务不会被误判成启动失败）
-- `POST /api/apps/{id}/stop` → `{ok}` / `{ok:false, error}`
-- `POST /api/apps/{id}/restart` → `{ok, pid}` / `{ok:false, error}`（仅重启 token 校验通过的受管进程；等待旧进程退出后再启动，不自动 SIGKILL）
+- `DELETE /api/apps/{id}` → `{ok}`（Windows body 必须携带观察到的 `expectedGeneration`；先安全停止再删，连同图标/日志）
+- `POST /api/apps/{id}/start` `{expectedGeneration:null}` → `{ok, pid, generationId?, lifecycleStatus?}` / `{ok:false, error, code?, health?}`（Windows 必须从停止状态 CAS；启动前复查配置健康，明确失效返回 422）
+- `POST /api/apps/{id}/stop` `{expectedGeneration, force?}` → `{ok}` / `{ok:false, error, code?}`（Windows 普通停止超时保留身份，`force:true` 是单独确认后的显式操作）
+- `POST /api/apps/{id}/restart` `{expectedGeneration}` → `{ok, pid, generationId?}` / `{ok:false, error, code?}`（仅重启完整身份校验通过的受管进程；等待旧进程退出后再启动，不自动 Force）
 - `POST /api/apps/{id}/diagnose` → `{ok, issues:[{kind,title,detail,fix,action?}], summary}`（本地规则诊断，不调外部 AI：合并运行前健康检查，并覆盖依赖未装/模块缺失、npm 脚本名错误、运行时端口占用、权限不足、pip 包缺失与退出码兜底判读；前端在配置失效或运行失败时显示诊断入口）
 - `POST /api/apps/{id}/attach` `{pid}` → `{ok, pid, cwdUpdated?, cwd?}` / `{ok:false, error}`（把已在监听配置端口的当前用户进程**认领**为本卡片受管进程：走 legacy 身份通道 lastPid+端口+UID+真实 cwd 四重校验，cwd 不一致时原子同步为进程实际目录；拒绝 task、无端口、已运行、非当前用户、他卡已认领与未监听该端口的进程。前端在端口诊断弹窗提供「认领为本卡片」）
 - `POST /api/apps/{id}/icon`（body 为 png/jpg/webp 原始字节）→ `{ok, icon}`
@@ -111,12 +112,16 @@
 - **关注进程**：`ps -axo pid=,uid=,comm=,args=,etime=,%cpu=,%mem=`，args 小写包含关键字即命中，只保留当前用户并排除自身及 ps/lsof。
 - **应用状态**：每次启动生成随机 `runToken`，常驻外层 shell 在 argv 中持有标记并等待内层命令及其后台作业。新版进程只有同时命中 `lastPgid` / 当前 UID / token 的进程组才算 running；升级前缺少 token 的旧进程，只有配置 `lastPid`、监听端口、当前 UID 与真实 cwd 全部一致时才兼容认领。用户明确从服务监控认领的 `attached` 卡片允许监听子进程换 PID，但必须在配置端口上按当前 UID + 真实 cwd 唯一命中；任一条件不符仍按外部端口占用处理。`ports` 来自受控进程组成员实际监听的端口。
 - **应用启停**：多张卡片可保存相同端口（例如多个默认使用 3000 的项目）；启动前只拒绝失效配置和当时真实被占用的端口。重启先做健康预检，失败时不会先停掉仍工作的旧服务。停止时先校验 token，然后只对该受控进程组发 `SIGTERM`，**绝不按端口杀其他监听者**。服务手动 stop 不记录退出历史；任务自然结束记录四态结果，总控台中止记录 `stopped`。批处理不做“长期服务存活探测”，避免把快速成功误判成失败
+- **Windows 受管生命周期**：只控制 Local Ops 以 `CREATE_SUSPENDED` 创建并加入专属 Named Job Object 的进程树。公开身份恰好 11 个字段；所有变更使用 generation CAS。普通停止超时保留身份，显式 Force 才能在重验完整证据后调用该 Job 的 `TerminateJobObject`。外部 attach/kill 与 console restart 保持禁用。
+- **Windows runtime 原子性与清理**：request/receipt 临时文件必须先应用并验证私有 DACL，再 `os.replace`；重连与清理只做 verify-only，不得自动修复已放宽 ACL。释放 active generation 前必须同时证明目录恰好包含三个私有 runtime records、terminal receipt 签名有效、Job 已空且 runner 不再存在；将目录原子 rename 为严格派生的 cleanup tombstone 是 release commit。commit 后的恢复只删除 private、nonlink tombstone 中三个 runtime record 的 allowlisted subset，且不得观察或控制任何进程；未知项、宽 ACL 或 link 一律 fail closed。
+- **Windows 生命周期测试**：只有隔离夹具作用域或 hosted runner 可以设置 `LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS=1`，且测试只能结束自身创建的 fixture 进程；禁止针对现有用户进程运行。
+- **Phase 4 当前证据**：Windows build 26200/25H2 非管理员本地 real discovery 为 170/170 PASS，frontend 为 24/24、HTTP hardening 为 6/6（合计 30/30）、Node 为 30/30，`WIN-LIFE-001..012` 为 12/12，`WIN-SEC-001..014` 为 14/14；本地 Python 是 3.13.13。`implementationCommit`/`ciRun` 仍为空，Windows Python 3.12 与 macOS 精确提交 CI 未运行，`lastGreenPhase` 仍为 P3。
 - **任务取消协议**：一次性任务内部的“用户主动取消”以退出码 **130** 通知总控台；0 表示成功，其余表示失败。不要通过日志文字猜测状态
 - **配置健康**：`inspect_app_health` 只解析确定无歧义的简单命令并执行 stat/权限/PATH 检查，不执行命令、不展开变量/通配符。相对脚本按配置 cwd（空值时用户主目录）解析；复杂或动态命令返回 unknown
 - **运行中编辑**：编辑面板打开时立即显示“停止服务”。点击只调用 stop，面板保持打开且当前草稿不变；停止成功后用户继续编辑并普通保存。名称/图标仍可在运行中直接保存。`stopBeforeUpdate:true` 保留为 API 客户端的原子停止更新能力，但不是默认前端流程。
 - **无终端 PATH**：Finder/`LSUIElement` 启动不会读取 shell 配置；子应用启动环境需显式补入 `~/.local/bin`、Volta/Bun/pnpm、NVM/fnm、Homebrew 与系统 bin 目录，保证 `node`/`npm`/`pnpm` 等可用。启动 API 短暂探测立即退出，并把日志末行作为明确错误返回。
 - **日志**：单文件超过 10MB 时 copy-truncate，保留 3 份轮转备份；日志 API 从文件尾部分块读取，不将整个日志读入内存。
-- **keep-alive 陷阱**：POST start/stop 前端会带 `{}` body，handler 必须 `discard_body()` 读掉——否则残留字节污染同一 keep-alive 连接的下一个请求（method 解析成 `{}GET` → 501，前端显示断连横幅）。新增不读 body 的 POST 路由时同样处理。
+- **keep-alive 陷阱**：所有 lifecycle POST/PUT/DELETE 都必须完整读取 JSON body；否则残留字节会污染同一 keep-alive 连接的下一个请求（method 可能被解析成 `{}GET` → 501）。新增拒绝分支也必须先按契约消费或安全关闭请求体。
 - **运行目录**：默认配置/图标位于 `~/Library/Application Support/总控台`，日志位于 `~/Library/Logs/总控台`；`CONSOLE_DATA_DIR` / `CONSOLE_LOG_DIR` 可显式覆盖，覆盖时对应目录不自动迁移旧 `data/`。
 - **配置**：读写加线程锁；写入用临时文件 + `os.replace` 防损坏；`schemaVersion` 逐版显式迁移；`.bak` 保留上一份良好版本。主配置与备份均不可读时进入只读保护，不覆盖原文件。
 - **项目识别**：仅读取项目根目录下不超过 2MB 的已知配置/入口文件，不安装依赖、不执行配置、不扫描整个目录；显式 CLI 端口优先于框架默认端口。
@@ -125,8 +130,8 @@
 ## 配置 schema
 ```json
 {
-  "schemaVersion": 1,
-  "apps": [{"id": "8位hex", "name": "", "command": "", "cwd": null, "port": null, "emoji": null, "icon": null, "favicon": null, "kind": "service", "lastPid": null, "lastPgid": null, "runToken": null, "attached": false, "lastExit": null, "createdAt": 0}],
+  "schemaVersion": 2,
+  "apps": [{"id": "8位hex", "name": "", "command": "", "commandSpec": null, "runtimeIdentity": null, "importStatus": null, "cwd": null, "port": null, "emoji": null, "icon": null, "favicon": null, "kind": "service", "lastPid": null, "lastPgid": null, "runToken": null, "attached": false, "lastExit": null, "createdAt": 0}],
   "hidden": ["name:port"], "pinned": ["name:port"], "promoted": ["name:port"],
   "watchedKeywords": [],
   "uiTheme": "ops"

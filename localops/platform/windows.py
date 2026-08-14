@@ -1,4 +1,4 @@
-"""Windows adapter for secure storage and read-only process monitoring."""
+"""Windows adapter for secure storage, monitoring, and owned-Job lifecycle."""
 
 from __future__ import annotations
 
@@ -7,9 +7,10 @@ import os
 import socket
 import stat
 import subprocess
+import sys
 import time
 import webbrowser
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Literal, Mapping
 
 import ntsecuritycon
@@ -18,14 +19,42 @@ import pywintypes
 import win32api
 import win32con
 import win32event
+import win32file
+import win32pipe
+import win32process
 import win32security
 import winerror
 from win32com.shell import shell
+
+from localops.command_spec import CommandSpecError, prepared_invocation
+from localops.windows.runner_protocol import (
+    PIPE_BUFFER_BYTES,
+    ProtocolError,
+    decode_message,
+    encode_message,
+    make_launch_request,
+    make_request,
+    new_token,
+    pipe_name,
+    read_json,
+    reconnect_observations_valid,
+    runner_command,
+    runtime_directory,
+    terminal_observations_valid,
+    token_digest,
+    validate_app_id,
+    validate_generation_id,
+    validate_public_identity,
+    validate_receipt,
+    verify_response,
+    write_json_atomic,
+)
 
 from .contracts import (
     CwdSnapshot,
     LaunchRequest,
     ListenerSnapshot,
+    ManagedActivation,
     ManagedInspection,
     ManagedRuntime,
     PickResult,
@@ -38,12 +67,26 @@ from .contracts import (
     RuntimePaths,
     ScanStatus,
     StopResult,
+    windows_runtime_identity_public,
 )
 
 
 _SYSTEM_SID = "S-1-5-18"
 _ADMINISTRATORS_SID = "S-1-5-32-544"
 _JUNCTION_REPARSE_TAG = 0xA0000003
+_RUNNER_PREPARE_TIMEOUT = 10.0
+_MAX_CLEANUP_RECOVERY_ENTRIES = 256
+_RUNTIME_RECORD_NAMES = frozenset({"request.json", "token.bin", "receipt.json"})
+_CLEANUP_TOMBSTONE_PREFIX = ".cleanup-"
+
+
+@dataclass(frozen=True)
+class _WindowsRuntimeContext:
+    identity: RuntimeIdentity
+    token: bytes
+    receipt: dict[str, object]
+    members: tuple[int, ...]
+    state: str
 
 
 def _issue(component: str, code: str, message: str) -> PlatformIssue:
@@ -61,15 +104,15 @@ class WindowsInstanceLock:
 
 
 class WindowsPlatform:
-    """Read-only Windows platform slice used until lifecycle support lands."""
+    """Windows backend that controls only authenticated Local Ops Jobs."""
 
     name = "windows"
     requires_verified_permissions = True
     capabilities = PlatformCapabilities(
         monitor_processes=True,
-        launch_managed=False,
-        stop_managed=False,
-        force_stop_managed=False,
+        launch_managed=True,
+        stop_managed=True,
+        force_stop_managed=True,
         kill_external=False,
         attach_external=False,
         pick_path=True,
@@ -100,10 +143,20 @@ class WindowsPlatform:
         local_app_data = shell.SHGetKnownFolderPath(
             shell.FOLDERID_LocalAppData, 0, None
         )
-        root = os.path.join(local_app_data, "LocalOps")
+        default_root = os.path.join(local_app_data, "LocalOps")
+        root_value = os.environ.get("CONSOLE_DATA_DIR")
+        logs_value = os.environ.get("CONSOLE_LOG_DIR")
+        if root_value is not None and not os.path.isabs(os.path.expanduser(root_value)):
+            raise ValueError("CONSOLE_DATA_DIR must be absolute")
+        if logs_value is not None and not os.path.isabs(os.path.expanduser(logs_value)):
+            raise ValueError("CONSOLE_LOG_DIR must be absolute")
+        root = os.path.abspath(os.path.expanduser(root_value or default_root))
+        logs = os.path.abspath(os.path.expanduser(
+            logs_value or os.path.join(root, "logs")
+        ))
         return RuntimePaths(
             root,
-            os.path.join(root, "logs"),
+            logs,
             os.path.join(root, "runtime"),
         )
 
@@ -170,19 +223,34 @@ class WindowsPlatform:
 
     def _apply_and_verify_acl(self, path: str, *, directory: bool) -> None:
         try:
-            acl = self._private_acl(directory)
-            owner = win32security.ConvertStringSidToSid(self._sid)
-            win32security.SetNamedSecurityInfo(
+            before = win32security.GetNamedSecurityInfo(
                 path,
                 win32security.SE_FILE_OBJECT,
                 win32security.OWNER_SECURITY_INFORMATION
-                | win32security.DACL_SECURITY_INFORMATION
+                | win32security.DACL_SECURITY_INFORMATION,
+            )
+            existing_owner = win32security.ConvertSidToStringSid(
+                before.GetSecurityDescriptorOwner()
+            )
+            if existing_owner != self._sid:
+                raise PermissionError("private Windows path has an unexpected owner")
+            acl = self._private_acl(directory)
+            win32security.SetNamedSecurityInfo(
+                path,
+                win32security.SE_FILE_OBJECT,
+                win32security.DACL_SECURITY_INFORMATION
                 | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
-                owner,
+                None,
                 None,
                 acl,
                 None,
             )
+        except pywintypes.error as exc:
+            raise PermissionError("cannot apply or inspect private Windows ACL") from exc
+        self._verify_private_acl(path)
+
+    def _verify_private_acl(self, path: str) -> None:
+        try:
             descriptor = win32security.GetNamedSecurityInfo(
                 path,
                 win32security.SE_FILE_OBJECT,
@@ -190,7 +258,7 @@ class WindowsPlatform:
                 | win32security.DACL_SECURITY_INFORMATION,
             )
         except pywintypes.error as exc:
-            raise PermissionError("cannot apply or inspect private Windows ACL") from exc
+            raise PermissionError("cannot inspect private Windows ACL") from exc
         actual_owner = win32security.ConvertSidToStringSid(
             descriptor.GetSecurityDescriptorOwner()
         )
@@ -224,6 +292,16 @@ class WindowsPlatform:
         if self._has_junction_component(path) or not os.path.isfile(path):
             raise OSError("private runtime path is not a regular file")
         self._apply_and_verify_acl(path, directory=False)
+
+    def verify_private_directory(self, path: str) -> None:
+        if self._has_junction_component(path) or not os.path.isdir(path):
+            raise OSError("private runtime path is not a safe directory")
+        self._verify_private_acl(path)
+
+    def verify_private_file(self, path: str) -> None:
+        if self._has_junction_component(path) or not os.path.isfile(path):
+            raise OSError("private runtime path is not a regular file")
+        self._verify_private_acl(path)
 
     @staticmethod
     def should_migrate_legacy_data() -> bool:
@@ -453,22 +531,865 @@ class WindowsPlatform:
         return ProcessSnapshot(ScanStatus.FAILED, issues=(problem,))
 
     @staticmethod
-    def launch(app: LaunchRequest) -> ManagedRuntime:
-        return ManagedRuntime(False, "Windows process launch is disabled in Phase 2")
+    def _create_private_file(path: str, data: bytes) -> None:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                descriptor = -1
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    def _ensure_runtime_parent(self, path: str) -> None:
+        created = False
+        try:
+            os.mkdir(path)
+            created = True
+        except FileExistsError:
+            pass
+        if created:
+            self.ensure_private_directory(path)
+        else:
+            self.verify_private_directory(path)
+
+    def _runtime_files(self, app_id: str, generation_id: str) -> tuple[str, ...]:
+        paths = self.runtime_paths()
+        directory = runtime_directory(paths.runtime_dir, app_id, generation_id)
+        return (
+            directory,
+            os.path.join(directory, "request.json"),
+            os.path.join(directory, "token.bin"),
+            os.path.join(directory, "receipt.json"),
+            os.path.join(paths.logs_dir, app_id + ".log"),
+        )
+
+    def _cleanup_tombstone_path(self, app_id: str, generation_id: str) -> str:
+        validated_app_id = validate_app_id(app_id)
+        validated_generation = validate_generation_id(generation_id)
+        return os.path.join(
+            self.runtime_paths().runtime_dir,
+            f"{_CLEANUP_TOMBSTONE_PREFIX}{validated_app_id}-{validated_generation}",
+        )
 
     @staticmethod
-    def inspect_managed(identity: RuntimeIdentity) -> ManagedInspection:
-        return ManagedInspection(False, False, issue=_issue(
-            "managed", "disabled", "Windows managed lifecycle is disabled in Phase 2"
-        ))
+    def _parse_cleanup_tombstone(name: str) -> tuple[str, str] | None:
+        if not name.startswith(_CLEANUP_TOMBSTONE_PREFIX):
+            return None
+        payload = name[len(_CLEANUP_TOMBSTONE_PREFIX):]
+        if len(payload) != 45 or payload[8:9] != "-":
+            return None
+        app_id, generation_id = payload[:8], payload[9:]
+        try:
+            if (validate_app_id(app_id) != app_id
+                    or validate_generation_id(generation_id) != generation_id):
+                return None
+        except (TypeError, ValueError, ProtocolError):
+            return None
+        return app_id, generation_id
+
+    def _verify_runtime_record_directory(
+        self, directory: str, *, exact: bool,
+    ) -> tuple[str, ...]:
+        self.verify_private_directory(directory)
+        names: list[str] = []
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if len(names) >= 4 or not entry.is_file(follow_symlinks=False):
+                    raise ProtocolError(
+                        "RUNTIME_RECORD_INSECURE",
+                        "runtime directory has unexpected records",
+                    )
+                names.append(entry.name)
+        present = set(names)
+        if (exact and present != _RUNTIME_RECORD_NAMES) or (
+                not exact and not present.issubset(_RUNTIME_RECORD_NAMES)):
+            raise ProtocolError(
+                "RUNTIME_RECORD_INSECURE", "runtime directory has unexpected records"
+            )
+        for name in names:
+            self.verify_private_file(os.path.join(directory, name))
+        return tuple(sorted(names))
+
+    def _stage_exact_runtime_records(self, app_id: str, generation_id: str) -> str:
+        directory, request_path, token_path, receipt_path, _ = self._runtime_files(
+            app_id, generation_id
+        )
+        runtime_root = self.runtime_paths().runtime_dir
+        app_directory = os.path.dirname(directory)
+        self.verify_private_directory(runtime_root)
+        self.verify_private_directory(app_directory)
+        self._verify_runtime_record_directory(directory, exact=True)
+        # Keep these bindings explicit: the rename is the cleanup commit point,
+        # and every credential must still be the verified exact source record.
+        for path in (request_path, token_path, receipt_path):
+            self.verify_private_file(path)
+        tombstone = self._cleanup_tombstone_path(app_id, generation_id)
+        if os.path.lexists(tombstone):
+            raise ProtocolError(
+                "RUNTIME_RECORD_INSECURE", "runtime cleanup tombstone already exists"
+            )
+        # Same-volume directory rename is atomic. Before it returns, failure
+        # leaves the authenticated generation intact; after it returns, the
+        # active runtime path is gone and config identity may stay cleared.
+        os.rename(directory, tombstone)
+        return tombstone
+
+    def _discard_unpublished_runtime_records(
+        self, app_id: str, generation_id: str,
+    ) -> None:
+        """Remove only records created by this failed, never-persisted launch."""
+        directory, _, _, _, _ = self._runtime_files(app_id, generation_id)
+        runtime_root = self.runtime_paths().runtime_dir
+        self.verify_private_directory(runtime_root)
+        self.verify_private_directory(os.path.dirname(directory))
+        # Preparation can fail before receipt publication, so a strict subset
+        # is valid here. Unexpected entries or ACL/link failures remain untouched.
+        self._verify_runtime_record_directory(directory, exact=False)
+        tombstone = self._cleanup_tombstone_path(app_id, generation_id)
+        if os.path.lexists(tombstone):
+            raise ProtocolError(
+                "RUNTIME_RECORD_INSECURE", "runtime cleanup tombstone already exists"
+            )
+        os.rename(directory, tombstone)
+        try:
+            self._delete_cleanup_tombstone(tombstone)
+        except (OSError, ProtocolError, pywintypes.error):
+            pass
+
+    def _delete_cleanup_tombstone(self, tombstone: str) -> None:
+        runtime_root = self.runtime_paths().runtime_dir
+        expected_parent = os.path.normcase(os.path.abspath(runtime_root))
+        if os.path.normcase(os.path.dirname(os.path.abspath(tombstone))) != expected_parent:
+            raise ProtocolError(
+                "RUNTIME_RECORD_INSECURE", "cleanup tombstone escaped runtime root"
+            )
+        parsed = self._parse_cleanup_tombstone(os.path.basename(tombstone))
+        if parsed is None:
+            raise ProtocolError(
+                "RUNTIME_RECORD_INSECURE", "cleanup tombstone name is invalid"
+            )
+        self.verify_private_directory(runtime_root)
+        names = self._verify_runtime_record_directory(tombstone, exact=False)
+        for name in names:
+            os.unlink(os.path.join(tombstone, name))
+        os.rmdir(tombstone)
+        app_directory = os.path.join(runtime_root, parsed[0])
+        try:
+            self.verify_private_directory(app_directory)
+            os.rmdir(app_directory)
+        except OSError:
+            pass
+
+    def release_managed(self, identity: RuntimeIdentity) -> StopResult:
+        """Delete one cleared generation after terminal ownership is proven."""
+        try:
+            self._runtime_context(identity, require_runner=False)
+            inspection = self.inspect_managed(identity)
+            if (not inspection.verified or inspection.status not in {"exited", "failed"}
+                    or inspection.members):
+                raise ProtocolError(
+                    "RUNTIME_IDENTITY_UNVERIFIED", "runtime is not safely terminal"
+                )
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                observation = self._observe_process(int(identity.runner_pid or 0))
+                if (observation is None or observation[0] != identity.owner
+                        or abs(observation[1] - float(identity.runner_create_time or 0)) > 0.1):
+                    break
+                time.sleep(0.05)
+            else:
+                raise ProtocolError(
+                    "RUNTIME_CONTROL_FAILED", "runner did not release runtime records"
+                )
+            tombstone = self._stage_exact_runtime_records(
+                str(identity.app_id), str(identity.generation_id)
+            )
+            # The atomic rename above commits release. Record deletion is
+            # intentionally best effort and recoverable after controller restart.
+            try:
+                self._delete_cleanup_tombstone(tombstone)
+            except (OSError, ProtocolError, pywintypes.error):
+                pass
+            return StopResult(True, still_running=False, status=inspection.status)
+        except (OSError, ProtocolError, pywintypes.error) as exc:
+            return StopResult(
+                False, str(exc), still_running=False, status="unknown",
+                code=getattr(exc, "code", "RUNTIME_CONTROL_FAILED"),
+            )
 
     @staticmethod
-    def stop_managed(identity: RuntimeIdentity, force: bool = False) -> StopResult:
-        return StopResult(False, "Windows process control is disabled in Phase 2")
+    def _bounded_directory_names(path: str, limit: int) -> tuple[str, ...]:
+        names: list[str] = []
+        with os.scandir(path) as entries:
+            for index, entry in enumerate(entries):
+                if index >= limit:
+                    break
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        names.append(entry.name)
+                except OSError:
+                    continue
+        return tuple(sorted(names))
+
+    def recover_managed_cleanups(self) -> tuple[RuntimeIdentity, ...]:
+        """Finalize committed tombstones, then discover signed terminal generations."""
+        runtime_root = self.runtime_paths().runtime_dir
+        try:
+            self.verify_private_directory(runtime_root)
+            runtime_names = self._bounded_directory_names(
+                runtime_root, _MAX_CLEANUP_RECOVERY_ENTRIES
+            )
+        except (OSError, ProtocolError, pywintypes.error):
+            return ()
+
+        # Tombstones are created only by the authenticated release transaction.
+        # Recovery deletes only strict private directories with a derived name
+        # and the bounded allowlisted record subset; it never opens a Job or PID.
+        for name in runtime_names:
+            if self._parse_cleanup_tombstone(name) is None:
+                continue
+            try:
+                self._delete_cleanup_tombstone(os.path.join(runtime_root, name))
+            except (OSError, ProtocolError, pywintypes.error):
+                continue
+
+        app_names = tuple(
+            name for name in runtime_names
+            if self._parse_cleanup_tombstone(name) is None
+        )
+
+        recovered: list[RuntimeIdentity] = []
+        scanned_generations = 0
+        for app_id in app_names:
+            if scanned_generations >= _MAX_CLEANUP_RECOVERY_ENTRIES:
+                break
+            try:
+                if validate_app_id(app_id) != app_id:
+                    continue
+                app_directory = os.path.join(runtime_root, app_id)
+                self.verify_private_directory(app_directory)
+                generation_names = self._bounded_directory_names(
+                    app_directory,
+                    _MAX_CLEANUP_RECOVERY_ENTRIES - scanned_generations,
+                )
+            except (OSError, ProtocolError, pywintypes.error):
+                continue
+            for generation_id in generation_names:
+                scanned_generations += 1
+                try:
+                    if validate_generation_id(generation_id) != generation_id:
+                        continue
+                    directory, request_path, token_path, receipt_path, _ = (
+                        self._runtime_files(app_id, generation_id)
+                    )
+                    self.verify_private_directory(directory)
+                    record_names: list[str] = []
+                    with os.scandir(directory) as records:
+                        for record in records:
+                            if len(record_names) >= 4:
+                                break
+                            record_names.append(record.name)
+                    if set(record_names) != {
+                        "request.json", "token.bin", "receipt.json"
+                    }:
+                        continue
+                    self.verify_private_file(request_path)
+                    self.verify_private_file(token_path)
+                    self.verify_private_file(receipt_path)
+                    with open(token_path, "rb") as stream:
+                        token = stream.read(33)
+                    if len(token) != 32:
+                        continue
+                    receipt = validate_receipt(
+                        read_json(receipt_path),
+                        token,
+                        app_id=app_id,
+                        generation_id=generation_id,
+                        owner_sid=self._sid,
+                    )
+                    if receipt["state"] not in {"exited", "failed"}:
+                        continue
+                    members = tuple(sorted(int(pid) for pid in receipt["members"]))
+                    if members:
+                        continue
+                    public = receipt["identity"]
+                    identity = self._identity_from_public(public, app_id, members)
+                    if windows_runtime_identity_public(identity) != public:
+                        continue
+                    if not terminal_observations_valid(
+                        public,
+                        runner_observation=self._observe_process(
+                            int(public["runnerPid"])
+                        ),
+                        root_observation=self._observe_process(int(public["rootPid"])),
+                        members=members,
+                    ):
+                        continue
+                    recovered.append(identity)
+                except (OSError, ValueError, ProtocolError, pywintypes.error):
+                    continue
+        return tuple(recovered)
+
+    @staticmethod
+    def _process_create_time(pid: int) -> float:
+        handle = win32api.OpenProcess(
+            win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+        )
+        try:
+            return float(
+                win32process.GetProcessTimes(handle)["CreationTime"].timestamp()
+            )
+        finally:
+            handle.Close()
+
+    def _observe_process(self, pid: int) -> tuple[str, float] | None:
+        try:
+            process = psutil.Process(int(pid))
+            create_time = float(process.create_time())
+        except psutil.NoSuchProcess:
+            return None
+        except (psutil.AccessDenied, OSError) as exc:
+            raise ProtocolError(
+                "RUNTIME_IDENTITY_UNVERIFIED", "runtime process is not observable"
+            ) from exc
+        try:
+            owner = self._process_owner_sid(pid)
+            handle = win32api.OpenProcess(
+                win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+            )
+            try:
+                if int(win32process.GetExitCodeProcess(handle)) != win32con.STILL_ACTIVE:
+                    return None
+            finally:
+                handle.Close()
+            return owner, create_time
+        except pywintypes.error as exc:
+            if exc.winerror in {winerror.ERROR_INVALID_PARAMETER,
+                                winerror.ERROR_FILE_NOT_FOUND}:
+                return None
+            raise ProtocolError(
+                "RUNTIME_IDENTITY_UNVERIFIED", "runtime process owner is not observable"
+            ) from exc
+
+    @staticmethod
+    def _identity_from_public(
+        public: Mapping[str, object], app_id: str, members: tuple[int, ...] = (),
+    ) -> RuntimeIdentity:
+        return RuntimeIdentity(
+            platform="windows",
+            kind="job",
+            identifier=str(public["jobName"]),
+            owner=str(public["ownerSid"]),
+            members=members,
+            app_id=app_id,
+            generation_id=str(public["generationId"]),
+            runner_pid=int(public["runnerPid"]),
+            runner_create_time=float(public["runnerCreateTime"]),
+            root_pid=int(public["rootPid"]),
+            root_create_time=float(public["rootCreateTime"]),
+            job_name=str(public["jobName"]),
+            token_digest=str(public["tokenDigest"]),
+            started_at=int(public["startedAt"]),
+        )
+
+    def _validate_identity(self, identity: RuntimeIdentity, token: bytes) -> dict[str, object]:
+        if identity.app_id is None or identity.generation_id is None:
+            raise ProtocolError("RUNTIME_IDENTITY_INVALID", "runtime identity is incomplete")
+        public = windows_runtime_identity_public(identity)
+        return validate_public_identity(
+            public,
+            app_id=identity.app_id,
+            generation_id=identity.generation_id,
+            owner_sid=self._sid,
+            digest=token_digest(token),
+        )
+
+    @staticmethod
+    def _receipt_previous_state(state: object) -> str | None:
+        return {
+            "prepared": None,
+            "running": "prepared",
+            "stopping": "running",
+            "exited": "running",
+            "failed": "prepared",
+        }.get(state)  # type: ignore[arg-type]
+
+    def _runtime_context(
+        self, identity: RuntimeIdentity, *, require_runner: bool,
+        allow_stale_root: bool = False,
+    ) -> _WindowsRuntimeContext:
+        if identity.app_id is None or identity.generation_id is None:
+            raise ProtocolError("RUNTIME_IDENTITY_INVALID", "runtime identity is incomplete")
+        directory, request_path, token_path, receipt_path, _ = self._runtime_files(
+            identity.app_id, identity.generation_id
+        )
+        self.verify_private_directory(directory)
+        self.verify_private_file(request_path)
+        self.verify_private_file(token_path)
+        self.verify_private_file(receipt_path)
+        with open(token_path, "rb") as stream:
+            token = stream.read(33)
+        if len(token) != 32:
+            raise ProtocolError("RUNTIME_RECORD_INSECURE", "invalid runtime token")
+        expected = self._validate_identity(identity, token)
+        raw_receipt = read_json(receipt_path)
+        unsigned = dict(raw_receipt)
+        unsigned.pop("hmac", None)
+        previous = self._receipt_previous_state(unsigned.get("state"))
+        if previous is None and unsigned.get("state") not in {"prepared", "failed"}:
+            raise ProtocolError("RUNTIME_IDENTITY_INVALID", "invalid current runner state")
+        receipt = validate_receipt(
+            raw_receipt,
+            token,
+            app_id=identity.app_id,
+            generation_id=identity.generation_id,
+            owner_sid=self._sid,
+            previous_state=previous,
+        )
+        if receipt["identity"] != expected:
+            raise ProtocolError("RUNTIME_IDENTITY_UNVERIFIED", "receipt identity mismatch")
+        members = tuple(sorted(int(pid) for pid in receipt["members"]))
+        state = str(receipt["state"])
+        if state in {"exited", "failed"}:
+            if members:
+                raise ProtocolError("RUNTIME_IDENTITY_UNVERIFIED", "terminal Job is not empty")
+            if not terminal_observations_valid(
+                expected,
+                runner_observation=self._observe_process(int(expected["runnerPid"])),
+                root_observation=self._observe_process(int(expected["rootPid"])),
+                members=members,
+            ):
+                raise ProtocolError(
+                    "RUNTIME_IDENTITY_UNVERIFIED", "terminal process evidence mismatch"
+                )
+        elif require_runner:
+            runner_observation = self._observe_process(int(expected["runnerPid"]))
+            root_observation = (
+                self._observe_process(int(expected["rootPid"]))
+                if int(expected["rootPid"]) in members else None
+            )
+            valid = reconnect_observations_valid(
+                expected,
+                runner_observation=runner_observation,
+                root_observation=root_observation,
+                members=members,
+            )
+            if (not valid and allow_stale_root and runner_observation is not None
+                    and runner_observation[0] == expected["ownerSid"]
+                    and abs(
+                        runner_observation[1] - float(expected["runnerCreateTime"])
+                    ) <= 0.1
+                    and root_observation is None):
+                valid = True
+            if not valid:
+                raise ProtocolError(
+                    "RUNTIME_IDENTITY_UNVERIFIED", "runtime process evidence mismatch"
+                )
+        return _WindowsRuntimeContext(identity, token, receipt, members, state)
+
+    def _connect_pipe(self, identity: RuntimeIdentity, timeout: float) -> object:
+        if identity.app_id is None or identity.generation_id is None:
+            raise ProtocolError("RUNTIME_IDENTITY_INVALID", "runtime identity is incomplete")
+        name = pipe_name(identity.app_id, identity.generation_id)
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        while True:
+            try:
+                handle = win32file.CreateFile(
+                    name,
+                    win32con.GENERIC_READ | win32con.GENERIC_WRITE,
+                    0,
+                    None,
+                    win32con.OPEN_EXISTING,
+                    0,
+                    None,
+                )
+                win32pipe.SetNamedPipeHandleState(
+                    handle, win32pipe.PIPE_READMODE_MESSAGE, None, None
+                )
+                if int(win32pipe.GetNamedPipeServerProcessId(handle)) != identity.runner_pid:
+                    handle.Close()
+                    raise ProtocolError(
+                        "RUNTIME_IDENTITY_UNVERIFIED", "named pipe runner mismatch"
+                    )
+                observation = self._observe_process(int(identity.runner_pid))
+                if (observation is None or observation[0] != identity.owner
+                        or abs(
+                            observation[1] - float(identity.runner_create_time or 0)
+                        ) > 0.1):
+                    handle.Close()
+                    raise ProtocolError(
+                        "RUNTIME_IDENTITY_UNVERIFIED",
+                        "named pipe runner identity changed",
+                    )
+                return handle
+            except pywintypes.error as exc:
+                if (exc.winerror not in {winerror.ERROR_FILE_NOT_FOUND,
+                                         winerror.ERROR_PIPE_BUSY}
+                        or time.monotonic() >= deadline):
+                    raise ProtocolError(
+                        "RUNTIME_CONTROL_FAILED", "runner control channel unavailable"
+                    ) from exc
+                try:
+                    win32pipe.WaitNamedPipe(name, 100)
+                except pywintypes.error:
+                    pass
+
+    def _control(
+        self,
+        identity: RuntimeIdentity,
+        action: str,
+        *,
+        payload: Mapping[str, object] | None = None,
+        timeout: float = 5.0,
+    ) -> tuple[dict[str, object], _WindowsRuntimeContext]:
+        context = self._runtime_context(
+            identity,
+            require_runner=True,
+            allow_stale_root=action == "inspect",
+        )
+        request = make_request(
+            action, str(identity.generation_id), context.token, payload
+        )
+        pipe = self._connect_pipe(identity, timeout)
+        try:
+            win32file.WriteFile(pipe, encode_message(request))
+            _, data = win32file.ReadFile(pipe, PIPE_BUFFER_BYTES)
+        except pywintypes.error as exc:
+            raise ProtocolError(
+                "RUNTIME_CONTROL_FAILED", "runner control exchange failed"
+            ) from exc
+        finally:
+            pipe.Close()
+        response = verify_response(decode_message(bytes(data)), context.token, request)
+        response_payload = response["payload"]
+        if set(response_payload) != {"identity", "members", "exitCode"}:
+            raise ProtocolError("RUNTIME_CONTROL_FAILED", "invalid runner response payload")
+        expected = self._validate_identity(identity, context.token)
+        actual = validate_public_identity(
+            response_payload["identity"],
+            app_id=str(identity.app_id),
+            generation_id=str(identity.generation_id),
+            owner_sid=self._sid,
+            digest=token_digest(context.token),
+        )
+        if actual != expected:
+            raise ProtocolError("RUNTIME_IDENTITY_UNVERIFIED", "runner identity mismatch")
+        members = response_payload["members"]
+        if (not isinstance(members, list)
+                or any(not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+                       for pid in members)
+                or len(members) != len(set(members))):
+            raise ProtocolError("RUNTIME_IDENTITY_UNVERIFIED", "invalid Job members")
+        refreshed = self._runtime_context(
+            identity,
+            require_runner=str(response["status"]) not in {"exited", "failed"},
+        )
+        if refreshed.state != response["status"]:
+            raise ProtocolError(
+                "RUNTIME_IDENTITY_UNVERIFIED",
+                "runner receipt state mismatch",
+            )
+        return response, refreshed
+
+    def launch(self, app: LaunchRequest) -> ManagedRuntime:
+        if app.command_spec is None or app.generation_id is None:
+            return ManagedRuntime(
+                False,
+                "Windows launch requires a reviewed command and generation",
+                code="LAUNCH_PREPARE_FAILED",
+            )
+        process: subprocess.Popen[bytes] | None = None
+        identity: RuntimeIdentity | None = None
+        directory_created = False
+        try:
+            invocation = prepared_invocation(app.command_spec)
+            directory, request_path, token_path, receipt_path, expected_log = (
+                self._runtime_files(app.app_id, app.generation_id)
+            )
+            if os.path.normcase(os.path.abspath(app.log_path)) != os.path.normcase(
+                os.path.abspath(expected_log)
+            ):
+                raise ProtocolError("RUNTIME_RECORD_INSECURE", "unexpected log path")
+            paths = self.runtime_paths()
+            for parent in (paths.data_dir, paths.logs_dir, paths.runtime_dir):
+                try:
+                    os.mkdir(parent)
+                except FileExistsError:
+                    pass
+                # These are controller-owned storage parents, not token-bearing
+                # generation records. Reapply the exact private DACL because
+                # Windows inheritance can mutate their inherited ACE flags.
+                self.ensure_private_directory(parent)
+            app_directory = os.path.dirname(directory)
+            if os.path.isdir(app_directory):
+                if os.listdir(app_directory):
+                    self.verify_private_directory(app_directory)
+                else:
+                    os.rmdir(app_directory)
+                    os.mkdir(app_directory)
+                    self.ensure_private_directory(app_directory)
+            else:
+                os.mkdir(app_directory)
+                self.ensure_private_directory(app_directory)
+            os.mkdir(directory)
+            directory_created = True
+            self.ensure_private_directory(directory)
+            if not os.path.isfile(expected_log):
+                self._create_private_file(expected_log, b"")
+            self.ensure_private_file(expected_log)
+            token = new_token()
+            self._create_private_file(token_path, token)
+            self.ensure_private_file(token_path)
+            request = make_launch_request(
+                app_id=app.app_id,
+                generation_id=app.generation_id,
+                owner_sid=self._sid,
+                invocation=invocation,
+                cwd=os.path.abspath(app.cwd),
+                log_path=expected_log,
+                token=token,
+            )
+            write_json_atomic(request_path, request, self.ensure_private_file)
+            self.ensure_private_file(request_path)
+            flags = (
+                win32process.DETACHED_PROCESS
+                | win32process.CREATE_NEW_PROCESS_GROUP
+                | win32process.CREATE_UNICODE_ENVIRONMENT
+            )
+            process = subprocess.Popen(
+                runner_command(sys.executable, app.app_id, app.generation_id),
+                cwd=self.base_dir,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                creationflags=flags,
+            )
+            deadline = time.monotonic() + _RUNNER_PREPARE_TIMEOUT
+            while time.monotonic() < deadline:
+                if os.path.isfile(receipt_path):
+                    self.verify_private_file(receipt_path)
+                    receipt = validate_receipt(
+                        read_json(receipt_path),
+                        token,
+                        app_id=app.app_id,
+                        generation_id=app.generation_id,
+                        owner_sid=self._sid,
+                    )
+                    public = receipt["identity"]
+                    if int(public["runnerPid"]) != process.pid:
+                        raise ProtocolError(
+                            "RUNTIME_IDENTITY_UNVERIFIED", "unexpected runner process"
+                        )
+                    identity = self._identity_from_public(
+                        public, app.app_id,
+                        tuple(sorted(int(pid) for pid in receipt["members"])),
+                    )
+                    self._runtime_context(identity, require_runner=True)
+                    break
+                if process.poll() is not None:
+                    break
+                time.sleep(0.05)
+            if identity is None:
+                raise ProtocolError("LAUNCH_PREPARE_FAILED", "runner did not prepare")
+            response, _ = self._control(identity, "inspect", timeout=2.0)
+            if not response["ok"] or response["status"] != "prepared":
+                raise ProtocolError("LAUNCH_PREPARE_FAILED", "runner is not prepared")
+            return ManagedRuntime(
+                True,
+                process=process,
+                process_id=identity.root_pid,
+                runtime_identity=identity,
+                status="prepared",
+            )
+        except (CommandSpecError, OSError, ProtocolError, pywintypes.error) as exc:
+            code = getattr(exc, "code", "LAUNCH_PREPARE_FAILED")
+            if identity is not None:
+                aborted = self.abort_managed(identity)
+                if aborted.ok:
+                    released = self.release_managed(identity)
+                    if released.ok:
+                        identity = None
+            elif process is not None:
+                try:
+                    process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    # This is the exact runner just created by this call. It owns
+                    # only this still-uncommitted generation.
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+                if process.poll() is not None and directory_created:
+                    try:
+                        self._discard_unpublished_runtime_records(
+                            app.app_id, app.generation_id
+                        )
+                    except (OSError, ProtocolError, pywintypes.error):
+                        pass
+            elif directory_created:
+                try:
+                    self._discard_unpublished_runtime_records(
+                        app.app_id, app.generation_id
+                    )
+                except (OSError, ProtocolError, pywintypes.error):
+                    pass
+            return ManagedRuntime(
+                False,
+                str(exc),
+                runtime_identity=identity,
+                status="failed",
+                code=code,
+            )
+
+    def activate_managed(self, identity: RuntimeIdentity) -> ManagedActivation:
+        try:
+            response, _ = self._control(identity, "resume", timeout=5.0)
+            if not response["ok"] or response["status"] != "running":
+                return ManagedActivation(
+                    False,
+                    str(response.get("error") or "runner activation failed"),
+                    status=str(response["status"]),
+                    code=str(response.get("code") or "LAUNCH_ACTIVATE_FAILED"),
+                )
+            return ManagedActivation(True, status="running", process_id=identity.root_pid)
+        except (OSError, ProtocolError, pywintypes.error) as exc:
+            return ManagedActivation(
+                False, str(exc), status="prepared",
+                code=getattr(exc, "code", "LAUNCH_ACTIVATE_FAILED"),
+            )
+
+    def abort_managed(self, identity: RuntimeIdentity) -> StopResult:
+        try:
+            response, context = self._control(identity, "abort", timeout=5.0)
+            return StopResult(
+                bool(response["ok"] and not context.members),
+                None if response["ok"] else str(response.get("error") or "abort failed"),
+                still_running=bool(context.members),
+                status=context.state,
+                code=None if response["ok"] else str(
+                    response.get("code") or "RUNTIME_CONTROL_FAILED"
+                ),
+            )
+        except (OSError, ProtocolError, pywintypes.error) as exc:
+            return StopResult(
+                False, str(exc), still_running=True, status="unknown",
+                code=getattr(exc, "code", "RUNTIME_CONTROL_FAILED"),
+            )
+
+    def inspect_managed(self, identity: RuntimeIdentity) -> ManagedInspection:
+        try:
+            context = self._runtime_context(identity, require_runner=False)
+            if context.state in {"exited", "failed"}:
+                return ManagedInspection(
+                    False,
+                    True,
+                    members=(),
+                    status=context.state,
+                    identity=identity,
+                    code=context.receipt.get("code"),
+                    exit_code=context.receipt.get("exitCode"),
+                    updated_at=int(context.receipt["updatedAt"]),
+                )
+            runner_observation = self._observe_process(int(identity.runner_pid or 0))
+            if runner_observation is None or (
+                runner_observation[0] != identity.owner
+                or abs(runner_observation[1] - float(identity.runner_create_time or 0))
+                > 0.1
+            ):
+                root_observation = self._observe_process(int(identity.root_pid or 0))
+                original_root_alive = bool(
+                    root_observation is not None
+                    and root_observation[0] == identity.owner
+                    and abs(
+                        root_observation[1] - float(identity.root_create_time or 0)
+                    ) <= 0.1
+                )
+                if original_root_alive:
+                    raise ProtocolError(
+                        "RUNTIME_IDENTITY_UNVERIFIED",
+                        "runner exited before Job cleanup completed",
+                    )
+                # The signed receipt binds this generation to a kill-on-close Job
+                # whose runner is its sole handle owner. Proven runner absence/PID
+                # reuse therefore proves kernel cleanup without reopening the Job.
+                return ManagedInspection(
+                    False,
+                    True,
+                    members=(),
+                    status="failed",
+                    identity=identity,
+                    code="RUNTIME_CONTROL_FAILED",
+                    exit_code=None,
+                    updated_at=int(time.time() * 1000),
+                )
+            response, refreshed = self._control(identity, "inspect", timeout=2.0)
+            return ManagedInspection(
+                running=bool(refreshed.members),
+                verified=bool(response["ok"]),
+                members=refreshed.members,
+                status=refreshed.state,
+                identity=self._identity_from_public(
+                    refreshed.receipt["identity"], str(identity.app_id), refreshed.members
+                ),
+                code=response.get("code"),
+                exit_code=refreshed.receipt.get("exitCode"),
+                updated_at=int(refreshed.receipt["updatedAt"]),
+            )
+        except (OSError, ProtocolError, pywintypes.error) as exc:
+            code = getattr(exc, "code", "RUNTIME_IDENTITY_UNVERIFIED")
+            return ManagedInspection(
+                False,
+                False,
+                issue=_issue("managed", code, str(exc)),
+                status="unknown",
+                code=code,
+            )
+
+    def stop_managed(
+        self, identity: RuntimeIdentity, force: bool = False, timeout: float = 5.0,
+    ) -> StopResult:
+        action = "force" if force else "stop"
+        try:
+            inspection = self.inspect_managed(identity)
+            if not inspection.verified:
+                return StopResult(
+                    False,
+                    inspection.issue.message if inspection.issue else
+                    "runtime identity could not be verified",
+                    still_running=True,
+                    status=inspection.status,
+                    code=inspection.code or "RUNTIME_IDENTITY_UNVERIFIED",
+                )
+            if inspection.status in {"exited", "failed"} and not inspection.members:
+                return StopResult(True, still_running=False, status=inspection.status)
+            response, context = self._control(
+                identity, action, payload={"timeout": float(timeout)},
+                timeout=max(2.0, float(timeout) + 2.0),
+            )
+            return StopResult(
+                bool(response["ok"] and not context.members),
+                None if response["ok"] else str(response.get("error") or "stop failed"),
+                still_running=bool(context.members),
+                status=context.state,
+                code=None if response["ok"] else str(
+                    response.get("code") or "RUNTIME_CONTROL_FAILED"
+                ),
+            )
+        except (OSError, ProtocolError, pywintypes.error) as exc:
+            return StopResult(
+                False, str(exc), still_running=True, status="unknown",
+                code=getattr(exc, "code", "RUNTIME_CONTROL_FAILED"),
+            )
 
     @staticmethod
     def stop_external_process(pid: int, force: bool = False) -> StopResult:
-        return StopResult(False, "Windows external process control is disabled in Phase 2")
+        return StopResult(False, "Windows external process control is disabled")
 
     @staticmethod
     def process_group_id(pid: int) -> None:
@@ -511,7 +1432,7 @@ class WindowsPlatform:
 
     @staticmethod
     def restart_console(preferred_port: int) -> RestartResult:
-        return RestartResult(False, error="Windows console restart is disabled in Phase 2")
+        return RestartResult(False, error="Windows console restart is disabled")
 
     @staticmethod
     def complete_console_restart(old_pid: int, preferred_port: int) -> int:

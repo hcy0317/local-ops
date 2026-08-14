@@ -135,6 +135,8 @@ kbd {
   transition: transform 0.22s var(--ease);
 }
 .banner.show { transform: translateY(0); }
+.banner.show ~ .shell > .rail,
+.banner.show ~ .shell > .shell-col { padding-top: 38px; }
 
 /* ---------- 布局 ---------- */
 .shell { position: relative; z-index: 1; display: flex; flex-direction: column; height: 100vh; }
@@ -957,7 +959,7 @@ body.dragging-on { cursor: grabbing; user-select: none; -webkit-user-select: non
 
 /* 日志抽屉 */
 .drawer-mask {
-  position: fixed; inset: 0; z-index: 290;
+  position: fixed; inset: 0; z-index: 410;
   background: rgba(10, 14, 20, 0.5);
   backdrop-filter: blur(3px);
   -webkit-backdrop-filter: blur(3px);
@@ -965,7 +967,7 @@ body.dragging-on { cursor: grabbing; user-select: none; -webkit-user-select: non
 }
 .drawer-mask.open { opacity: 1; pointer-events: auto; }
 .drawer {
-  position: fixed; top: 0; right: 0; bottom: 0; z-index: 295;
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: 415;
   width: 580px; max-width: 94vw;
   display: flex; flex-direction: column;
   background: var(--card);

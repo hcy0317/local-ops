@@ -2,6 +2,10 @@
 
 Status: Phase 3 implementation contract
 
+Phase 4 managed lifecycle semantics are frozen separately in
+`API-CONTRACT-v3.md`; this document remains authoritative for schema v2,
+CommandSpec, picker, project detection, and configuration import.
+
 Scope: schema, command description, import, path selection, and compatible UI
 Out of scope: Windows process start, stop, restart, attach, Job Objects, and runner IPC
 

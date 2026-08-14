@@ -27,24 +27,39 @@
 - [ ] GitHub Bug/Feature Issue 表单与 Pull Request 模板仍符合当前安全、隐私和素材门禁。
 - [ ] 已人工复核从上一版本到当前 commit 的完整 diff。
 
-### Windows Phase 2 源码门禁
+### Windows Phase 2 历史源码门禁
 
 - [ ] `requirements-windows.txt` 中 `psutil` 与 `pywin32` 精确锁定，并在 Windows Python 3.12 CI 中从零安装成功。
 - [ ] Windows adapter import、compile、contract 与 `tests/windows/` 全部通过，测试数量大于 0。
 - [ ] 普通用户 Windows 10 与 Windows 11 均验证 Local AppData、SID/DACL、Named Mutex、IPv4/IPv6 和受保护进程降级行为。
 - [ ] Windows HTTP socket 使用 `SO_EXCLUSIVEADDRUSE`，仍只绑定 `127.0.0.1`。
-- [ ] Windows capability flags 禁用 attach/kill/start/stop/restart，相关 API 在扫描、写配置或控制进程前返回拒绝。
-- [ ] 未完成 Windows 10、完整生命周期与打包验收时，发行说明明确标记为只读源码预览，不使用 Beta 或 production-ready 表述。
+- [ ] Phase 2 候选的 capability flags 禁用 attach/kill/start/stop/restart，相关 API 在扫描、写配置或控制进程前返回拒绝；该项只验证 Phase 2 历史边界，不代表当前 Phase 4 capability。
+- [ ] 发布 Phase 2 候选且未完成 Windows 10、完整生命周期与打包验收时，发行说明明确标记为只读源码预览，不使用 Beta 或 production-ready 表述。
 
-### Windows Phase 3 兼容性门禁
+### Windows Phase 3 历史兼容性门禁
 
 - [ ] schema v1→v2 迁移幂等，旧 `command` 保留，future schema 保持只读且不会覆盖主文件或备份。
 - [ ] direct/cmd/PowerShell `commandSpec` 与特殊字符 argv 测试通过；静态预检不执行命令、不访问网络，并在 stat 前拒绝 UNC/设备路径。
 - [ ] 项目识别覆盖 `.cmd/.bat/.ps1`、PATHEXT、npm/pnpm shim 和明确的 Python 3.12 launcher；POSIX 命令只标记为待复核。
 - [ ] 配置导入 preview 零写入，commit 不覆盖目标并清空运行身份，重复提交幂等，CAS rollback 不丢弃后续用户修改。
 - [ ] 导入的 prepared/rollback_prepared 回执能在写入或 CAS 瞬时失败后安全重试；原子替换后的 ACL 校验失败保持内存/磁盘一致并进入只读保护。
-- [ ] Windows UI 不存在 start/stop/restart/attach/kill/batch-stop 可触发路径，HTTP 路由在任何配置或进程副作用前返回 `CAPABILITY_DISABLED`。
-- [ ] Windows 10 仍未验收或 Phase 4 runner 尚未实现时，发行说明继续使用“兼容性源码预览”，不声称完整 Windows 生命周期或 Beta readiness。
+- [ ] Phase 3 候选的 Windows UI 不存在 start/stop/restart/attach/kill/batch-stop 可触发路径，HTTP 路由在任何配置或进程副作用前返回 `CAPABILITY_DISABLED`；该项只验证 Phase 3 历史边界。
+- [ ] 发布 Phase 3 候选且 Windows 10 仍未验收或 Phase 4 runner 尚未实现时，发行说明继续使用“兼容性源码预览”，不声称完整 Windows 生命周期或 Beta readiness。
+
+### Windows Phase 4 生命周期门禁
+
+- [ ] `CREATE_SUSPENDED` 目标在加入专属 Job 且完整 runtime identity 原子持久化前没有执行用户代码；准备失败无进程或半写身份残留。
+- [ ] runtime identity 恰好包含 11 个公开字段，Job 名包含完整 generation UUID 与 16 位 token digest；raw token、pipe/runtime/receipt 路径不进入公开状态、命令行、日志或诊断。
+- [ ] request/receipt 原子写入在 `os.replace` 前已对临时文件应用并验证私有 DACL；重连/清理使用 verify-only，已放宽 ACL 的记录不会被静默修复后继续使用。
+- [ ] active generation 只有在目录恰好包含三个私有 runtime records、terminal receipt 签名有效、Job 已空且 runner absent 时才能进入释放；原子 rename 到严格派生的 cleanup tombstone 是 release commit，rename 前失败保留 active generation。
+- [ ] commit 后的恢复只处理 runtime root 直属、严格派生命名、private、nonlink tombstone 中三个 runtime record 的 allowlisted subset，且不观察或控制任何进程；未知项、宽 ACL、link 或非派生路径一律 fail closed 并保留 tombstone。
+- [ ] 重连重新验证当前 SID、runner/root PID 创建时间、generation、HMAC/受保护回执和 Job 成员；证据不完整显示 `orphaned/unknown` 并拒绝控制。
+- [ ] 所有 start/stop/force/restart/运行中修改/delete 使用冻结的 `expectedGeneration`；旧 generation 请求返回 mismatch 且不影响新实例。
+- [ ] 普通停止超时保留身份且不自动 Force；显式 Force 重做完整验证并只对受管 Job 调用 `TerminateJobObject`。
+- [ ] 禁止 `taskkill /T`、裸 PID `TerminateProcess`、Windows `os.kill(pid, 0)` 和 `psutil.children()` 所有权证明；外部 attach/kill 与总控台重启仍关闭。
+- [ ] `WIN-LIFE-001..012` 与 `WIN-SEC-001..014` 在设置 `LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS=1` 的隔离夹具作用域或 Windows runner 中只操作测试自身创建的进程并通过。
+- [ ] 本地门禁通过后状态仅为 `LOCAL_PASS_CI_PENDING`；精确实现 commit 的 Windows Python 3.12 CI 与完整 macOS regression/release CI 同时通过后，才将 Phase 4 改为 `PASS`。
+- [ ] Windows 10、self-contained 打包和干净无 Python VM 仍为 Phase 5；这些项目完成前 `windowsBetaReady=false`。
 
 ## 3. 安全与进程生命周期
 

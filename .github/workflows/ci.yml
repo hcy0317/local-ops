@@ -10,11 +10,13 @@ permissions:
 
 jobs:
   windows-read-only:
-    name: Windows Phase 2-3 contracts
+    name: Windows Phase 2-4 contracts and isolated lifecycle
     runs-on: windows-2022
     timeout-minutes: 20
     env:
       PYTHONDONTWRITEBYTECODE: "1"
+      # Destructive primitives may target only processes created by the test fixtures.
+      LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS: "1"
 
     steps:
       - name: Check out source
@@ -30,12 +32,12 @@ jobs:
       - name: Install Windows runtime dependencies
         run: python -m pip install --disable-pip-version-check -r requirements-windows.txt
 
-      - name: Compile and import Windows Phase 3 modules
+      - name: Compile and import Windows Phase 4 modules
         run: |
           python -m compileall -q server.py localops tools tests
           python -c "import server; import localops.command_spec; import localops.config_import; from localops.platform.windows import WindowsPlatform; assert server.PLATFORM.name == 'windows'; assert WindowsPlatform('.', 'server.py').name == 'windows'"
 
-      - name: Run Windows platform, Phase 3, and shared contract tests
+      - name: Run Windows contracts and fixture-owned lifecycle tests
         run: |
           python -m unittest discover -s tests/windows -p "test_*.py" -v
           python -m unittest discover -s tests/contract -p "test_*.py" -v

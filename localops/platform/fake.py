@@ -8,6 +8,7 @@ from typing import Literal, Mapping
 from .contracts import (
     CwdSnapshot,
     ListenerSnapshot,
+    ManagedActivation,
     ManagedInspection,
     ManagedRuntime,
     PickResult,
@@ -66,9 +67,13 @@ class FakePlatform:
         default_factory=lambda: ProcessSnapshot(status=ScanStatus.OK)
     )
     launch_result: ManagedRuntime = field(default_factory=lambda: ManagedRuntime(ok=True))
+    activation_result: ManagedActivation = field(
+        default_factory=lambda: ManagedActivation(ok=True)
+    )
     inspection: ManagedInspection = field(
         default_factory=lambda: ManagedInspection(running=False, verified=True)
     )
+    cleanup_recoveries: list[RuntimeIdentity] = field(default_factory=list)
     stop_result: StopResult = field(default_factory=lambda: StopResult(ok=True))
     pick_result: PickResult = field(default_factory=PickResult)
     restart_result: RestartResult = field(default_factory=lambda: RestartResult(ok=True))
@@ -126,12 +131,30 @@ class FakePlatform:
         self.calls.append(("launch", app))
         return self.launch_result
 
+    def activate_managed(self, identity: RuntimeIdentity) -> ManagedActivation:
+        self.calls.append(("activate_managed", identity))
+        return self.activation_result
+
+    def abort_managed(self, identity: RuntimeIdentity) -> StopResult:
+        self.calls.append(("abort_managed", identity))
+        return self.stop_result
+
+    def release_managed(self, identity: RuntimeIdentity) -> StopResult:
+        self.calls.append(("release_managed", identity))
+        return self.stop_result
+
+    def recover_managed_cleanups(self) -> tuple[RuntimeIdentity, ...]:
+        self.calls.append(("recover_managed_cleanups", None))
+        return tuple(self.cleanup_recoveries)
+
     def inspect_managed(self, identity: RuntimeIdentity) -> ManagedInspection:
         self.calls.append(("inspect_managed", identity))
         return self.inspection
 
-    def stop_managed(self, identity: RuntimeIdentity, force: bool = False) -> StopResult:
-        self.calls.append(("stop_managed", (identity, force)))
+    def stop_managed(
+        self, identity: RuntimeIdentity, force: bool = False, timeout: float = 5.0,
+    ) -> StopResult:
+        self.calls.append(("stop_managed", (identity, force, timeout)))
         return self.stop_result
 
     def stop_external_process(self, pid: int, force: bool = False) -> StopResult:

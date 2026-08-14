@@ -25,6 +25,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -45,6 +46,7 @@ from localops.command_spec import (
     legacy_command_spec,
     normalize_command_spec,
     platform_compatibility,
+    prepared_invocation,
     python_command_spec,
     select_python_executable,
     static_preflight,
@@ -145,6 +147,13 @@ LOG_LOCK = threading.RLock()
 MANUAL_STOP_LOCK = threading.RLock()
 MANUAL_STOP_TOKENS = set()
 _PLATFORM_SCAN_STATE = threading.local()
+# One terminal generation clear is a single transaction: config CAS, runtime
+# record release, and any identity restore must not race state reconciliation.
+# A global lock keeps this uncommon path simple and also serializes recovery
+# scans with release I/O; normal process inspection and lifecycle control do
+# not take it.
+_WINDOWS_RELEASE_LOCK = threading.RLock()
+_WINDOWS_PENDING_RELEASES = {}
 
 
 def process_owned_by_current(info):
@@ -432,6 +441,275 @@ class FutureConfigSchemaError(ConfigSchemaError):
     pass
 
 
+_WINDOWS_RUNTIME_IDENTITY_FIELDS = {
+    "platform",
+    "kind",
+    "ownerSid",
+    "generationId",
+    "runnerPid",
+    "runnerCreateTime",
+    "rootPid",
+    "rootCreateTime",
+    "jobName",
+    "tokenDigest",
+    "startedAt",
+}
+_WINDOWS_SID_RE = re.compile(r"^S-1-(?:\d+-){1,14}\d+$")
+_TOKEN_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_LIFECYCLE_ERROR_MESSAGES = {
+    "GENERATION_REQUIRED": "请求缺少有效的运行代次",
+    "GENERATION_MISMATCH": "应用运行代次已变化，请刷新状态后重试",
+    "RUNTIME_IDENTITY_INVALID": "保存的运行身份无效，已禁止控制",
+    "RUNTIME_IDENTITY_UNVERIFIED": "无法完整验证受管运行身份，已禁止控制",
+    "RUNTIME_RECORD_INSECURE": "运行记录安全验证失败，已禁止控制",
+    "LAUNCH_PREPARE_FAILED": "无法安全准备受管进程",
+    "LAUNCH_COMMIT_FAILED": "无法在启动前保存运行身份",
+    "LAUNCH_ACTIVATE_FAILED": "运行身份已保存，但进程未能安全恢复",
+    "STOP_TIMEOUT": "应用未在限定时间内退出，仍保留管理身份",
+    "RUNTIME_CONTROL_FAILED": "受管进程控制失败，仍保留管理身份",
+}
+
+
+def runtime_generation(app):
+    """Return the persisted managed generation, never a legacy PID token."""
+    identity = app.get("runtimeIdentity") if isinstance(app, dict) else None
+    return identity.get("generationId") if isinstance(identity, dict) else None
+
+
+def normalize_expected_generation(data, *, required):
+    """Validate the observed generation carried by a lifecycle request."""
+    if "expectedGeneration" not in data:
+        if required:
+            return None, "请求缺少 expectedGeneration"
+        return None, None
+    value = data.get("expectedGeneration")
+    if value is None:
+        return None, None
+    if not isinstance(value, str):
+        return None, "expectedGeneration 必须是 UUID 字符串或 null"
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return None, "expectedGeneration 必须是 UUID 字符串或 null"
+    if str(parsed) != value:
+        return None, "expectedGeneration 必须使用规范的小写 UUID"
+    return value, None
+
+
+def normalize_runtime_identity(value, app_id, *, current_owner=None):
+    """Validate the exact public Windows Job identity stored in schema v2."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != _WINDOWS_RUNTIME_IDENTITY_FIELDS:
+        raise ConfigSchemaError("runtimeIdentity 必须是受支持的完整 Windows Job 身份")
+    if value.get("platform") != "windows" or value.get("kind") != "job":
+        raise ConfigSchemaError("runtimeIdentity 平台或类型无效")
+
+    owner_sid = value.get("ownerSid")
+    if not isinstance(owner_sid, str) or not _WINDOWS_SID_RE.fullmatch(owner_sid):
+        raise ConfigSchemaError("runtimeIdentity ownerSid 无效")
+    if current_owner is not None and owner_sid != current_owner:
+        raise ConfigSchemaError("runtimeIdentity 不属于当前 Windows 用户")
+
+    generation = value.get("generationId")
+    try:
+        parsed_generation = uuid.UUID(generation) if isinstance(generation, str) else None
+    except (ValueError, AttributeError):
+        parsed_generation = None
+    if parsed_generation is None or str(parsed_generation) != generation:
+        raise ConfigSchemaError("runtimeIdentity generationId 无效")
+
+    for field in ("runnerPid", "rootPid", "startedAt"):
+        field_value = value.get(field)
+        if isinstance(field_value, bool) or not isinstance(field_value, int) or field_value <= 0:
+            raise ConfigSchemaError("runtimeIdentity %s 无效" % field)
+    for field in ("runnerCreateTime", "rootCreateTime"):
+        field_value = value.get(field)
+        if (isinstance(field_value, bool)
+                or not isinstance(field_value, (int, float))
+                or not (0 < field_value < float("inf"))):
+            raise ConfigSchemaError("runtimeIdentity %s 无效" % field)
+
+    prefix = "Local\\LocalOps-%s-%s-" % (app_id, generation)
+    job_name = value.get("jobName")
+    token_digest = value.get("tokenDigest")
+    if (not isinstance(token_digest, str)
+            or not _TOKEN_DIGEST_RE.fullmatch(token_digest)):
+        raise ConfigSchemaError("runtimeIdentity tokenDigest 无效")
+    expected_job_name = prefix + token_digest[7:23]
+    if job_name != expected_job_name:
+        raise ConfigSchemaError("runtimeIdentity jobName 无效")
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def public_runtime_identity(identity, app_id):
+    """Serialize only the non-secret v3 identity fields."""
+    if identity is None or identity.app_id != app_id:
+        raise ConfigSchemaError("runner 返回的 runtimeIdentity 未绑定当前应用")
+    public = {
+        "platform": identity.platform,
+        "kind": identity.kind,
+        "ownerSid": identity.owner,
+        "generationId": identity.generation_id,
+        "runnerPid": identity.runner_pid,
+        "runnerCreateTime": identity.runner_create_time,
+        "rootPid": identity.root_pid,
+        "rootCreateTime": identity.root_create_time,
+        "jobName": identity.job_name,
+        "tokenDigest": identity.token_digest,
+        "startedAt": identity.started_at,
+    }
+    return normalize_runtime_identity(
+        public,
+        app_id,
+        current_owner=(
+            SELF_PRINCIPAL.identifier if PLATFORM.name == "windows" else None
+        ),
+    )
+
+
+def native_runtime_identity(app):
+    """Rehydrate internal adapter context without exposing runtime paths/secrets."""
+    app_id = app.get("id")
+    public = normalize_runtime_identity(
+        app.get("runtimeIdentity"),
+        app_id,
+        current_owner=(
+            SELF_PRINCIPAL.identifier if PLATFORM.name == "windows" else None
+        ),
+    )
+    if public is None:
+        return None
+    return RuntimeIdentity(
+        platform=public["platform"],
+        kind=public["kind"],
+        identifier=public["jobName"],
+        owner=public["ownerSid"],
+        members=(public["rootPid"],),
+        app_id=app_id,
+        generation_id=public["generationId"],
+        runner_pid=public["runnerPid"],
+        runner_create_time=public["runnerCreateTime"],
+        root_pid=public["rootPid"],
+        root_create_time=public["rootCreateTime"],
+        job_name=public["jobName"],
+        token_digest=public["tokenDigest"],
+        started_at=public["startedAt"],
+    )
+
+
+def lifecycle_error(code, fallback="RUNTIME_IDENTITY_UNVERIFIED"):
+    stable = code if code in _LIFECYCLE_ERROR_MESSAGES else fallback
+    return {"code": stable, "message": _LIFECYCLE_ERROR_MESSAGES[stable]}
+
+
+def inspect_windows_runtime(app):
+    """Return fail-closed lifecycle presentation for one Windows app."""
+    identity = app.get("runtimeIdentity")
+    if identity is None:
+        return {
+            "status": "stopped",
+            "running": False,
+            "controlAvailable": True,
+            "issue": None,
+            "members": (),
+            "verified": True,
+        }
+    try:
+        native = native_runtime_identity(app)
+        inspection = PLATFORM.inspect_managed(native)
+    except (ConfigSchemaError, OSError, ValueError, TypeError):
+        return {
+            "status": "orphaned",
+            "running": False,
+            "controlAvailable": False,
+            "issue": lifecycle_error("RUNTIME_IDENTITY_INVALID"),
+            "members": (),
+            "verified": False,
+        }
+    except Exception:
+        LOG.exception("检查 Windows 受管运行身份失败: %s", app.get("id"))
+        return {
+            "status": "unknown",
+            "running": False,
+            "controlAvailable": False,
+            "issue": lifecycle_error("RUNTIME_IDENTITY_UNVERIFIED"),
+            "members": (),
+            "verified": False,
+        }
+
+    raw_status = getattr(inspection, "status", None) or "unknown"
+    status_map = {
+        "prepared": "starting",
+        "starting": "starting",
+        "running": "running",
+        "stopping": "stopping",
+    }
+    status = status_map.get(raw_status)
+    verified = bool(getattr(inspection, "verified", False))
+    if not verified:
+        raw_code = getattr(inspection, "code", None)
+        issue_code = getattr(getattr(inspection, "issue", None), "code", None)
+        code = raw_code if raw_code in _LIFECYCLE_ERROR_MESSAGES else issue_code
+        insecure = code in {
+            "RUNTIME_IDENTITY_INVALID",
+            "RUNTIME_RECORD_INSECURE",
+        }
+        return {
+            "status": "orphaned" if insecure else "unknown",
+            "running": False,
+            "controlAvailable": False,
+            "issue": lifecycle_error(code),
+            "members": (),
+            "verified": False,
+        }
+    if not _windows_inspection_matches(native, inspection):
+        return {
+            "status": "unknown",
+            "running": False,
+            "controlAvailable": False,
+            "issue": lifecycle_error("RUNTIME_IDENTITY_UNVERIFIED"),
+            "members": (),
+            "verified": False,
+        }
+    members = tuple(getattr(inspection, "members", ()) or ())
+    inspection_running = bool(getattr(inspection, "running", False))
+    if (status in ("running", "stopping")
+            and (not inspection_running or not members)):
+        return {
+            "status": "unknown",
+            "running": False,
+            "controlAvailable": False,
+            "issue": lifecycle_error("RUNTIME_IDENTITY_UNVERIFIED"),
+            "members": (),
+            "verified": False,
+        }
+    if status is None:
+        return {
+            "status": "unknown",
+            "running": False,
+            "controlAvailable": False,
+            "issue": lifecycle_error(
+                getattr(inspection, "code", None),
+                "RUNTIME_CONTROL_FAILED",
+            ),
+            "members": members,
+            "verified": True,
+        }
+    return {
+        "status": status,
+        "running": (
+            status in ("running", "stopping")
+            and inspection_running
+            and bool(members)
+        ),
+        "controlAvailable": status == "running",
+        "issue": None,
+        "members": members,
+        "verified": True,
+    }
+
+
 def migrate_config_v0_to_v1(raw):
     """旧配置没有 schemaVersion；v1 只建立显式版本基线。"""
     migrated = dict(raw)
@@ -522,7 +800,7 @@ class Config:
         return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
 
     @classmethod
-    def _normalize(cls, raw):
+    def _normalize(cls, raw, *, strict_runtime=False):
         data = {"schemaVersion": CURRENT_SCHEMA_VERSION}
         for key, default in cls.DEFAULT.items():
             if key == "schemaVersion":
@@ -541,9 +819,22 @@ class Config:
             for key in app:
                 if key in item:
                     app[key] = item[key]
-            # Phase 3 does not accept or expose a PID-only/runtime identity.
-            # Phase 4 will introduce a separately validated tagged union.
-            app["runtimeIdentity"] = None
+            try:
+                app["runtimeIdentity"] = normalize_runtime_identity(
+                    app.get("runtimeIdentity"),
+                    app["id"],
+                    current_owner=(
+                        SELF_PRINCIPAL.identifier
+                        if PLATFORM.name == "windows" else None
+                    ),
+                )
+            except ConfigSchemaError:
+                if strict_runtime:
+                    raise
+                # Explicit imports normalize first and clear legacy identity
+                # later; an untrusted PID-only source must never survive that
+                # pipeline or become a Windows ownership claim.
+                app["runtimeIdentity"] = None
             invalid_command_spec = False
             try:
                 command_spec = app.get("commandSpec")
@@ -580,7 +871,7 @@ class Config:
                 with open(path, "r", encoding="utf-8") as f:
                     raw = json.load(f)
                 migrated, source_version = migrate_config(raw)
-                data = self._normalize(migrated)
+                data = self._normalize(migrated, strict_runtime=True)
                 if index:
                     self._recovered_from_backup = True
                     LOG.warning("主配置不可读，已从备份恢复: %s", path)
@@ -673,6 +964,37 @@ class Config:
                 self._data = previous
                 raise
 
+    def mutate_app_if_generation(self, app_id, expected_generation, fn):
+        """Apply one app mutation only when its runtime generation still matches.
+
+        A mismatch performs no file write, backup rotation, or cache invalidation.
+        Returns ``(status, result, actual_generation)`` where status is one of
+        ``applied``, ``not_found``, or ``mismatch``.
+        """
+        with self._lock:
+            if not self._writable:
+                raise OSError("配置处于只读保护状态，请先恢复配置或权限")
+            target = find_app(self._data, app_id)
+            if target is None:
+                return "not_found", None, None
+            actual_generation = runtime_generation(target)
+            if actual_generation != expected_generation:
+                return "mismatch", None, actual_generation
+            previous = json.loads(json.dumps(self._data, ensure_ascii=False))
+            try:
+                result = fn(self._data, target)
+                payload = self._payload(self._data)
+                previous_payload = self._payload(previous)
+                if not self._write_atomic(
+                        self._path + ".bak", previous_payload):
+                    raise OSError("配置备份权限验证失败")
+                self._write_atomic(self._path, payload)
+                invalidate_state_cache()
+                return "applied", result, runtime_generation(target)
+            except Exception:
+                self._data = previous
+                raise
+
     def replace_if_hash(self, expected_hash, replacement):
         """Atomically replace the full config only if its normalized hash matches."""
         return self._replace_if_hash(
@@ -693,7 +1015,9 @@ class Config:
             if config_hash(self._data) != expected_hash:
                 return False
             if normalize_replacement:
-                normalized = self._normalize(replacement)
+                normalized = self._normalize(
+                    replacement, strict_runtime=True
+                )
             else:
                 if (not isinstance(replacement, dict)
                         or replacement.get("schemaVersion")
@@ -1210,18 +1534,21 @@ def legacy_managed_pid(app, listeners=None, snap=None, cwds=None):
     return matches[0] if app.get("attached") and len(matches) == 1 else None
 
 
-def listener_app_owners(apps, listeners, snap, cwds, groups=None):
+def listener_app_owners(
+        apps, listeners, snap, cwds, groups=None, managed_override=None):
     """返回真实受管监听进程的 ``pid -> app`` 映射。
 
     端口只是配置与网络资源，不能作为进程所有权证明。映射沿用应用状态的
     run token / PGID / UID 校验，并为升级前的进程保留严格 legacy 识别。
     如果异常配置让同一 PID 同时命中多张卡片，则不做关联，避免误导 UI。
     """
-    managed, _, _ = managed_process_index(apps, groups)
+    managed = managed_override
+    if managed is None:
+        managed, _, _ = managed_process_index(apps, groups)
     candidates = {}
     for app in apps:
         live = managed.get(app.get("id"), [])
-        if not live:
+        if not live and managed_override is None:
             legacy_pid = legacy_managed_pid(app, listeners, snap, cwds)
             live = [legacy_pid] if legacy_pid else []
         for pid in live:
@@ -1243,7 +1570,19 @@ def build_apps(cfg, listeners, groups=None):
     for pid, port in listeners:
         port_map.setdefault(port, []).append(pid)
     apps_cfg = cfg.get("apps") or []
-    managed, snap, _ = managed_process_index(apps_cfg, groups)
+    runtime_states = (
+        {app["id"]: inspect_windows_runtime(app) for app in apps_cfg}
+        if PLATFORM.name == "windows" else {}
+    )
+    if PLATFORM.name == "windows":
+        managed = {
+            app_id: list(state["members"])
+            for app_id, state in runtime_states.items()
+            if state["verified"] and state["status"] in ("running", "stopping")
+        }
+        snap = {}
+    else:
+        managed, snap, _ = managed_process_index(apps_cfg, groups)
     listen_by_pid = {}
     for pid, port in listeners:
         listen_by_pid.setdefault(pid, []).append(port)
@@ -1257,18 +1596,30 @@ def build_apps(cfg, listeners, groups=None):
                      if configured_listener_pids else {})
     listener_cwds = lsof_cwds(configured_listener_pids)
     verified_owner = listener_app_owners(
-        apps_cfg, listeners, listener_snap, listener_cwds)
+        apps_cfg,
+        listeners,
+        listener_snap,
+        listener_cwds,
+        managed_override=managed if PLATFORM.name == "windows" else None,
+    )
 
     apps = []
     for app in apps_cfg:
+        runtime_state = runtime_states.get(app["id"])
         managed_live = managed.get(app["id"], [])
-        legacy_pid = None if managed_live else legacy_managed_pid(
-            app, listeners, listener_snap, listener_cwds)
+        legacy_pid = (
+            None
+            if PLATFORM.name == "windows" or managed_live
+            else legacy_managed_pid(app, listeners, listener_snap, listener_cwds)
+        )
         if (legacy_pid and
                 (verified_owner.get(legacy_pid) or {}).get("id") != app.get("id")):
             legacy_pid = None
         live = managed_live or ([legacy_pid] if legacy_pid else [])
-        lp = app.get("lastPid")
+        lp = (
+            (app.get("runtimeIdentity") or {}).get("rootPid")
+            if PLATFORM.name == "windows" else app.get("lastPid")
+        )
         pid = lp if lp in live else (live[0] if live else None)
         port = app.get("port")
         configured_listeners = port_map.get(port, []) if port else []
@@ -1335,13 +1686,28 @@ def build_apps(cfg, listeners, groups=None):
         apps.append({
             "id": app["id"], "name": app["name"], "command": app["command"],
             "commandSpec": command_spec,
-            "runtimeIdentity": None,
+            "runtimeIdentity": app.get("runtimeIdentity"),
+            "lifecycleStatus": (
+                runtime_state["status"]
+                if runtime_state is not None
+                else ("running" if live else "stopped")
+            ),
+            "controlAvailable": (
+                runtime_state["controlAvailable"]
+                if runtime_state is not None else True
+            ),
+            "runtimeIssue": (
+                runtime_state["issue"] if runtime_state is not None else None
+            ),
             "importStatus": compatibility.get("status", "blocked"),
             "platformCompatibility": compatibility,
             "cwd": app.get("cwd"), "port": port,
             "emoji": app.get("emoji"), "glyph": app.get("glyph"), "icon": app.get("icon"),
             "favicon": app.get("favicon"),
-            "running": bool(live), "pid": pid,
+            "running": (
+                runtime_state["running"]
+                if runtime_state is not None else bool(live)
+            ), "pid": pid,
             "uptimeSec": ((snap.get(pid) or listener_snap.get(pid) or {}).get("etime")
                           if pid else None),
             "kind": app.get("kind") or "service",
@@ -1412,7 +1778,10 @@ def build_state(cfg, console_port, config_health=None):
     platform_name = platform_metadata.get("platform", PLATFORM.name)
     if platform_name == "windows":
         launch_instruction = "运行 python server.py 启动总控台。"
-        lifecycle_notice = "Windows 进程控制在当前阶段尚未启用。"
+        lifecycle_notice = (
+            "仅可控制由 Local Ops 创建且身份验证完整的 Windows Job；"
+            "当前项目不可控时请查看诊断。"
+        )
         shortcut_modifier = "Ctrl"
     else:
         launch_instruction = "运行 start.command 或打开总控台应用。"
@@ -1448,16 +1817,18 @@ def build_state(cfg, console_port, config_health=None):
 
 # ---------------------------------------------------------------- 状态快照缓存
 # 每次快照要跑约十余个 ps/lsof 子进程。TTL 略大于前端 2s 轮询周期：
-# 单标签页约每 2-3 轮重建一次，多标签页请求自动合并（锁内构建排队后
-# 第二个请求直接命中缓存）。配置/进程变更时 invalidate 立即失效。
+# 单标签页约每 2-3 轮重建一次，多标签页请求通过独立 build lock 合并。
+# cache lock 只保护元数据；配置/进程变更时 invalidate 立即失效。
 STATE_CACHE_TTL = 2.2  # 秒
 _state_cache_lock = threading.Lock()
-_state_cache = {"mono": 0.0, "state": None}
+_state_build_lock = threading.Lock()
+_state_cache = {"mono": 0.0, "state": None, "epoch": 0}
 
 
 def invalidate_state_cache():
     with _state_cache_lock:
         _state_cache["state"] = None
+        _state_cache["epoch"] = int(_state_cache.get("epoch", 0)) + 1
 
 
 def get_state_snapshot(cfg, console_port):
@@ -1466,10 +1837,27 @@ def get_state_snapshot(cfg, console_port):
         cached = _state_cache["state"]
         if cached is not None and now - _state_cache["mono"] < STATE_CACHE_TTL:
             return cached
-        state = build_state(cfg.snapshot(), console_port, cfg.health_info())
-        _state_cache["mono"] = time.monotonic()
-        _state_cache["state"] = state
-        return state
+    with _state_build_lock:
+        now = time.monotonic()
+        with _state_cache_lock:
+            cached = _state_cache["state"]
+            if cached is not None and now - _state_cache["mono"] < STATE_CACHE_TTL:
+                return cached
+
+        # Only an authenticated terminal receipt may mutate during reconciliation.
+        reconcile_windows_terminal_runtimes(cfg)
+        while True:
+            with _state_cache_lock:
+                epoch = int(_state_cache.get("epoch", 0))
+            config_snapshot = cfg.snapshot()
+            config_health = cfg.health_info()
+            state = build_state(config_snapshot, console_port, config_health)
+            with _state_cache_lock:
+                if epoch != int(_state_cache.get("epoch", 0)):
+                    continue
+                _state_cache["mono"] = time.monotonic()
+                _state_cache["state"] = state
+                return state
 
 
 def build_health(cfg):
@@ -1618,6 +2006,480 @@ def start_app(app):
     ))
     return (result.ok, result.error, result.process, result.group_id,
             result.token)
+
+
+def _windows_lifecycle_result(ok, *, code=None, pid=None,
+                              generation_id=None, status=None):
+    result = {"ok": bool(ok)}
+    if code:
+        error = lifecycle_error(code)
+        result.update({"code": error["code"], "error": error["message"]})
+    if pid is not None:
+        result["pid"] = pid
+    if generation_id is not None:
+        result["generationId"] = generation_id
+    if status is not None:
+        result["lifecycleStatus"] = status
+    return result
+
+
+def _windows_inspection_matches(identity, inspection):
+    """Accept inspection evidence only when it is bound to the exact identity."""
+    if not bool(getattr(inspection, "verified", False)):
+        return False
+    observed = getattr(inspection, "identity", None)
+    if observed is None:
+        return False
+    try:
+        return public_runtime_identity(observed, identity.app_id) == (
+            public_runtime_identity(identity, identity.app_id)
+        )
+    except (ConfigSchemaError, TypeError, ValueError):
+        return False
+
+
+def _windows_terminal_last_exit(app, inspection, *, manually_stopped=False):
+    """Map authenticated terminal receipt metadata to bounded product state."""
+    if manually_stopped:
+        if (app.get("kind") or "service") != "task":
+            return None
+        return {"status": "stopped", "code": None, "at": int(time.time())}
+    if not hasattr(inspection, "exit_code"):
+        return None
+    exit_code = getattr(inspection, "exit_code", None)
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        exit_code = None
+    updated_at = getattr(inspection, "updated_at", None)
+    if isinstance(updated_at, bool) or not isinstance(updated_at, (int, float)):
+        ended_at = int(time.time())
+    else:
+        ended_at = int(updated_at / 1000 if updated_at > 10_000_000_000
+                       else updated_at)
+    value = {"code": exit_code, "at": ended_at}
+    if (app.get("kind") or "service") == "task":
+        value["status"] = (
+            classify_task_exit(exit_code)
+            if exit_code is not None else "failed"
+        )
+    return value
+
+
+def _defer_windows_release(identity):
+    release_key = (str(identity.app_id), str(identity.generation_id))
+    with _WINDOWS_RELEASE_LOCK:
+        previous = _WINDOWS_PENDING_RELEASES.get(release_key) or {"attempts": 0}
+        attempts = int(previous["attempts"]) + 1
+        _WINDOWS_PENDING_RELEASES[release_key] = {
+            "attempts": attempts,
+            "nextAttempt": time.monotonic() + min(60.0, 2.0 ** min(attempts, 6)),
+            "identity": identity,
+        }
+
+
+def _release_windows_runtime_records(identity):
+    release_key = (str(identity.app_id), str(identity.generation_id))
+    with _WINDOWS_RELEASE_LOCK:
+        try:
+            release_managed = getattr(PLATFORM, "release_managed", None)
+            released = (
+                release_managed(identity) if release_managed is not None else None
+            )
+        except Exception:
+            LOG.exception(
+                "Windows runtime record cleanup failed: %s generation %s",
+                release_key[0], release_key[1],
+            )
+            released = None
+        if released is not None and bool(getattr(released, "ok", False)):
+            _WINDOWS_PENDING_RELEASES.pop(release_key, None)
+            return True
+        _defer_windows_release(identity)
+        LOG.warning(
+            "Windows runtime record cleanup deferred for app %s generation %s",
+            release_key[0], release_key[1],
+        )
+        return False
+
+
+def _abort_unpersisted_windows_runtime(identity):
+    """Abort and release only a generation proven absent from config."""
+    try:
+        aborted = PLATFORM.abort_managed(identity)
+    except Exception:
+        LOG.exception("Windows prepared Job abort failed: %s", identity.app_id)
+        _defer_windows_release(identity)
+        return False
+    if not bool(getattr(aborted, "ok", False)):
+        _defer_windows_release(identity)
+        return False
+    return _release_windows_runtime_records(identity)
+
+
+def _persist_windows_cleanup_identity(cfg, app_id, identity):
+    """Retain an ambiguous generation so restart reconciliation can finish it."""
+    try:
+        public = public_runtime_identity(identity, app_id)
+    except (ConfigSchemaError, TypeError, ValueError):
+        return False
+
+    def persist(_data, target):
+        target["runtimeIdentity"] = public
+        target["lastPid"] = None
+        target["lastPgid"] = None
+        target["runToken"] = None
+        target["attached"] = False
+        return True
+
+    try:
+        status, saved, _ = cfg.mutate_app_if_generation(
+            app_id, None, persist
+        )
+    except OSError:
+        return False
+    return status == "applied" and bool(saved)
+
+
+def _abort_or_retain_windows_runtime(cfg, app_id, identity):
+    """Clean an unpublished generation or durably retain its exact identity."""
+    with _WINDOWS_RELEASE_LOCK:
+        if _abort_unpersisted_windows_runtime(identity):
+            return True
+        return _persist_windows_cleanup_identity(cfg, app_id, identity)
+
+
+def _clear_windows_generation(cfg, app, inspection, *, manually_stopped=False):
+    generation_id = runtime_generation(app)
+    try:
+        identity = native_runtime_identity(app)
+    except (ConfigSchemaError, TypeError, ValueError):
+        return False, "invalid"
+    if identity is None:
+        return False, "invalid"
+    release_key = (str(identity.app_id), str(identity.generation_id))
+    with _WINDOWS_RELEASE_LOCK:
+        pending = _WINDOWS_PENDING_RELEASES.get(release_key)
+        if pending is not None and time.monotonic() < pending["nextAttempt"]:
+            return False, "cleanup_pending"
+        last_exit = _windows_terminal_last_exit(
+            app, inspection, manually_stopped=manually_stopped
+        )
+
+        def op(_data, target):
+            target["runtimeIdentity"] = None
+            target["lastPid"] = None
+            target["lastPgid"] = None
+            target["runToken"] = None
+            target["attached"] = False
+            if last_exit is not None:
+                target["lastExit"] = last_exit
+            return True
+
+        try:
+            status, cleared, _ = cfg.mutate_app_if_generation(
+                app["id"], generation_id, op
+            )
+        except OSError:
+            return False, "failed"
+        if status != "applied" or not cleared:
+            return False, status
+
+        if _release_windows_runtime_records(identity):
+            return True, status
+
+        # Keep the terminal identity when possible so a later state reconciliation
+        # can authenticate the same receipt and retry exact-generation cleanup.
+        public = public_runtime_identity(identity, app["id"])
+
+        def restore(_data, target):
+            target["runtimeIdentity"] = public
+            return True
+
+        try:
+            restore_status, restored, _ = cfg.mutate_app_if_generation(
+                app["id"], None, restore
+            )
+        except OSError:
+            restore_status, restored = "failed", False
+        return False, (
+            "cleanup_pending"
+            if restore_status == "applied" and restored else "cleanup_failed"
+        )
+
+
+def _retry_windows_pending_releases(cfg):
+    """Retry exact terminal cleanup, including records recovered after restart."""
+    if PLATFORM.name != "windows":
+        return
+    with _WINDOWS_RELEASE_LOCK:
+        persisted = {
+            (str(app.get("id")), str(runtime_generation(app)))
+            for app in cfg.snapshot().get("apps", [])
+            if runtime_generation(app) is not None
+        }
+        try:
+            recover = getattr(PLATFORM, "recover_managed_cleanups", None)
+            recovered = recover() if recover is not None else ()
+        except Exception:
+            LOG.exception("Windows terminal cleanup recovery failed")
+            recovered = ()
+        for identity in recovered:
+            key = (str(identity.app_id), str(identity.generation_id))
+            if key in persisted:
+                continue
+            _WINDOWS_PENDING_RELEASES.setdefault(key, {
+                "attempts": 0,
+                "nextAttempt": 0.0,
+                "identity": identity,
+            })
+        now = time.monotonic()
+        due = [
+            (key, value["identity"])
+            for key, value in _WINDOWS_PENDING_RELEASES.items()
+            if key not in persisted and now >= value["nextAttempt"]
+        ]
+        for key, identity in due:
+            current = _WINDOWS_PENDING_RELEASES.get(key)
+            if current is None:
+                continue
+            current_app = find_app(cfg.snapshot(), key[0])
+            if current_app is not None and runtime_generation(current_app) == key[1]:
+                # The identity was restored after an earlier release failure.
+                # Its authenticated terminal reconciliation owns the next CAS.
+                continue
+            _release_windows_runtime_records(identity)
+
+
+def _inspect_windows_terminal(identity):
+    """Return a verified terminal inspection, or None without guessing."""
+    try:
+        inspection = PLATFORM.inspect_managed(identity)
+    except Exception:
+        LOG.exception("Windows runtime reconciliation failed: %s", identity.app_id)
+        return None
+    if not _windows_inspection_matches(identity, inspection):
+        return None
+    members = tuple(getattr(inspection, "members", ()) or ())
+    status = getattr(inspection, "status", None)
+    if (not bool(getattr(inspection, "running", False))
+            and not members and status in ("exited", "failed")):
+        return inspection
+    return None
+
+
+def start_windows_app(cfg, app):
+    """Prepare, persist, activate, and verify one new Windows Job generation."""
+    if not bool(cfg.health_info().get("writable")):
+        return _windows_lifecycle_result(False, code="LAUNCH_COMMIT_FAILED")
+    generation_id = str(uuid.uuid4())
+    _ensure_private_dir(LOGS_DIR)
+    log_path = os.path.join(LOGS_DIR, "%s.log" % app["id"])
+    rotate_log_file(log_path)
+    cwd = app.get("cwd") or os.path.expanduser("~")
+    try:
+        command_spec = normalize_command_spec(app.get("commandSpec"))
+        # Revalidate the native boundary before the runner creates any process.
+        prepared_invocation(command_spec)
+        prepared = PLATFORM.launch(LaunchRequest(
+            app_id=app["id"],
+            command=app["command"],
+            cwd=cwd,
+            log_path=log_path,
+            command_spec=command_spec,
+            generation_id=generation_id,
+        ))
+    except Exception:
+        LOG.exception("Windows managed launch preparation failed: %s", app["id"])
+        return _windows_lifecycle_result(
+            False, code="LAUNCH_PREPARE_FAILED"
+        )
+    identity = getattr(prepared, "runtime_identity", None)
+    if not getattr(prepared, "ok", False) or identity is None:
+        if identity is not None:
+            _abort_or_retain_windows_runtime(cfg, app["id"], identity)
+        return _windows_lifecycle_result(False, code=(
+            prepared.code
+            if getattr(prepared, "code", None) in _LIFECYCLE_ERROR_MESSAGES
+            else "LAUNCH_PREPARE_FAILED"
+        ))
+    try:
+        public = public_runtime_identity(identity, app["id"])
+        if (public["generationId"] != generation_id
+                or getattr(prepared, "status", None) != "prepared"):
+            raise ConfigSchemaError("runner did not prepare the requested generation")
+    except (ConfigSchemaError, TypeError, ValueError):
+        _abort_or_retain_windows_runtime(cfg, app["id"], identity)
+        return _windows_lifecycle_result(False, code="LAUNCH_PREPARE_FAILED")
+
+    def persist(_data, target):
+        target["runtimeIdentity"] = public
+        target["lastPid"] = None
+        target["lastPgid"] = None
+        target["runToken"] = None
+        target["attached"] = False
+        if (target.get("kind") or "service") != "task":
+            target["lastExit"] = None
+        return True
+
+    try:
+        commit_status, saved, _ = cfg.mutate_app_if_generation(
+            app["id"], None, persist
+        )
+    except Exception:
+        commit_status, saved = "failed", False
+    config_writable = bool(cfg.health_info().get("writable"))
+    if commit_status != "applied" or not saved or not config_writable:
+        current = find_app(cfg.snapshot(), app["id"])
+        identity_was_persisted = (
+            current is not None
+            and runtime_generation(current) == generation_id
+        )
+        if identity_was_persisted:
+            try:
+                PLATFORM.abort_managed(identity)
+            except Exception:
+                LOG.exception("Windows launch rollback failed: %s", app["id"])
+        else:
+            _abort_or_retain_windows_runtime(cfg, app["id"], identity)
+        return _windows_lifecycle_result(False, code="LAUNCH_COMMIT_FAILED")
+
+    try:
+        activation = PLATFORM.activate_managed(identity)
+    except Exception:
+        LOG.exception("Windows managed activation response failed: %s", app["id"])
+        activation = None
+    try:
+        inspection = PLATFORM.inspect_managed(identity)
+    except Exception:
+        inspection = None
+    if inspection is not None and _windows_inspection_matches(identity, inspection):
+        members = tuple(getattr(inspection, "members", ()) or ())
+        inspection_status = getattr(inspection, "status", None)
+        if (bool(getattr(inspection, "running", False))
+                and members and inspection_status == "running"):
+            return _windows_lifecycle_result(
+                True,
+                pid=(getattr(activation, "process_id", None)
+                     or identity.root_pid),
+                generation_id=generation_id,
+                status="running",
+            )
+        if (not bool(getattr(inspection, "running", False))
+                and not members and inspection_status in ("exited", "failed")):
+            current = find_app(cfg.snapshot(), app["id"])
+            cleared = False
+            clear_status = "not_found"
+            if current is not None:
+                cleared, clear_status = _clear_windows_generation(
+                    cfg, current, inspection
+                )
+            if ((app.get("kind") or "service") == "task"
+                    and inspection_status == "exited" and cleared):
+                return _windows_lifecycle_result(
+                    True,
+                    pid=identity.root_pid,
+                    generation_id=generation_id,
+                    status="stopped",
+                )
+            if clear_status == "mismatch":
+                return _windows_lifecycle_result(
+                    False, code="GENERATION_MISMATCH"
+                )
+    # Resume may have reached the runner even when its response was lost. Keep
+    # the persisted identity so a later authenticated inspect can reconcile it.
+    return _windows_lifecycle_result(False, code="LAUNCH_ACTIVATE_FAILED")
+
+
+def stop_windows_app(cfg, app, *, force=False, timeout=APP_STOP_TIMEOUT_SEC):
+    """Stop only the authenticated Job and clear only the same generation."""
+    try:
+        identity = native_runtime_identity(app)
+    except (ConfigSchemaError, TypeError, ValueError):
+        return _windows_lifecycle_result(False, code="RUNTIME_IDENTITY_INVALID")
+    if identity is None:
+        return _windows_lifecycle_result(False, code="GENERATION_MISMATCH")
+    try:
+        before = PLATFORM.inspect_managed(identity)
+    except Exception:
+        before = None
+    if before is not None and _windows_inspection_matches(identity, before):
+        before_members = tuple(getattr(before, "members", ()) or ())
+        before_status = getattr(before, "status", None)
+        if (not bool(getattr(before, "running", False))
+                and not before_members and before_status in ("exited", "failed")):
+            cleared, cas_status = _clear_windows_generation(
+                cfg, app, before, manually_stopped=True
+            )
+            if cleared:
+                return _windows_lifecycle_result(
+                    True,
+                    generation_id=identity.generation_id,
+                    status="stopped",
+                )
+            return _windows_lifecycle_result(
+                False,
+                code=("GENERATION_MISMATCH" if cas_status == "mismatch"
+                      else "RUNTIME_CONTROL_FAILED"),
+            )
+        controllable_statuses = (
+            ("running", "stopping") if force else ("running",)
+        )
+        if not (bool(getattr(before, "running", False))
+                and before_members and before_status in controllable_statuses):
+            return _windows_lifecycle_result(
+                False, code="RUNTIME_IDENTITY_UNVERIFIED"
+            )
+    else:
+        return _windows_lifecycle_result(
+            False, code="RUNTIME_IDENTITY_UNVERIFIED"
+        )
+    try:
+        result = PLATFORM.stop_managed(
+            identity, force=bool(force), timeout=float(timeout)
+        )
+    except Exception:
+        LOG.exception("Windows managed stop failed: %s", app["id"])
+        result = None
+    terminal = _inspect_windows_terminal(identity)
+    if terminal is not None:
+        cleared, cas_status = _clear_windows_generation(
+            cfg, app, terminal, manually_stopped=True
+        )
+        if cleared:
+            return _windows_lifecycle_result(
+                True,
+                generation_id=identity.generation_id,
+                status="stopped",
+            )
+        return _windows_lifecycle_result(
+            False,
+            code=("GENERATION_MISMATCH" if cas_status == "mismatch"
+                  else "RUNTIME_CONTROL_FAILED"),
+        )
+    code = getattr(result, "code", None)
+    if (code == "STOP_TIMEOUT"
+            or bool(getattr(result, "still_running", False))
+            or getattr(result, "status", None) in ("running", "stopping")):
+        return _windows_lifecycle_result(False, code="STOP_TIMEOUT")
+    if code in _LIFECYCLE_ERROR_MESSAGES:
+        return _windows_lifecycle_result(False, code=code)
+    return _windows_lifecycle_result(False, code="RUNTIME_CONTROL_FAILED")
+
+
+def reconcile_windows_terminal_runtimes(cfg):
+    """Clear only authenticated terminal receipts for the exact persisted generation."""
+    if PLATFORM.name != "windows":
+        return
+    _retry_windows_pending_releases(cfg)
+    for app in cfg.snapshot().get("apps", []):
+        if app.get("runtimeIdentity") is None:
+            continue
+        try:
+            identity = native_runtime_identity(app)
+        except (ConfigSchemaError, TypeError, ValueError):
+            continue
+        terminal = _inspect_windows_terminal(identity)
+        if terminal is not None:
+            _clear_windows_generation(cfg, app, terminal)
 
 
 def startup_failure_message(app_id, code):
@@ -2907,7 +3769,12 @@ def serialized_app_operation(fn):
     def wrapped(self, app_id, *args, **kwargs):
         lock = self.server.try_app_operation(app_id)
         if lock is None:
-            self.send_err(409, "该应用正在执行其他操作，请稍后重试")
+            self.discard_body()
+            self.send_err(
+                409,
+                "该应用正在执行其他操作，请稍后重试",
+                "APP_OPERATION_IN_PROGRESS",
+            )
             return None
         try:
             return fn(self, app_id, *args, **kwargs)
@@ -3190,6 +4057,62 @@ class Handler(BaseHTTPRequestHandler):
             return None, None
         return cfg, app
 
+    def _read_json_request(self):
+        data, error = self.read_json_body()
+        if error:
+            self.send_err(400, error, "INVALID_REQUEST")
+            return None
+        return data
+
+    def _expected_generation(self, data):
+        expected, error = normalize_expected_generation(
+            data, required=PLATFORM.name == "windows")
+        if error:
+            self.send_err(400, error, "GENERATION_REQUIRED")
+            return False, None
+        return True, expected
+
+    def _generation_matches(self, app, expected_generation):
+        if PLATFORM.name != "windows":
+            return True
+        if runtime_generation(app) == expected_generation:
+            return True
+        self.send_err(
+            409,
+            "应用运行代次已变化，请刷新状态后重试",
+            "GENERATION_MISMATCH",
+        )
+        return False
+
+    def _send_app_cas_failure(self, status):
+        if status == "not_found":
+            self.send_err(404, "应用不存在")
+        else:
+            self.send_err(
+                409,
+                "应用运行代次已变化，请刷新状态后重试",
+                "GENERATION_MISMATCH",
+            )
+
+    def _send_windows_lifecycle_result(self, result):
+        if result.get("ok"):
+            self.send_json(result)
+            return
+        code = result.get("code") or "RUNTIME_CONTROL_FAILED"
+        status = {
+            "GENERATION_REQUIRED": 400,
+            "GENERATION_MISMATCH": 409,
+            "RUNTIME_IDENTITY_INVALID": 409,
+            "RUNTIME_IDENTITY_UNVERIFIED": 409,
+            "RUNTIME_RECORD_INSECURE": 409,
+            "LAUNCH_PREPARE_FAILED": 500,
+            "LAUNCH_COMMIT_FAILED": 409,
+            "LAUNCH_ACTIVATE_FAILED": 500,
+            "STOP_TIMEOUT": 409,
+            "RUNTIME_CONTROL_FAILED": 500,
+        }.get(code, 500)
+        self.send_json(result, status)
+
     # ---------- GET ----------
 
     def do_GET(self):
@@ -3349,15 +4272,12 @@ class Handler(BaseHTTPRequestHandler):
             if m:
                 app_id, action = m.group(1), m.group(2)
                 if action == "start":
-                    self.discard_body()
                     self.handle_app_start(app_id)
                     return
                 if action == "stop":
-                    self.discard_body()
                     self.handle_app_stop(app_id)
                     return
                 if action == "restart":
-                    self.discard_body()
                     self.handle_app_restart(app_id)
                     return
                 if action == "diagnose":
@@ -3796,13 +4716,40 @@ class Handler(BaseHTTPRequestHandler):
 
     @serialized_app_operation
     def handle_app_start(self, app_id):
+        if (PLATFORM.name != "windows"
+                and int(self.headers.get("Content-Length") or 0) == 0):
+            data = {}
+        else:
+            data = self._read_json_request()
+            if data is None:
+                return
         if not self._require_capability(
                 "launch_managed", "当前平台或阶段未启用应用启动"):
+            return
+        valid, expected_generation = self._expected_generation(data)
+        if not valid:
             return
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
-        if app_alive_sign(app):
+        if not self._generation_matches(app, expected_generation):
+            return
+        if PLATFORM.name == "windows" and expected_generation is not None:
+            self.send_err(
+                409,
+                "应用已有受管运行代次，请刷新状态后重试",
+                "GENERATION_MISMATCH",
+            )
+            return
+        if (PLATFORM.name == "windows"
+                and app.get("runtimeIdentity") is not None):
+            self.send_err(
+                409,
+                "应用已有受管运行代次，请刷新状态后重试",
+                "GENERATION_MISMATCH",
+            )
+            return
+        if PLATFORM.name != "windows" and app_alive_sign(app):
             self.send_json({"ok": False, "error": "应用已在运行"})
             return
         health = inspect_app_health(app)
@@ -3819,6 +4766,11 @@ class Handler(BaseHTTPRequestHandler):
         if occupied:
             self.send_json({"ok": False, "error": "端口 %d 已被 PID %d 占用" %
                             (port, occupied[0][0])}, 409)
+            return
+        if PLATFORM.name == "windows":
+            self._send_windows_lifecycle_result(
+                start_windows_app(self.server.cfg, app)
+            )
             return
         ok, err, proc, pgid, token = start_app(app)
         if not ok:
@@ -3846,11 +4798,43 @@ class Handler(BaseHTTPRequestHandler):
 
     @serialized_app_operation
     def handle_app_stop(self, app_id):
+        if (PLATFORM.name != "windows"
+                and int(self.headers.get("Content-Length") or 0) == 0):
+            data = {}
+        else:
+            data = self._read_json_request()
+            if data is None:
+                return
+        force = data.get("force", False)
+        if not isinstance(force, bool):
+            self.send_err(400, "force 必须是布尔值", "INVALID_REQUEST")
+            return
         if not self._require_capability(
                 "stop_managed", "当前平台或阶段未启用应用停止"):
             return
+        if force and not self._require_capability(
+                "force_stop_managed", "当前平台或阶段未启用强制停止"):
+            return
+        valid, expected_generation = self._expected_generation(data)
+        if not valid:
+            return
         _, app = self._get_app_or_404(app_id)
         if app is None:
+            return
+        if not self._generation_matches(app, expected_generation):
+            return
+        if PLATFORM.name == "windows":
+            if app.get("runtimeIdentity") is None:
+                self.send_err(409, "应用未在运行")
+                return
+            self._send_windows_lifecycle_result(
+                stop_windows_app(
+                    self.server.cfg,
+                    app,
+                    force=force,
+                    timeout=APP_STOP_TIMEOUT_SEC,
+                )
+            )
             return
         if not app_alive_sign(app):
             self.send_json({"ok": False, "error": "应用未在运行"})
@@ -3890,15 +4874,31 @@ class Handler(BaseHTTPRequestHandler):
 
     @serialized_app_operation
     def handle_app_restart(self, app_id):
+        if (PLATFORM.name != "windows"
+                and int(self.headers.get("Content-Length") or 0) == 0):
+            data = {}
+        else:
+            data = self._read_json_request()
+            if data is None:
+                return
         if not (self._require_capability(
                 "stop_managed", "当前平台或阶段未启用应用重启")
                 and self._require_capability(
                     "launch_managed", "当前平台或阶段未启用应用重启")):
             return
+        valid, expected_generation = self._expected_generation(data)
+        if not valid:
+            return
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
-        if not app_alive_sign(app):
+        if not self._generation_matches(app, expected_generation):
+            return
+        if (PLATFORM.name == "windows"
+                and app.get("runtimeIdentity") is None):
+            self.send_err(409, "应用未在运行")
+            return
+        if PLATFORM.name != "windows" and not app_alive_sign(app):
             self.send_err(409, "应用未在运行")
             return
         # 必须在停止旧服务前预检；配置已失效时保留仍在工作的旧进程。
@@ -3911,6 +4911,38 @@ class Handler(BaseHTTPRequestHandler):
                          (issue["title"], issue["detail"]),
                 "health": health,
             }, 422)
+            return
+
+        if PLATFORM.name == "windows":
+            stopped = stop_windows_app(
+                self.server.cfg,
+                app,
+                force=False,
+                timeout=APP_STOP_TIMEOUT_SEC,
+            )
+            if not stopped.get("ok"):
+                self._send_windows_lifecycle_result(stopped)
+                return
+            port = app.get("port")
+            occupied = [
+                (pid, item_port)
+                for pid, item_port in scan_listeners()
+                if item_port == port
+            ] if port else []
+            if occupied:
+                self.send_err(
+                    409,
+                    "端口 %d 已被 PID %d 占用，旧应用已停止" %
+                    (port, occupied[0][0]),
+                )
+                return
+            current = find_app(self.server.cfg.snapshot(), app_id)
+            if current is None:
+                self.send_err(404, "应用已被删除")
+                return
+            self._send_windows_lifecycle_result(
+                start_windows_app(self.server.cfg, current)
+            )
             return
 
         stopped, error = stop_app_and_clear(self.server.cfg, app)
@@ -4000,11 +5032,18 @@ class Handler(BaseHTTPRequestHandler):
                 return
             operation_lock = self.server.try_app_operation(m.group(1))
             if operation_lock is None:
-                self.send_err(409, "该应用正在执行其他操作，请稍后重试")
+                self.discard_body()
+                self.send_err(
+                    409,
+                    "该应用正在执行其他操作，请稍后重试",
+                    "APP_OPERATION_IN_PROGRESS",
+                )
                 return
-            data, err = self.read_json_body()
-            if err:
-                self.send_err(400, err)
+            data = self._read_json_request()
+            if data is None:
+                return
+            valid, expected_generation = self._expected_generation(data)
+            if not valid:
                 return
             stop_before_update = data.get("stopBeforeUpdate", False)
             if not isinstance(stop_before_update, bool):
@@ -4012,6 +5051,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             _, app = self._get_app_or_404(m.group(1))
             if app is None:
+                return
+            if not self._generation_matches(app, expected_generation):
                 return
             fields, err = validate_app_fields(data, partial=True)
             if err:
@@ -4028,7 +5069,35 @@ class Handler(BaseHTTPRequestHandler):
                 key in fields and fields[key] != app.get(key)
                 for key in lifecycle_fields)
             stopped_for_update = False
-            if lifecycle_changed and app_alive_sign(app):
+            if (PLATFORM.name == "windows" and lifecycle_changed
+                    and app.get("runtimeIdentity") is not None):
+                if not self._require_capability(
+                        "stop_managed",
+                        "当前平台或阶段禁止修改运行中应用的生命周期配置"):
+                    return
+                if not stop_before_update:
+                    stop_label = ("中止任务"
+                                  if (app.get("kind") or "service") == "task"
+                                  else "停止服务")
+                    self.send_json({
+                        "ok": False,
+                        "error": "应用正在运行，请先在当前编辑面板%s；填写内容会保留" %
+                                 stop_label,
+                        "requiresStop": True,
+                    }, 409)
+                    return
+                stopped = stop_windows_app(
+                    self.server.cfg,
+                    app,
+                    force=False,
+                    timeout=APP_STOP_TIMEOUT_SEC,
+                )
+                if not stopped.get("ok"):
+                    self._send_windows_lifecycle_result(stopped)
+                    return
+                stopped_for_update = True
+            elif (PLATFORM.name != "windows" and lifecycle_changed
+                  and app_alive_sign(app)):
                 if not self._require_capability(
                         "stop_managed",
                         "当前平台或阶段禁止修改运行中应用的生命周期配置"):
@@ -4050,15 +5119,31 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_err(409, stop_error)
                     return
 
-            def op(c):
-                target = find_app(c, m.group(1))
+            def op(c, target):
                 target.update(fields)
                 if "commandSpec" in fields or "cwd" in fields:
                     target["importStatus"] = command_import_status(
                         target["commandSpec"], target.get("cwd"))
                 return dict(target)
 
-            updated = self.server.cfg.update(op)
+            mutation_generation = (
+                None
+                if PLATFORM.name == "windows" and stopped_for_update
+                else expected_generation
+            )
+            if PLATFORM.name == "windows":
+                cas_status, updated, _ = (
+                    self.server.cfg.mutate_app_if_generation(
+                        m.group(1), mutation_generation, op
+                    )
+                )
+                if cas_status != "applied":
+                    self._send_app_cas_failure(cas_status)
+                    return
+            else:
+                updated = self.server.cfg.update(
+                    lambda c: op(c, find_app(c, m.group(1)))
+                )
             if stopped_for_update:
                 updated = dict(updated)
                 updated["stoppedForUpdate"] = True
@@ -4075,14 +5160,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         try:
-            if not self.authorize_request(mutating=True):
-                return
             path = urllib.parse.urlparse(self.path).path
             m = APP_ROUTE_RE.match(path)
             if not m:
+                if not self.authorize_request(mutating=True):
+                    return
                 self.send_err(404, "接口不存在")
                 return
             app_id, action = m.group(1), m.group(2)
+            content_kind = (
+                "json"
+                if action is None and PLATFORM.name == "windows" else None
+            )
+            if not self.authorize_request(
+                    mutating=True, content_kind=content_kind):
+                return
             if action is None:
                 self.handle_app_delete(app_id)
                 return
@@ -4102,10 +5194,38 @@ class Handler(BaseHTTPRequestHandler):
 
     @serialized_app_operation
     def handle_app_delete(self, app_id):
+        if (PLATFORM.name != "windows"
+                and int(self.headers.get("Content-Length") or 0) == 0):
+            data = {}
+        else:
+            data = self._read_json_request()
+            if data is None:
+                return
+        valid, expected_generation = self._expected_generation(data)
+        if not valid:
+            return
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
-        if app_running(app):
+        if not self._generation_matches(app, expected_generation):
+            return
+        stopped_for_delete = False
+        if (PLATFORM.name == "windows"
+                and app.get("runtimeIdentity") is not None):
+            if not self._require_capability(
+                    "stop_managed", "当前平台或阶段禁止删除运行中的应用"):
+                return
+            stopped = stop_windows_app(
+                self.server.cfg,
+                app,
+                force=False,
+                timeout=APP_STOP_TIMEOUT_SEC,
+            )
+            if not stopped.get("ok"):
+                self._send_windows_lifecycle_result(stopped)
+                return
+            stopped_for_delete = True
+        elif PLATFORM.name != "windows" and app_running(app):
             if not self._require_capability(
                     "stop_managed", "当前平台或阶段禁止删除运行中的应用"):
                 return
@@ -4114,15 +5234,29 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_err(409, "删除已取消：%s" %
                               (error or "应用未能正常退出"))
                 return
+            stopped_for_delete = True
 
-        def op(c):
+        def op(c, target):
             before = len(c["apps"])
             c["apps"] = [a for a in c["apps"] if a.get("id") != app_id]
             return len(c["apps"]) != before
 
-        if not self.server.cfg.update(op):
-            self.send_err(404, "应用不存在")
-            return
+        if PLATFORM.name == "windows":
+            cas_status, deleted, _ = self.server.cfg.mutate_app_if_generation(
+                app_id,
+                None if stopped_for_delete else expected_generation,
+                op,
+            )
+            if cas_status != "applied":
+                self._send_app_cas_failure(cas_status)
+                return
+        else:
+            deleted = self.server.cfg.update(
+                lambda c: op(c, find_app(c, app_id))
+            )
+            if not deleted:
+                self.send_err(404, "应用不存在")
+                return
         self.server.forget_app_lock(app_id)
 
         for ext in ICON_EXTS:

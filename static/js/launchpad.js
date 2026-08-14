@@ -7,9 +7,11 @@ import { $, el, setText, setChildren, setKpi, setKpiUnit, icon, iconBtn, escapeH
   state, findApp, fmtUptime, fmtDuration, taskExitStatus,
   localServiceUrl, hasCapability, platformPresentation,
   currentPlatform } from './core.js';
-import { openConfirm, openAppModal, openLogs, getIconVer } from './overlays.js';
+import { openConfirm, openAppModal, openLogs, getIconVer,
+  refreshLifecycleState, offerForceStopAfterTimeout } from './overlays.js';
 import { configuredPort, actualPorts, hasPortMismatch,
   preferredOpenPort, displayedPorts, portIsOpenable } from './ports.js';
+import { lifecyclePayload, lifecycleSnapshot, runLifecycleMutation } from './lifecycle.js';
 
 const svcGrid = $('#svcGrid'), taskGrid = $('#taskGrid');
 const reorderStatus = $('#reorderStatus');
@@ -209,13 +211,19 @@ function createAppCard() {
 }
 
 /* 主按钮：服务 = 启动/停止；批处理 = 运行/中止。 */
-function setPrimary(btn, running, kind) {
-  const sig = running + '|' + kind;
+function setPrimary(btn, running, kind, lifecycleState = '') {
+  const sig = running + '|' + kind + '|' + lifecycleState;
   if (btn._sig === sig) return;
   btn._sig = sig;
-  const label = running ? (kind === 'task' ? '中止' : '停止')
-    : (kind === 'task' ? '运行' : '启动');
-  setChildren(btn, icon(running ? 'square' : 'play', 13));
+  const label = lifecycleState === 'starting' ? '启动中'
+    : lifecycleState === 'stopping' ? '停止中'
+      : lifecycleState === 'unavailable' ? '不可用'
+        : running ? (kind === 'task' ? '中止' : '停止')
+          : (kind === 'task' ? '运行' : '启动');
+  const glyph = lifecycleState === 'starting' || lifecycleState === 'stopping'
+    ? 'clock' : lifecycleState === 'unavailable' ? 'power'
+      : running ? 'square' : 'play';
+  setChildren(btn, icon(glyph, 13));
   btn.appendChild(document.createTextNode(label));
   btn.classList.toggle('btn-stop', running);
   btn.classList.toggle('btn-accent', !running);
@@ -270,6 +278,7 @@ function updateAppCard(card, app) {
   /* 状态副行：运行态、端口冲突，以及服务/任务上次退出结果。 */
   const kind = app.kind || 'service';
   const isTask = kind === 'task';
+  const lifecycle = lifecycleSnapshot(app, currentPlatform());
   const taskStatus = isTask && app.lastExit ? taskExitStatus(app.lastExit) : '';
   const taskFinished = isTask && !app.running && !!app.lastExit;
   const taskFailed = taskFinished && taskStatus === 'failed';
@@ -285,11 +294,21 @@ function updateAppCard(card, app) {
   const portMismatch = hasPortMismatch(app);
   r.dot.classList.toggle('running', !!app.running);
   r.dot.classList.toggle('success', taskSucceeded);
-  r.dot.classList.toggle('danger', taskFailed);
+  r.dot.classList.toggle('danger', taskFailed || lifecycle.uncertain);
   let stTxt = app.running ? '运行中' : (app.port ? '已停止' : '未运行');
   let stFail = false;
   let taskHistoryText = '';
-  if (app.portConflict) {
+  if (lifecycle.status === 'starting') {
+    stTxt = '启动中';
+  } else if (lifecycle.status === 'stopping') {
+    stTxt = '停止中';
+  } else if (lifecycle.status === 'orphaned') {
+    stTxt = '运行身份无法验证';
+    stFail = true;
+  } else if (lifecycle.status === 'unknown') {
+    stTxt = '运行状态待确认';
+    stFail = true;
+  } else if (app.portConflict) {
     stTxt = '配置冲突';
     stFail = true;
   } else if (app.portOccupied) {
@@ -384,10 +403,16 @@ function updateAppCard(card, app) {
     r.stUp.hidden = true;
     setText(r.stUp, '');
   }
-  setPrimary(r.primary, !!app.running, kind);
+  const primaryState = lifecycle.busy ? lifecycle.status
+    : lifecycle.uncertain || (!lifecycle.canStart && !lifecycle.canManage)
+      ? 'unavailable' : '';
+  setPrimary(r.primary, !!app.running, kind, primaryState);
   const appName = app.name || (isTask ? '任务' : '应用');
-  const primaryVerb = app.running ? (isTask ? '中止' : '停止')
-    : (isTask ? '运行' : '启动');
+  const primaryVerb = primaryState === 'starting' ? '启动中'
+    : primaryState === 'stopping' ? '停止中'
+      : primaryState === 'unavailable' ? '控制不可用'
+        : app.running ? (isTask ? '中止' : '停止')
+          : (isTask ? '运行' : '启动');
   r.primary.setAttribute('aria-label', primaryVerb + ' ' + appName);
   r.copy.setAttribute('aria-label', '复制 ' + appName + ' 的链接');
   r.logs.setAttribute('aria-label', (taskFailed ? '查看失败日志：' : '查看日志：') + appName);
@@ -399,9 +424,10 @@ function updateAppCard(card, app) {
   card.setAttribute('aria-label', appName + '，' + stTxt);
   const canLaunch = hasCapability('launch_managed');
   const canStop = hasCapability('stop_managed');
-  const canToggle = app.running ? canStop : canLaunch;
-  r.restart.hidden = !app.running || kind !== 'service' || !canStop || !canLaunch;
-  r.del.disabled = !!app.running && !canStop;
+  const canToggle = lifecycle.canManage ? canStop
+    : lifecycle.canStart ? canLaunch : false;
+  r.restart.hidden = !lifecycle.canManage || kind !== 'service' || !canStop || !canLaunch;
+  r.del.disabled = !lifecycle.canDelete || (lifecycle.canManage && !canStop);
   r.del.title = r.del.disabled ? platformPresentation().lifecycleNotice : '删除';
   const blocked = !canToggle || (!app.running &&
     (!!app.portConflict || !!app.portOccupied || !!healthIssue || platformBlocked));
@@ -409,7 +435,8 @@ function updateAppCard(card, app) {
   const compatibilityReason = compatibility && Array.isArray(compatibility.reasons)
     ? compatibility.reasons.map(reason => reason && reason.message).filter(Boolean).join('；')
     : '';
-  r.primary.title = !canToggle ? platformPresentation().lifecycleNotice
+  const runtimeIssue = app.runtimeIssue && (app.runtimeIssue.message || app.runtimeIssue.detail);
+  r.primary.title = !canToggle ? runtimeIssue || platformPresentation().lifecycleNotice
     : app.portConflict
     ? '端口配置重复，请先编辑其中一项'
     : app.portOccupied ? '端口已被其他进程占用；可打开端口诊断或修改当前卡片端口'
@@ -419,20 +446,23 @@ function updateAppCard(card, app) {
     && (isTask ? taskStatus === 'failed' : app.lastExit.code !== 0);
   card.classList.toggle('running', !!app.running);
   card.classList.toggle('has-error', !!app.portConflict || !!app.portOccupied
-    || portMismatch || launchFailed || !!healthIssue);
-  r.diag.hidden = !launchFailed && !healthIssue;
+    || portMismatch || launchFailed || !!healthIssue || lifecycle.uncertain);
+  r.diag.hidden = !launchFailed && !healthIssue && !lifecycle.uncertain;
   updateCardGlow(card, app);
   r.logs.classList.toggle('attention', taskFailed);
   r.logs.title = taskFailed ? '查看失败日志' : '日志';
   maybeFetchFavicon(card, app);
 }
 
-async function toggleApp(id, button) {
+async function toggleApp(id, button, capturedIntent) {
   const app = findApp(id);
   if (!app) return;
   const isTask = (app.kind || 'service') === 'task';
-  const capability = app.running ? 'stop_managed' : 'launch_managed';
-  if (!hasCapability(capability)) {
+  const intent = capturedIntent || lifecycleSnapshot(app, currentPlatform());
+  const starting = intent.status === 'stopped';
+  const capability = starting ? 'launch_managed' : 'stop_managed';
+  if ((!starting && !intent.canManage) || (starting && !intent.canStart)
+      || !hasCapability(capability)) {
     toast(platformPresentation().lifecycleNotice);
     return;
   }
@@ -445,7 +475,6 @@ async function toggleApp(id, button) {
     toast('端口已被 PID ' + (app.portOccupiedPid || '?') + ' 占用');
     return;
   }
-  const starting = !app.running;
   if (button) {
     button.dataset.busy = 'true';
     button.disabled = true;
@@ -455,31 +484,37 @@ async function toggleApp(id, button) {
     ? (isTask ? '正在运行 ' : '正在启动 ') + targetName + '…'
     : (isTask ? '正在中止 ' : '正在停止 ') + targetName + '…');
   try {
-    const result = await act(post('/api/apps/' + id + '/' + (starting ? 'start' : 'stop')));
+    const { result, stateIsFresh } = await runLifecycleMutation(
+      () => act(post(
+        '/api/apps/' + id + '/' + (starting ? 'start' : 'stop'),
+        lifecyclePayload(intent, starting ? {} : { force: false }),
+      )),
+      refreshLifecycleState,
+    );
     if (result && result.ok !== false) {
       if (starting) {
         toast(isTask
           ? targetName + '已开始运行'
           : '启动命令已执行，正在等待' + (app.port ? ' :' + app.port : '服务'));
-        await window.__poll();
         setTimeout(window.__poll, 700);
         setTimeout(window.__poll, 1800);
       } else {
-        await window.__poll();
         toast((isTask ? '已中止 ' : '已停止 ') + targetName);
       }
-    } else {
-      await window.__poll();
+    } else if (!starting) {
+      offerForceStopAfterTimeout(result, intent, id, targetName, stateIsFresh);
     }
   } finally {
     if (button) {
       delete button.dataset.busy;
       const latest = findApp(id);
-      const latestCapability = latest && latest.running ? 'stop_managed' : 'launch_managed';
+      const latestLifecycle = lifecycleSnapshot(latest, currentPlatform());
+      const latestCapability = latestLifecycle.canManage ? 'stop_managed' : 'launch_managed';
       const latestCompatibility = latest && latest.platformCompatibility;
       const incompatible = currentPlatform() === 'windows' && latestCompatibility &&
         (latestCompatibility.status === 'needs_review' || latestCompatibility.status === 'blocked');
-      button.disabled = !latest || !hasCapability(latestCapability) || !!(!latest.running &&
+      button.disabled = !latest || (!latestLifecycle.canManage && !latestLifecycle.canStart)
+        || !hasCapability(latestCapability) || !!(!latest.running &&
         (latest.portConflict || latest.portOccupied || incompatible ||
           (latest.health && latest.health.blocking)));
     }
@@ -488,7 +523,8 @@ async function toggleApp(id, button) {
 export { toggleApp };
 
 function confirmRestartApp(app) {
-  if (!hasCapability('stop_managed') || !hasCapability('launch_managed')) {
+  const intent = lifecycleSnapshot(app, currentPlatform());
+  if (!intent.canManage || !hasCapability('stop_managed') || !hasCapability('launch_managed')) {
     toast(platformPresentation().lifecycleNotice);
     return;
   }
@@ -498,19 +534,28 @@ function confirmRestartApp(app) {
       '<div class="confirm-detail">总控台会等待旧进程完全退出，然后使用当前配置重新启动。</div>',
     okText: '重新启动',
     onOk: async () => {
-      if (!hasCapability('stop_managed') || !hasCapability('launch_managed')) {
+      if (!intent.canManage || !hasCapability('stop_managed') || !hasCapability('launch_managed')) {
         toast(platformPresentation().lifecycleNotice);
         return;
       }
-      const r = await act(post('/api/apps/' + app.id + '/restart'));
-      if (r && r.ok !== false) toast('已重启 ' + (app.name || '应用'));
-      window.__poll();
+      const { result: r, stateIsFresh } = await runLifecycleMutation(
+        () => act(post('/api/apps/' + app.id + '/restart', lifecyclePayload(intent))),
+        refreshLifecycleState,
+      );
+      if (r && r.ok !== false) {
+        toast('已重启 ' + (app.name || '应用'));
+      } else {
+        offerForceStopAfterTimeout(r, intent, app.id, app.name, stateIsFresh, () => {
+          toast('已强制停止，请再次启动应用');
+        });
+      }
     },
   });
 }
 
 function confirmDeleteApp(app) {
-  if (app.running && !hasCapability('stop_managed')) {
+  const intent = lifecycleSnapshot(app, currentPlatform());
+  if (!intent.canDelete || (intent.canManage && !hasCapability('stop_managed'))) {
     toast(platformPresentation().lifecycleNotice);
     return;
   }
@@ -521,12 +566,19 @@ function confirmDeleteApp(app) {
       '删除其图标与日志。</div>',
     okText: '删除',
     onOk: async () => {
-      if (app.running && !hasCapability('stop_managed')) {
+      if (!intent.canDelete || (intent.canManage && !hasCapability('stop_managed'))) {
         toast(platformPresentation().lifecycleNotice);
         return;
       }
-      await act(del('/api/apps/' + app.id));
-      window.__poll();
+      const { result, stateIsFresh } = await runLifecycleMutation(
+        () => act(del('/api/apps/' + app.id, lifecyclePayload(intent))),
+        refreshLifecycleState,
+      );
+      if (intent.canManage) {
+        offerForceStopAfterTimeout(result, intent, app.id, app.name, stateIsFresh, () => {
+          toast('已强制停止，请再次确认删除');
+        });
+      }
     },
   });
 }
@@ -556,6 +608,8 @@ function setDiagRow(row, node, value) {
 function openPortDiagnostic(app) {
   diagCurrentApp = app;
   const owner = app.portOwner || null;
+  const managedOwner = owner && owner.appId ? findApp(owner.appId) : null;
+  const ownerLifecycle = lifecycleSnapshot(managedOwner, currentPlatform());
   const conflict = !!app.portConflict;
   const occupied = !!app.portOccupied;
   portDiagTitle.textContent = '端口 ' + (app.port || '--') + ' 诊断';
@@ -581,7 +635,8 @@ function openPortDiagnostic(app) {
   } else if (owner && owner.currentUser) {
     const ownerLabel = owner.project || owner.appName || owner.name || ('PID ' + owner.pid);
     const canControlOwner = owner.appId
-      ? hasCapability('stop_managed') : hasCapability('kill_external');
+      ? hasCapability('stop_managed') && ownerLifecycle.canManage
+      : hasCapability('kill_external');
     const canAttach = hasCapability('attach_external');
     diagNote.textContent = !canControlOwner && !canAttach
       ? '当前平台仅展示监听者“' + ownerLabel + '”。你可以创建未认领的启动卡片、' +
@@ -605,7 +660,8 @@ function openPortDiagnostic(app) {
     && owner.pid !== (state.data && state.data.consolePid));
   diagEdit.hidden = !(conflict || occupied);
   const canControlOwner = owner && owner.appId
-    ? hasCapability('stop_managed') : hasCapability('kill_external');
+    ? hasCapability('stop_managed') && ownerLifecycle.canManage
+    : hasCapability('kill_external');
   diagKill.hidden = !canControlOwner || !(occupied && owner && owner.currentUser
     && owner.pid !== (state.data && state.data.consolePid));
   diagKill.textContent = owner && owner.appId ? '停止占用应用' : '结束占用进程';
@@ -686,7 +742,9 @@ diagKill.addEventListener('click', () => {
   const owner = app && app.portOwner;
   if (!owner) return;
   const capability = owner.appId ? 'stop_managed' : 'kill_external';
-  if (!hasCapability(capability)) {
+  const managedApp = owner.appId ? findApp(owner.appId) : null;
+  const intent = lifecycleSnapshot(managedApp, currentPlatform());
+  if (!hasCapability(capability) || (owner.appId && !intent.canManage)) {
     toast(platformPresentation().lifecycleNotice);
     return;
   }
@@ -698,13 +756,29 @@ diagKill.addEventListener('click', () => {
       ' · ' + escapeHtml(owner.name || '') + '</div>',
     okText: owner.appId ? '停止应用' : '结束进程',
     onOk: async () => {
-      if (!hasCapability(capability)) {
+      if (!hasCapability(capability) || (owner.appId && !intent.canManage)) {
         toast(platformPresentation().lifecycleNotice);
         return;
       }
-      if (owner.appId) await act(post('/api/apps/' + owner.appId + '/stop'));
-      else await act(post('/api/kill', { pid: owner.pid, force: false }));
-      window.__poll();
+      if (owner.appId) {
+        const { result, stateIsFresh } = await runLifecycleMutation(
+          () => act(post(
+            '/api/apps/' + owner.appId + '/stop',
+            lifecyclePayload(intent, { force: false }),
+          )),
+          refreshLifecycleState,
+        );
+        offerForceStopAfterTimeout(
+          result,
+          intent,
+          owner.appId,
+          (managedApp && managedApp.name) || owner.appName,
+          stateIsFresh,
+        );
+      } else {
+        await act(post('/api/kill', { pid: owner.pid, force: false }));
+        window.__poll();
+      }
     },
   });
 });

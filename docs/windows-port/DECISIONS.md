@@ -1,5 +1,37 @@
 # Windows Port Decisions
 
+## P4-D001 — Bind every managed app generation to one runner-owned Job
+
+- Status: Accepted
+- Phase: P4
+- Decision: Create the target suspended, assign it to a private named Job, persist the exact 11-field identity, and only then authenticate resume. The independent runner is the only long-lived Job handle owner and writes protected receipts, while the HTTP console alone writes config through generation CAS.
+- Reason: Console lifetime, PID lifetime, and process ancestry do not prove ownership. The runner/Job boundary lets services survive console closure while ensuring runner failure cleans only its own process tree.
+- Consequence: Any identity, ACL, receipt, IPC, or persistence failure is fail closed and user code must not execute before commit.
+
+## P4-D002 — Separate graceful stop from explicit force
+
+- Status: Accepted
+- Phase: P4
+- Decision: Graceful timeout retains the same runtime identity and never escalates. Force repeats SID, generation, PID create-time, HMAC/receipt, and Job validation before terminating only that Job. External attach/kill remains unsupported.
+- Reason: A delayed or ambiguous stop must not affect a newer generation or an unrelated process.
+- Consequence: Every lifecycle mutation carries `expectedGeneration`; stale requests return mismatch without retry.
+
+## P4-D003 — Gate destructive tests to isolated fixtures
+
+- Status: Accepted
+- Phase: P4
+- Decision: Tests that exercise Job termination require `LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS=1`, run only inside an isolated fixture scope or hosted runner, and may control only processes spawned by their fixtures.
+- Reason: Lifecycle verification needs real Win32 primitives, but development validation must never target existing user processes.
+- Consequence: Local/mock results alone cannot close Phase 4. Exact-commit isolated Windows and full macOS CI evidence are required; Windows 10, packaging, and Beta stay in Phase 5.
+
+## P4-D004 — Commit release by atomic rename, then recover strict tombstones
+
+- Status: Accepted
+- Phase: P4
+- Decision: Use a two-stage cleanup protocol. Before release, the active generation must contain exactly the three protected request, token, and receipt records; token digest, signed terminal receipt, exact public identity, terminal state, and empty Job must agree, and the runner must be absent. An atomic same-volume rename to the strictly derived cleanup tombstone is the release commit. After commit, recovery may delete only a private, nonlink tombstone containing an allowlisted subset of those three records and performs no process observation or control. Atomic request/receipt writers protect the temporary file before replacement, and all reconnect/recovery paths verify existing ACLs without repairing them.
+- Reason: Configuration CAS may complete before physical record removal, and unlink/rmdir can partially fail after release. A single atomic commit point prevents identity restoration from racing partial deletion, while a committed tombstone can be finalized without treating filesystem residue as process authority.
+- Consequence: Failure before rename leaves the authenticated active generation intact. Failure after rename remains a committed release and is retryable. Unknown entries, widened ACLs, links/junctions, non-derived paths, live or ambiguous active generations, logs, and unrelated files remain untouched.
+
 ## P0-D001 — Enforce phase isolation
 
 - Status: Accepted

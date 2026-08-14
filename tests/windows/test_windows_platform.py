@@ -6,19 +6,81 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from localops.platform.contracts import ScanStatus
+from localops.command_spec import direct_command_spec
+from localops.platform.contracts import LaunchRequest, ScanStatus, StopResult
 
 if sys.platform == "win32":
     import psutil
+    import win32api
+    import win32con
+    import win32process
     import win32security
 
     from localops.platform.windows import WindowsPlatform
+    from localops.windows.runner_protocol import (
+        PROTOCOL_VERSION,
+        job_name,
+        sign_record,
+        token_digest,
+        write_json_atomic,
+    )
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only adapter tests")
 class WindowsPlatformTests(unittest.TestCase):
     def setUp(self):
         self.platform = WindowsPlatform(os.getcwd(), "server.py")
+
+    @staticmethod
+    def _create_recovery_record(platform, *, state="exited"):
+        app_id = "a1b2c3d4"
+        generation_id = "00000000-0000-4000-8000-000000000001"
+        token = b"r" * 32
+        paths = platform.runtime_paths()
+        os.mkdir(paths.data_dir)
+        platform.ensure_private_directory(paths.data_dir)
+        os.mkdir(paths.runtime_dir)
+        platform.ensure_private_directory(paths.runtime_dir)
+        app_directory = os.path.join(paths.runtime_dir, app_id)
+        os.mkdir(app_directory)
+        platform.ensure_private_directory(app_directory)
+        directory, request_path, token_path, receipt_path, _ = (
+            platform._runtime_files(app_id, generation_id)
+        )
+        os.mkdir(directory)
+        platform.ensure_private_directory(directory)
+        platform._create_private_file(request_path, b"{}")
+        platform.ensure_private_file(request_path)
+        platform._create_private_file(token_path, token)
+        platform.ensure_private_file(token_path)
+        public = {
+            "platform": "windows",
+            "kind": "job",
+            "ownerSid": platform.current_principal().identifier,
+            "generationId": generation_id,
+            "runnerPid": 2147483001,
+            "runnerCreateTime": 1.0,
+            "rootPid": 2147483002,
+            "rootCreateTime": 2.0,
+            "jobName": job_name(app_id, generation_id, token_digest(token)),
+            "tokenDigest": token_digest(token),
+            "startedAt": 3,
+        }
+        members = [public["rootPid"]] if state in {"prepared", "running"} else []
+        receipt = sign_record({
+            "version": PROTOCOL_VERSION,
+            "sequence": 1,
+            "state": state,
+            "identity": public,
+            "members": members,
+            "updatedAt": 4,
+            "code": None,
+            "error": None,
+            "exitCode": 0 if state == "exited" else None,
+        }, token, "receipt")
+        write_json_atomic(receipt_path, receipt)
+        platform.ensure_private_file(receipt_path)
+        return app_id, generation_id, directory, token_path, receipt_path
 
     def test_runtime_paths_use_local_app_data(self):
         paths = self.platform.runtime_paths()
@@ -29,6 +91,24 @@ class WindowsPlatformTests(unittest.TestCase):
             os.path.normcase(paths.data_dir),
             os.path.normcase(self.platform.base_dir),
         )
+
+    def test_runtime_paths_honor_absolute_controller_overrides(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = os.path.join(directory, "data")
+            logs = os.path.join(directory, "logs")
+            with mock.patch.dict(os.environ, {
+                "CONSOLE_DATA_DIR": data,
+                "CONSOLE_LOG_DIR": logs,
+            }):
+                paths = self.platform.runtime_paths()
+
+            self.assertEqual(paths.data_dir, os.path.abspath(data))
+            self.assertEqual(paths.logs_dir, os.path.abspath(logs))
+            self.assertEqual(paths.runtime_dir, os.path.join(os.path.abspath(data), "runtime"))
+
+        with mock.patch.dict(os.environ, {"CONSOLE_DATA_DIR": "relative"}):
+            with self.assertRaises(ValueError):
+                self.platform.runtime_paths()
 
     def test_runtime_path_rejects_roots_equivalents_and_junctions(self):
         with self.assertRaises(ValueError):
@@ -81,6 +161,87 @@ class WindowsPlatformTests(unittest.TestCase):
                 },
             )
 
+    def test_private_acl_never_attempts_to_change_owner(self):
+        descriptor = mock.Mock()
+        descriptor.GetSecurityDescriptorOwner.return_value = (
+            win32security.ConvertStringSidToSid(
+                self.platform.current_principal().identifier
+            )
+        )
+        descriptor.GetSecurityDescriptorDacl.return_value = mock.Mock(
+            GetAceCount=mock.Mock(return_value=3),
+            GetAce=mock.Mock(side_effect=[
+                ((win32security.ACCESS_ALLOWED_ACE_TYPE, 0), 0x1F01FF,
+                 win32security.ConvertStringSidToSid(sid))
+                for sid in (
+                    self.platform.current_principal().identifier,
+                    "S-1-5-18",
+                    "S-1-5-32-544",
+                )
+            ]),
+        )
+        descriptor.GetSecurityDescriptorControl.return_value = (
+            win32security.SE_DACL_PROTECTED, 0
+        )
+        with mock.patch.object(
+                win32security, "GetNamedSecurityInfo", return_value=descriptor), \
+                mock.patch.object(win32security, "SetNamedSecurityInfo") as setter, \
+                mock.patch.object(self.platform, "_private_acl", return_value=object()):
+            self.platform._apply_and_verify_acl("fixture", directory=False)
+
+        self.assertIsNone(setter.call_args.args[3])
+        self.assertFalse(
+            setter.call_args.args[2] & win32security.OWNER_SECURITY_INFORMATION
+        )
+
+    def test_private_acl_rejects_a_path_owned_by_another_sid(self):
+        descriptor = mock.Mock()
+        descriptor.GetSecurityDescriptorOwner.return_value = (
+            win32security.ConvertStringSidToSid("S-1-5-18")
+        )
+        with mock.patch.object(
+                win32security, "GetNamedSecurityInfo", return_value=descriptor), \
+                mock.patch.object(win32security, "SetNamedSecurityInfo") as setter:
+            with self.assertRaises(PermissionError):
+                self.platform._apply_and_verify_acl("fixture", directory=False)
+
+        setter.assert_not_called()
+
+    def test_verify_only_acl_rejects_widened_existing_record(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "token.bin")
+            with open(path, "wb") as stream:
+                stream.write(b"fixture")
+            self.platform.ensure_private_file(path)
+            descriptor = win32security.GetNamedSecurityInfo(
+                path,
+                win32security.SE_FILE_OBJECT,
+                win32security.DACL_SECURITY_INFORMATION,
+            )
+            dacl = descriptor.GetSecurityDescriptorDacl()
+            dacl.AddAccessAllowedAceEx(
+                win32security.ACL_REVISION_DS,
+                0,
+                win32con.GENERIC_READ,
+                win32security.ConvertStringSidToSid("S-1-1-0"),
+            )
+            win32security.SetNamedSecurityInfo(
+                path,
+                win32security.SE_FILE_OBJECT,
+                win32security.DACL_SECURITY_INFORMATION
+                | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                dacl,
+                None,
+            )
+
+            with self.assertRaises(PermissionError):
+                self.platform.verify_private_file(path)
+
+            # Restore only so TemporaryDirectory can clean up on Windows.
+            self.platform.ensure_private_file(path)
+
     def test_named_mutex_allows_only_one_writer_and_recovers_after_release(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             identity = os.path.join(temp_dir, "console.lock")
@@ -99,6 +260,24 @@ class WindowsPlatformTests(unittest.TestCase):
             snapshot.processes[os.getpid()]["owner"],
             self.platform.current_principal().identifier,
         )
+
+    def test_process_observation_treats_exited_object_as_absent(self):
+        process = mock.Mock()
+        process.create_time.return_value = 123.0
+        handle = mock.Mock()
+        with mock.patch("psutil.Process", return_value=process), \
+                mock.patch.object(
+                    self.platform, "_process_owner_sid",
+                    return_value=self.platform.current_principal().identifier,
+                ), mock.patch.object(
+                    win32api, "OpenProcess", return_value=handle
+                ), mock.patch.object(
+                    win32process, "GetExitCodeProcess", return_value=0
+                ):
+            observation = self.platform._observe_process(4321)
+
+        self.assertIsNone(observation)
+        handle.Close.assert_called_once_with()
 
     def test_listener_snapshot_preserves_ipv4_and_ipv6(self):
         connections = [
@@ -170,6 +349,361 @@ class WindowsPlatformTests(unittest.TestCase):
             self.assertIn((os.getpid(), port), snapshot.listeners)
         finally:
             listener.close()
+
+    def test_recover_managed_cleanups_returns_only_exact_terminal_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+                os.environ, {
+                    "CONSOLE_DATA_DIR": os.path.join(temp_dir, "data"),
+                    "CONSOLE_LOG_DIR": os.path.join(temp_dir, "logs"),
+                }):
+            platform = WindowsPlatform(os.getcwd(), "server.py")
+            app_id, generation_id, _, _, _ = self._create_recovery_record(platform)
+            with mock.patch.object(platform, "_observe_process", return_value=None):
+                recovered = platform.recover_managed_cleanups()
+
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].app_id, app_id)
+        self.assertEqual(recovered[0].generation_id, generation_id)
+        self.assertEqual(recovered[0].members, ())
+
+    def test_recover_managed_cleanups_skips_active_generation(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+                os.environ, {
+                    "CONSOLE_DATA_DIR": os.path.join(temp_dir, "data"),
+                    "CONSOLE_LOG_DIR": os.path.join(temp_dir, "logs"),
+                }):
+            platform = WindowsPlatform(os.getcwd(), "server.py")
+            self._create_recovery_record(platform, state="running")
+            with mock.patch.object(platform, "_observe_process") as observe:
+                recovered = platform.recover_managed_cleanups()
+
+        self.assertEqual(recovered, ())
+        observe.assert_not_called()
+
+    def test_recover_managed_cleanups_skips_insecure_or_malformed_records(self):
+        cases = ("widened", "malformed", "link")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temp_dir, \
+                    mock.patch.dict(os.environ, {
+                        "CONSOLE_DATA_DIR": os.path.join(temp_dir, "data"),
+                        "CONSOLE_LOG_DIR": os.path.join(temp_dir, "logs"),
+                    }):
+                platform = WindowsPlatform(os.getcwd(), "server.py")
+                _, _, directory, token_path, receipt_path = (
+                    self._create_recovery_record(platform)
+                )
+                link_patch = mock.patch.object(
+                    platform, "_has_junction_component", wraps=platform._has_junction_component
+                )
+                if case == "widened":
+                    descriptor = win32security.GetNamedSecurityInfo(
+                        token_path,
+                        win32security.SE_FILE_OBJECT,
+                        win32security.DACL_SECURITY_INFORMATION,
+                    )
+                    dacl = descriptor.GetSecurityDescriptorDacl()
+                    dacl.AddAccessAllowedAceEx(
+                        win32security.ACL_REVISION_DS,
+                        0,
+                        win32con.GENERIC_READ,
+                        win32security.ConvertStringSidToSid("S-1-1-0"),
+                    )
+                    win32security.SetNamedSecurityInfo(
+                        token_path,
+                        win32security.SE_FILE_OBJECT,
+                        win32security.DACL_SECURITY_INFORMATION
+                        | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+                        None,
+                        None,
+                        dacl,
+                        None,
+                    )
+                elif case == "malformed":
+                    with open(receipt_path, "wb") as stream:
+                        stream.write(b"{")
+                else:
+                    original = platform._has_junction_component
+                    expected = os.path.normcase(os.path.abspath(directory))
+                    link_patch = mock.patch.object(
+                        platform,
+                        "_has_junction_component",
+                        side_effect=lambda path: (
+                            os.path.normcase(os.path.abspath(path)) == expected
+                            or original(path)
+                        ),
+                    )
+                try:
+                    with link_patch, mock.patch.object(
+                            platform, "_observe_process", return_value=None):
+                        recovered = platform.recover_managed_cleanups()
+                    self.assertEqual(recovered, ())
+                finally:
+                    if case == "widened":
+                        platform.ensure_private_file(token_path)
+
+    def test_release_managed_keeps_original_when_tombstone_rename_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+                os.environ, {
+                    "CONSOLE_DATA_DIR": os.path.join(temp_dir, "data"),
+                    "CONSOLE_LOG_DIR": os.path.join(temp_dir, "logs"),
+                }):
+            platform = WindowsPlatform(os.getcwd(), "server.py")
+            app_id, generation_id, directory, _, _ = (
+                self._create_recovery_record(platform)
+            )
+            with mock.patch.object(platform, "_observe_process", return_value=None):
+                identity = platform.recover_managed_cleanups()[0]
+            tombstone = platform._cleanup_tombstone_path(app_id, generation_id)
+
+            with mock.patch.object(platform, "_observe_process", return_value=None), \
+                    mock.patch(
+                        "localops.platform.windows.os.rename",
+                        side_effect=OSError("rename fixture"),
+                    ), mock.patch("localops.platform.windows.os.unlink") as unlink:
+                result = platform.release_managed(identity)
+
+            self.assertFalse(result.ok)
+            self.assertTrue(os.path.isdir(directory))
+            self.assertEqual(
+                set(os.listdir(directory)),
+                {"request.json", "token.bin", "receipt.json"},
+            )
+            self.assertFalse(os.path.lexists(tombstone))
+            unlink.assert_not_called()
+
+    def test_release_managed_commits_before_rmdir_and_recovers_tombstone(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+                os.environ, {
+                    "CONSOLE_DATA_DIR": os.path.join(temp_dir, "data"),
+                    "CONSOLE_LOG_DIR": os.path.join(temp_dir, "logs"),
+                }):
+            platform = WindowsPlatform(os.getcwd(), "server.py")
+            app_id, generation_id, directory, _, _ = (
+                self._create_recovery_record(platform)
+            )
+            with mock.patch.object(platform, "_observe_process", return_value=None):
+                identity = platform.recover_managed_cleanups()[0]
+            tombstone = platform._cleanup_tombstone_path(app_id, generation_id)
+            real_rmdir = os.rmdir
+
+            def fail_tombstone_rmdir(path):
+                if os.path.normcase(path) == os.path.normcase(tombstone):
+                    raise OSError("rmdir fixture")
+                return real_rmdir(path)
+
+            with mock.patch.object(platform, "_observe_process", return_value=None), \
+                    mock.patch(
+                        "localops.platform.windows.os.rmdir",
+                        side_effect=fail_tombstone_rmdir,
+                    ):
+                result = platform.release_managed(identity)
+
+            self.assertTrue(result.ok)
+            self.assertFalse(os.path.lexists(directory))
+            self.assertTrue(os.path.isdir(tombstone))
+            self.assertEqual(os.listdir(tombstone), [])
+            with mock.patch.object(platform, "_observe_process") as observe, \
+                    mock.patch.object(platform, "_control") as control:
+                self.assertEqual(platform.recover_managed_cleanups(), ())
+            observe.assert_not_called()
+            control.assert_not_called()
+            self.assertFalse(os.path.lexists(tombstone))
+
+    def test_release_managed_commits_before_unlink_and_recovers_tombstone(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+                os.environ, {
+                    "CONSOLE_DATA_DIR": os.path.join(temp_dir, "data"),
+                    "CONSOLE_LOG_DIR": os.path.join(temp_dir, "logs"),
+                }):
+            platform = WindowsPlatform(os.getcwd(), "server.py")
+            app_id, generation_id, directory, _, _ = (
+                self._create_recovery_record(platform)
+            )
+            with mock.patch.object(platform, "_observe_process", return_value=None):
+                identity = platform.recover_managed_cleanups()[0]
+            tombstone = platform._cleanup_tombstone_path(app_id, generation_id)
+            real_unlink = os.unlink
+            failed = False
+
+            def fail_one_unlink(path):
+                nonlocal failed
+                if not failed:
+                    failed = True
+                    raise OSError("unlink fixture")
+                return real_unlink(path)
+
+            with mock.patch.object(platform, "_observe_process", return_value=None), \
+                    mock.patch(
+                        "localops.platform.windows.os.unlink",
+                        side_effect=fail_one_unlink,
+                    ):
+                result = platform.release_managed(identity)
+
+            self.assertTrue(result.ok)
+            self.assertFalse(os.path.lexists(directory))
+            self.assertTrue(os.path.isdir(tombstone))
+            self.assertTrue(os.listdir(tombstone))
+            with mock.patch.object(platform, "_observe_process") as observe, \
+                    mock.patch.object(platform, "_control") as control:
+                self.assertEqual(platform.recover_managed_cleanups(), ())
+            observe.assert_not_called()
+            control.assert_not_called()
+            self.assertFalse(os.path.lexists(tombstone))
+
+    def test_tombstone_recovery_rejects_unexpected_link_or_insecure_entries(self):
+        cases = ("unexpected", "link", "insecure")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temp_dir, \
+                    mock.patch.dict(os.environ, {
+                        "CONSOLE_DATA_DIR": os.path.join(temp_dir, "data"),
+                        "CONSOLE_LOG_DIR": os.path.join(temp_dir, "logs"),
+                    }):
+                platform = WindowsPlatform(os.getcwd(), "server.py")
+                app_id, generation_id, directory, _, _ = (
+                    self._create_recovery_record(platform)
+                )
+                tombstone = platform._cleanup_tombstone_path(app_id, generation_id)
+                os.rename(directory, tombstone)
+                link_patch = mock.patch.object(
+                    platform,
+                    "_has_junction_component",
+                    wraps=platform._has_junction_component,
+                )
+                if case == "unexpected":
+                    extra = os.path.join(tombstone, "extra.json")
+                    platform._create_private_file(extra, b"{}")
+                    platform.ensure_private_file(extra)
+                elif case == "link":
+                    original = platform._has_junction_component
+                    expected = os.path.normcase(os.path.abspath(tombstone))
+                    link_patch = mock.patch.object(
+                        platform,
+                        "_has_junction_component",
+                        side_effect=lambda path: (
+                            os.path.normcase(os.path.abspath(path)) == expected
+                            or original(path)
+                        ),
+                    )
+                else:
+                    descriptor = win32security.GetNamedSecurityInfo(
+                        tombstone,
+                        win32security.SE_FILE_OBJECT,
+                        win32security.DACL_SECURITY_INFORMATION,
+                    )
+                    dacl = descriptor.GetSecurityDescriptorDacl()
+                    dacl.AddAccessAllowedAceEx(
+                        win32security.ACL_REVISION_DS,
+                        0,
+                        win32con.GENERIC_READ,
+                        win32security.ConvertStringSidToSid("S-1-1-0"),
+                    )
+                    win32security.SetNamedSecurityInfo(
+                        tombstone,
+                        win32security.SE_FILE_OBJECT,
+                        win32security.DACL_SECURITY_INFORMATION
+                        | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+                        None,
+                        None,
+                        dacl,
+                        None,
+                    )
+                try:
+                    with link_patch, mock.patch.object(
+                            platform, "_observe_process") as observe, \
+                            mock.patch.object(platform, "_control") as control:
+                        self.assertEqual(platform.recover_managed_cleanups(), ())
+                    observe.assert_not_called()
+                    control.assert_not_called()
+                    self.assertTrue(os.path.isdir(tombstone))
+                finally:
+                    if case == "insecure":
+                        platform.ensure_private_directory(tombstone)
+
+    def test_fake_platform_returns_configured_cleanup_recoveries(self):
+        from localops.platform.fake import FakePlatform
+
+        identity = mock.sentinel.identity
+        platform = FakePlatform(cleanup_recoveries=[identity])
+
+        self.assertEqual(platform.recover_managed_cleanups(), (identity,))
+        self.assertIn(("recover_managed_cleanups", None), platform.calls)
+
+    def test_launch_retains_exact_identity_until_abort_and_release_both_succeed(self):
+        from localops.windows.runner_protocol import ProtocolError
+
+        for abort_ok, release_ok, retains_identity in (
+            (False, False, True),
+            (True, False, True),
+            (True, True, False),
+        ):
+            with self.subTest(abort_ok=abort_ok, release_ok=release_ok), \
+                    tempfile.TemporaryDirectory() as temp_dir, \
+                    mock.patch.dict(os.environ, {
+                        "CONSOLE_DATA_DIR": os.path.join(temp_dir, "data"),
+                        "CONSOLE_LOG_DIR": os.path.join(temp_dir, "logs"),
+                    }):
+                platform = WindowsPlatform(os.getcwd(), "server.py")
+                app_id = "a1b2c3d4"
+                generation_id = "00000000-0000-4000-8000-000000000001"
+                receipt_path = platform._runtime_files(
+                    app_id, generation_id
+                )[3]
+                process = mock.Mock(pid=4321)
+                process.poll.return_value = None
+                public = {
+                    "jobName": "LocalOps-fixture",
+                    "ownerSid": platform.current_principal().identifier,
+                    "generationId": generation_id,
+                    "runnerPid": process.pid,
+                    "runnerCreateTime": 1.0,
+                    "rootPid": 6543,
+                    "rootCreateTime": 2.0,
+                    "tokenDigest": "0" * 64,
+                    "startedAt": 3,
+                }
+
+                def create_receipt(*_args, **_kwargs):
+                    with open(receipt_path, "w", encoding="utf-8") as stream:
+                        stream.write("{}")
+                    platform.ensure_private_file(receipt_path)
+                    return process
+
+                with mock.patch(
+                        "localops.platform.windows.subprocess.Popen",
+                        side_effect=create_receipt), \
+                        mock.patch(
+                            "localops.platform.windows.validate_receipt",
+                            return_value={"identity": public, "members": [6543]}), \
+                        mock.patch.object(platform, "_runtime_context"), \
+                        mock.patch.object(
+                            platform, "_control",
+                            side_effect=ProtocolError(
+                                "RUNTIME_CONTROL_FAILED", "inspect fixture"
+                            )), \
+                        mock.patch.object(
+                            platform, "abort_managed",
+                            return_value=StopResult(abort_ok)), \
+                        mock.patch.object(
+                            platform, "release_managed",
+                            return_value=StopResult(release_ok)) as release:
+                    result = platform.launch(LaunchRequest(
+                        app_id=app_id,
+                        command="fixture",
+                        cwd=temp_dir,
+                        log_path=os.path.join(
+                            platform.runtime_paths().logs_dir, app_id + ".log"
+                        ),
+                        command_spec=direct_command_spec(
+                            sys.executable, ["-c", "pass"]
+                        ),
+                        generation_id=generation_id,
+                    ))
+
+                self.assertFalse(result.ok)
+                self.assertEqual(
+                    result.runtime_identity is not None, retains_identity
+                )
+                self.assertEqual(release.called, abort_ok)
 
 
 if __name__ == "__main__":

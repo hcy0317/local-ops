@@ -63,13 +63,15 @@ class WindowsServerTests(unittest.TestCase):
     def tearDown(self):
         self.harness.close()
 
-    def test_state_exposes_read_only_capabilities(self):
+    def test_state_exposes_owned_job_lifecycle_capabilities(self):
         status, state, _ = self.harness.request("GET", "/api/state")
         self.assertEqual(status, 200)
         self.assertEqual(state["platform"], "windows")
         self.assertTrue(state["capabilities"]["monitor_processes"])
         for capability in (
-                "launch_managed", "stop_managed", "force_stop_managed",
+                "launch_managed", "stop_managed", "force_stop_managed"):
+            self.assertTrue(state["capabilities"][capability])
+        for capability in (
                 "kill_external", "attach_external", "restart_console"):
             self.assertFalse(state["capabilities"][capability])
 
@@ -110,7 +112,7 @@ class WindowsServerTests(unittest.TestCase):
         missing_cwd = os.path.join(self.harness.temp_dir.name, "missing")
         status, updated, _ = self.harness.request(
             "PUT", "/api/apps/%s" % created["id"],
-            {"cwd": missing_cwd}, self.headers
+            {"cwd": missing_cwd, "expectedGeneration": None}, self.headers
         )
         self.assertEqual(status, 200)
         self.assertEqual(updated["importStatus"], "blocked")
@@ -214,7 +216,7 @@ class WindowsServerTests(unittest.TestCase):
         )
         self.assertEqual(value, 1)
 
-    def test_destructive_routes_reject_before_process_or_config_side_effects(self):
+    def test_external_control_routes_reject_before_process_or_config_side_effects(self):
         app_id = "deadbeef"
         app = dict(server.Config.APP_DEFAULT)
         app.update({
@@ -234,9 +236,6 @@ class WindowsServerTests(unittest.TestCase):
                 mock.patch.object(server, "schedule_console_stop") as stop_console:
             requests = (
                 ("POST", "/api/kill", {"pid": os.getpid()}),
-                ("POST", f"/api/apps/{app_id}/start", {}),
-                ("POST", f"/api/apps/{app_id}/stop", {}),
-                ("POST", f"/api/apps/{app_id}/restart", {}),
                 ("POST", f"/api/apps/{app_id}/attach", {"pid": os.getpid()}),
                 ("POST", "/api/apps/facefeed/attach", {"pid": os.getpid()}),
                 ("POST", "/api/console/restart", {}),
@@ -292,37 +291,52 @@ class WindowsServerTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_running_delete_and_update_do_not_stop_processes(self):
-        app_id = "cafebabe"
-        app = dict(server.Config.APP_DEFAULT)
-        app.update({
-            "id": app_id,
-            "name": "Running app",
+    def test_legacy_observation_never_triggers_windows_process_control(self):
+        delete_id = "cafebabe"
+        update_id = "facefeed"
+        delete_app = dict(server.Config.APP_DEFAULT)
+        delete_app.update({
+            "id": delete_id,
+            "name": "Delete stopped app",
             "command": "echo old",
             "cwd": self.harness.temp_dir.name,
             "port": 9606,
             "kind": "service",
         })
-        self.harness.cfg.update(lambda config: config["apps"].append(app))
-        before = self.harness.cfg.snapshot()
+        update_app = {
+            **delete_app,
+            "id": update_id,
+            "name": "Update stopped app",
+            "port": 9607,
+        }
+        self.harness.cfg.update(
+            lambda config: config["apps"].extend([delete_app, update_app])
+        )
+        updated_cwd = os.path.join(self.harness.temp_dir.name, "updated")
+        os.mkdir(updated_cwd)
         with mock.patch.object(server, "app_running", return_value=True), \
                 mock.patch.object(server, "app_alive_sign", return_value=True), \
                 mock.patch.object(server, "stop_app_and_clear") as stop_app, \
                 mock.patch.object(server, "stop_app_for_update") as stop_update:
             status, _, _ = self.harness.request(
-                "DELETE", f"/api/apps/{app_id}", None, self.headers
+                "DELETE", f"/api/apps/{delete_id}",
+                {"expectedGeneration": None}, self.headers
             )
-            self.assertEqual(status, 409)
-            status, _, _ = self.harness.request(
+            self.assertEqual(status, 200)
+            status, updated, _ = self.harness.request(
                 "PUT",
-                f"/api/apps/{app_id}",
-                {"command": "echo new", "stopBeforeUpdate": True},
+                f"/api/apps/{update_id}",
+                {"cwd": updated_cwd, "stopBeforeUpdate": True,
+                 "expectedGeneration": None},
                 self.headers,
             )
-            self.assertEqual(status, 409)
+            self.assertEqual(status, 200)
+            self.assertEqual(updated["cwd"], updated_cwd)
         stop_app.assert_not_called()
         stop_update.assert_not_called()
-        self.assertEqual(self.harness.cfg.snapshot(), before)
+        apps = self.harness.cfg.snapshot()["apps"]
+        self.assertEqual([app["id"] for app in apps], [update_id])
+        self.assertIsNone(apps[0]["runtimeIdentity"])
 
 
 if __name__ == "__main__":

@@ -870,9 +870,11 @@ class StateCacheTests(unittest.TestCase):
     def test_snapshot_reused_within_ttl_and_rebuilt_after_invalidate(self):
         calls = []
         cfg = mock.Mock()
-        with mock.patch.object(
-                server, "build_state",
-                side_effect=self._snapshot_that_counts(calls)):
+        with (mock.patch.object(
+                  server, "reconcile_windows_terminal_runtimes"),
+              mock.patch.object(
+                  server, "build_state",
+                  side_effect=self._snapshot_that_counts(calls))):
             first = server.get_state_snapshot(cfg, 9600)
             second = server.get_state_snapshot(cfg, 9600)
             server.invalidate_state_cache()

@@ -267,19 +267,21 @@ class WindowsPackageSmokeTests(unittest.TestCase):
 
     def _make_bundle_read_execute_only(self):
         self._assert_fixture_path(self.bundle)
-        grant = "*%s:(OI)(CI)RX" % self._current_user_sid()
+        sid = self._current_user_sid()
+        deny_write_data = "*%s:(OI)(CI)(WD,AD)" % sid
         self.fixture_acl_restored = False
-        # Apply at the root so children inherit RX. Recursive inheritance removal
-        # would leave existing files with an empty DACL instead of inherited RX.
+        # The hosted runner also has an Administrators allow ACE. Denying only
+        # data creation/appends for the exact user overrides that write path while
+        # preserving the loader's inherited read/execute and ACL-recovery rights.
         self._icacls(
             [
                 self.bundle.name,
-                "/inheritance:r",
-                "/grant:r",
-                grant,
+                "/deny",
+                deny_write_data,
+                "/T",
                 "/Q",
             ],
-            action="set read/execute-only ACL",
+            action="deny recursive bundle data writes",
         )
 
     def _assert_bundle_write_denied(self):
@@ -299,13 +301,10 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         if not self.bundle.exists():
             return
         self._assert_fixture_path(self.bundle)
+        deny_sid = "*%s" % self._current_user_sid()
         self._icacls(
-            [self.bundle.name, "/inheritance:e", "/T", "/Q"],
-            action="restore inheritance",
-        )
-        self._icacls(
-            [self.bundle.name, "/reset", "/T", "/Q"],
-            action="reset inherited ACL",
+            [self.bundle.name, "/remove:d", deny_sid, "/T", "/Q"],
+            action="remove recursive bundle write deny",
         )
         marker = self.bundle / build_windows.BUILD_INFO_NAME
         descriptor = os.open(marker, os.O_WRONLY | os.O_APPEND)

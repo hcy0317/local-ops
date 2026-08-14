@@ -302,7 +302,7 @@ class WindowsBuildContractTests(unittest.TestCase):
         relative = build_windows.PurePosixPath("_internal/_bz2.pyd")
         self.assertIsNone(
             build_windows._find_package_path_leak(
-                relative, b"C:/Users/Administrator/cpython-build"
+                relative, b"C:/Users/" + b"Administrator/cpython-build"
             )
         )
         local_home = str(Path.home().resolve()).replace("\\", "/").encode("utf-8")

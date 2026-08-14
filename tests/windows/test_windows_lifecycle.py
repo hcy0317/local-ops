@@ -242,38 +242,80 @@ class IsolatedWindowsLifecycleTests(unittest.TestCase):
         self.fail("no isolated Local Ops console port is available")
 
     @staticmethod
-    def _api_json(port, path, payload=None):
+    def _api_json(port, path, payload=None, *, timeout=15.0):
         body = None if payload is None else json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             f"http://127.0.0.1:{port}{path}",
             data=body,
             headers=({"Content-Type": "application/json"} if body else {}),
         )
-        with urllib.request.urlopen(request, timeout=15.0) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.load(response)
 
+    @staticmethod
+    def _console_output_tail(path, limit=4096):
+        """Return bounded fixture output without exposing the process environment."""
+        try:
+            with open(path, "rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                stream.seek(max(0, size - limit))
+                output = stream.read().decode("utf-8", errors="replace")
+        except OSError as exc:
+            return "<unavailable: %s>" % type(exc).__name__
+        output = "".join(
+            character if character in "\n\r\t" or character.isprintable() else "?"
+            for character in output
+        ).strip()
+        return output or "<empty>"
+
     def _start_console(self, port):
-        process = subprocess.Popen(
-            [sys.executable, "server.py", "--no-browser", "--preferred-port", str(port)],
-            cwd=self.repo,
-            env=dict(os.environ),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-        )
+        output_id = uuid.uuid4().hex
+        stdout_path = os.path.join(self.temp.name, "console-%s.stdout.log" % output_id)
+        stderr_path = os.path.join(self.temp.name, "console-%s.stderr.log" % output_id)
+        with open(stdout_path, "wb") as stdout_stream, open(stderr_path, "wb") as stderr_stream:
+            process = subprocess.Popen(
+                [sys.executable, "server.py", "--no-browser", "--preferred-port", str(port)],
+                cwd=self.repo,
+                env=dict(os.environ),
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_stream,
+                stderr=stderr_stream,
+                close_fds=True,
+            )
         self.sentinels.append(process)
 
-        def ready():
-            if process.poll() is not None:
-                return False
+        deadline = time.monotonic() + 45.0
+        last_error = "connection unavailable"
+        while time.monotonic() < deadline:
+            returncode = process.poll()
+            if returncode is not None:
+                self.fail(
+                    "console exited before readiness (exit=%d, stderr=%r, stdout=%r)"
+                    % (
+                        returncode,
+                        self._console_output_tail(stderr_path),
+                        self._console_output_tail(stdout_path),
+                    )
+                )
             try:
-                return self._api_json(port, "/api/state")["consolePid"] == process.pid
-            except OSError:
-                return False
+                state = self._api_json(port, "/api/state", timeout=1.0)
+                if state["consolePid"] == process.pid:
+                    return process
+                last_error = "consolePid did not match fixture process"
+            except (OSError, KeyError, ValueError) as exc:
+                last_error = type(exc).__name__
+            time.sleep(0.1)
 
-        self.assertTrue(self._wait(ready, timeout=15.0), "console did not become ready")
-        return process
+        self.fail(
+            "console did not become ready within 45s "
+            "(lastError=%s, stderr=%r, stdout=%r)"
+            % (
+                last_error,
+                self._console_output_tail(stderr_path),
+                self._console_output_tail(stdout_path),
+            )
+        )
 
     def _stop_console(self, process):
         if process.poll() is None:

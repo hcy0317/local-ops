@@ -19,11 +19,18 @@ class JobObjectUnitTests(unittest.TestCase):
 
         self.assertFalse(attributes.bInheritHandle)
 
-    @mock.patch.object(job_object.win32api, "GetLastError", return_value=0)
-    @mock.patch.object(job_object.win32job, "SetInformationJobObject")
-    @mock.patch.object(job_object.win32job, "QueryInformationJobObject")
-    @mock.patch.object(job_object.win32job, "CreateJobObject", return_value=object())
-    @mock.patch.object(job_object, "private_security_attributes", return_value=object())
+    @mock.patch(
+        "localops.windows.job_object.win32api.GetLastError", return_value=0
+    )
+    @mock.patch("localops.windows.job_object.win32job.SetInformationJobObject")
+    @mock.patch("localops.windows.job_object.win32job.QueryInformationJobObject")
+    @mock.patch(
+        "localops.windows.job_object.win32job.CreateJobObject", return_value=object()
+    )
+    @mock.patch(
+        "localops.windows.job_object.private_security_attributes",
+        return_value=object(),
+    )
     def test_job_is_created_kill_on_close_without_opening_a_second_handle(
         self, _attributes, create, query, set_information, _last_error,
     ):
@@ -40,7 +47,7 @@ class JobObjectUnitTests(unittest.TestCase):
         self.assertNotIn("OpenJobObject", inspect.getsource(job_object))
         job._handle = None
 
-    @mock.patch.object(job_object.win32job, "QueryInformationJobObject")
+    @mock.patch("localops.windows.job_object.win32job.QueryInformationJobObject")
     def test_members_come_only_from_job_accounting(self, query):
         instance = object.__new__(job_object.OwnedJob)
         instance.name = "test"
@@ -52,7 +59,7 @@ class JobObjectUnitTests(unittest.TestCase):
         query.return_value = (7, 3)
         self.assertEqual(instance.members(), (3, 7))
 
-    @mock.patch.object(job_object.win32job, "TerminateJobObject")
+    @mock.patch("localops.windows.job_object.win32job.TerminateJobObject")
     def test_force_uses_only_the_owned_job_handle(self, terminate):
         instance = object.__new__(job_object.OwnedJob)
         instance.name = "test"

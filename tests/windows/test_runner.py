@@ -1,11 +1,89 @@
 import inspect
+import io
+from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only runner tests")
 class RunnerUnitTests(unittest.TestCase):
+    def test_source_runner_replaces_redirected_streams(self):
+        from localops.windows import runner
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "fixture.log"
+            path.write_bytes(b"")
+            platform = mock.Mock()
+            original_stdout, original_stderr = sys.stdout, sys.stderr
+            sys.stdout = io.StringIO()
+            sys.stderr = io.StringIO()
+            stream = None
+            try:
+                stream = runner.bind_windowed_runner_output(platform, str(path))
+                print("SOURCE_RUNNER_DIAGNOSTIC", file=sys.stderr, flush=True)
+            finally:
+                if stream is not None:
+                    stream.close()
+                sys.stdout, sys.stderr = original_stdout, original_stderr
+
+            self.assertEqual(
+                path.read_text(encoding="utf-8"), "SOURCE_RUNNER_DIAGNOSTIC\n"
+            )
+
+    def test_frozen_runner_replaces_inherited_devnull_streams(self):
+        from localops.windows import runner
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "fixture.log"
+            path.write_bytes(b"")
+            platform = mock.Mock()
+            original_stdout, original_stderr = sys.stdout, sys.stderr
+            sys.stdout = io.StringIO()
+            sys.stderr = io.StringIO()
+            stream = None
+            try:
+                with mock.patch.object(sys, "frozen", True, create=True):
+                    stream = runner.bind_windowed_runner_output(platform, str(path))
+                    print("FROZEN_RUNNER_DIAGNOSTIC", file=sys.stderr, flush=True)
+            finally:
+                if stream is not None:
+                    stream.close()
+                sys.stdout, sys.stderr = original_stdout, original_stderr
+
+            self.assertEqual(
+                path.read_text(encoding="utf-8"), "FROZEN_RUNNER_DIAGNOSTIC\n"
+            )
+
+    def test_windowed_runner_binds_private_existing_app_log(self):
+        from localops.windows import runner
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "fixture.log"
+            path.write_bytes(b"")
+            platform = mock.Mock()
+            original_stdout, original_stderr = sys.stdout, sys.stderr
+            sys.stdout = None
+            sys.stderr = None
+            stream = None
+            try:
+                stream = runner.bind_windowed_runner_output(platform, str(path))
+                print("RUNNER_DIAGNOSTIC_FIXTURE", file=sys.stderr, flush=True)
+            finally:
+                if stream is not None:
+                    stream.close()
+                sys.stdout, sys.stderr = original_stdout, original_stderr
+
+            platform.verify_private_directory.assert_called_once_with(temporary)
+            self.assertEqual(
+                platform.verify_private_file.call_args_list,
+                [mock.call(str(path)), mock.call(str(path))],
+            )
+            self.assertEqual(
+                path.read_text(encoding="utf-8"), "RUNNER_DIAGNOSTIC_FIXTURE\n"
+            )
+
     def test_prepare_assigns_job_before_publishing_and_never_resumes(self):
         from localops.windows import runner
 
@@ -34,6 +112,34 @@ class RunnerUnitTests(unittest.TestCase):
 
         resume.assert_called_once_with(thread_handle)
         self.assertEqual(runtime.state, "running")
+
+    def test_runner_detaches_before_allocating_private_console(self):
+        from localops.windows import runner
+
+        events = []
+        process_handle = object()
+        thread_handle = object()
+        with mock.patch.object(
+                runner.win32console, "FreeConsole",
+                side_effect=lambda: events.append("free")), \
+                mock.patch.object(
+                    runner.win32console, "AllocConsole",
+                    side_effect=lambda: events.append("alloc")), \
+                mock.patch.object(
+                    runner.win32process, "CreateProcess",
+                    side_effect=lambda *_args: (
+                        events.append("create")
+                        or (process_handle, thread_handle, 123, 456)
+                    )), \
+                mock.patch.object(runner, "_process_create_time", return_value=1.0), \
+                mock.patch.object(runner.os, "set_handle_inheritable"), \
+                mock.patch.object(runner, "_close_handle"):
+            process = runner.create_suspended_process(
+                ["fixture.exe"], "C:\\fixture", "NUL"
+            )
+            process.close()
+
+        self.assertEqual(events[:3], ["free", "alloc", "create"])
 
     def test_post_create_failure_terminates_exact_suspended_process(self):
         from localops.windows import runner

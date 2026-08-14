@@ -10,6 +10,8 @@
 
 ### Added
 
+- 增加 Windows Phase 5 本地打包候选：Python 3.12 + PyInstaller onedir/windowed/x64 unsigned zip、确定性 checksum/manifest sidecars、包内容/版本/依赖/许可/敏感数据审计，以及只操作隔离夹具的最终 package smoke。
+- 增加冻结 windowed 入口；在无标准流时把诊断写入受保护的 Local AppData console log，并由同一 executable 分派 HTTP console 与 per-generation runner。
 - 增加 Windows Phase 4 生命周期源码候选：per-app runner、受保护 Named Pipe/回执、`CREATE_SUSPENDED` 启动、Named Job Object、generation compare-and-swap，以及普通停止与显式 Force 的分离流程。
 - 增加 `docs/windows-port/API-CONTRACT-v3.md`，冻结 11 字段公开 runtime identity、生命周期状态、稳定错误码和前端 generation 规则；隔离 Windows CI 仅运行测试夹具进程。
 - 增加 Windows Phase 3 兼容性源码预览：schema v2、`commandSpec`、静态命令预检、Windows 脚本/PATHEXT/npm/pnpm/Python 3.12 项目候选，以及平台化快捷键、路径和能力说明。
@@ -52,6 +54,8 @@
 
 ### Fixed
 
+- 修复 Windows 源码 venv redirector 在启动后立即退出、使短命 PID 被误作 runner 根身份的问题：runner 改由 base Python 承载，并通过 `__PYVENV_LAUNCHER__` 保留目标 venv 上下文。
+- 修复 runner 继承控制台导致目标没有私有 console group、冻结同 executable child 复用 PyInstaller 父进程环境、`win32timezone` 漏打包和相对 executable 解析不稳定的问题；现在先 `FreeConsole`/`AllocConsole`，为冻结 child 设置 `PYINSTALLER_RESET_ENVIRONMENT=1`，显式加入 hidden import，并在创建目标前解析绝对 executable。
 - 修复从服务监控加入启动台时只创建卡片、未认领来源进程的问题；创建与进程认领现由后端原子完成，项目命令识别完成前不能提前保存。明确认领的服务在 Next/Vite 等框架重建监听子进程、PID 变化后，会按端口、当前用户与真实项目目录唯一重新关联。
 - 修复 Candy 主题超大标题的英文粗体描边出现双重轮廓，并让英文副标题在窄屏明确换行。
 - 修复批处理脚本内取消被误报为运行成功，以及任务成功退出被诊断成“服务过早退出”。
@@ -68,6 +72,7 @@
 
 ### Security
 
+- Windows Phase 5 发行审计拒绝用户数据、日志、runtime/token、凭据、缓存、个人绝对路径、不受支持的架构和缺失许可；本地 unsigned artifact 不会因 stripped child PATH smoke 被误标为干净无 Python VM 或 Beta。
 - Windows 受管生命周期仅信任当前 SID、generation、runner/root PID 创建时间、HMAC 回执和 Job Object 成员关系；普通停止不会自动升级为 Force，强制停止只终止验证通过的专属 Job。
 - raw control token 仅保存在受保护 runtime 文件和 runner 内存中，不进入配置、前端、命令行、日志或诊断；runner 异常退出通过 Job kill-on-close 仅清理自己的进程树。
 - request/receipt 原子写入在替换为权威记录前先保护临时文件 DACL；清理恢复只接受签名有效、Job 已空且目录内容精确匹配的 terminal generation，不删除模糊记录、日志或无关文件。

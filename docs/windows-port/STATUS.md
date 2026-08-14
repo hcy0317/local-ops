@@ -1,5 +1,65 @@
 # Windows Port Status
 
+## Phase 5 — IMPLEMENTED_LOCAL_PASS_CI_PENDING
+
+The current Windows 11 x64 tree implements the Python 3.12 PyInstaller
+onedir/windowed/x64 unsigned package, deterministic checksum/manifest
+sidecars, package-content audit, packaged entry point, and package smoke
+harness. It also closes four packaged/source runner correctness gaps:
+
+- a source venv redirector launches the runner through resolved base Python
+  while `__PYVENV_LAUNCHER__` preserves the selected venv, so the persisted
+  runner PID is the real long-lived interpreter;
+- the runner calls `FreeConsole` before its private `AllocConsole`, then creates
+  the target, keeping console-group control inside the owned generation;
+- a frozen same-executable child receives
+  `PYINSTALLER_RESET_ENVIRONMENT=1`, and `win32timezone` is an explicit hidden
+  import;
+- every managed target executable is resolved to an absolute path before
+  suspended creation.
+
+Current local verification:
+
+- full Windows Python 3.12 lifecycle gate: 207 tests, `OK`, one separately
+  gated package-smoke skip, 120.941s;
+- packaging unit: 25 ran, 24 passed, one gated package-smoke skip;
+- focused Windows: 109/109; shared contracts: 31 passed plus one
+  symlink-privilege skip;
+- frontend + HTTP hardening: 30/30; lifecycle Node contracts: 30/30;
+- common: 10/10; project checks: 6/6; compile: 45; Ruff/diff: PASS;
+- current-tree audited package smoke: 1/1 PASS in 25.468s.
+
+The package smoke extracted the bundle under a read-only Chinese-and-space
+path, stripped the packaged child's `PATH`, and completed real start, log
+marker, listener, controller close/reopen, Force stop, release, and delete.
+All fixture PIDs and ports were gone and the bundle tree hashes were unchanged.
+The harness itself still had Python and test dependencies, so this evidence is
+not equivalent to an independent clean VM without Python.
+
+Two independent current-tree builds and both internal and independent audits
+passed. The 15,155,392-byte archive A/B is byte-identical with SHA-256
+`60e0b33b4903bdc58ef905e3673cff87a421a767c460122812d7e099d4ecaa3c`.
+The checksum sidecar file SHA-256 is
+`b77c24f9a066e70bf090f8e1c30365b1d485f5c36a20bdb9019011e742858f0f`;
+the manifest sidecar file SHA-256 is
+`3b1adfe6ee63d097e5a1aee587ca3428daea383ac8f50f7e3d698fb366033986`.
+A/B sidecar content and bytes are identical.
+
+No Phase 5 exact implementation commit or CI run has been frozen:
+`implementationCommit=null`, `ciRun=null`. `lastGreenPhase` remains P4 and
+`windowsBetaReady=false`. Windows 10 is deferred/`NOT_RUN`; an independent
+clean no-Python VM, Defender/SmartScreen, native Windows picker, and Windows
+Notification Center delivery are `NOT_RUN`; favicon brand approval is
+`REVIEW_REQUIRED`; and the development artifact is unsigned.
+
+## Current result
+
+**P5 IMPLEMENTED_LOCAL_PASS_CI_PENDING / LAST GREEN P4 / WINDOWS BETA FALSE.**
+
+The next acceptance step is an exact Phase 5 commit and
+common/macOS/Windows/package CI. None of the remaining external or release
+gates may be inferred from the local smoke.
+
 ## Phase 4 — PASS
 
 The Phase 4 source candidate implements the runner/Job ownership model,
@@ -71,7 +131,7 @@ set `aria-hidden="true"`.
 Windows 10, self-contained packaging, a clean machine without Python, and Beta
 readiness remain Phase 5 scope. `windowsBetaReady=false`.
 
-## Current result
+## Phase 4 accepted result
 
 **P4 PASS / EXACT-COMMIT WINDOWS + MACOS CI PASS / WIN10 PHASE 5.**
 

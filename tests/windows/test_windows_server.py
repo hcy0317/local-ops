@@ -341,21 +341,66 @@ class WindowsServerTests(unittest.TestCase):
 
 
 class WindowsCiWorkflowTests(unittest.TestCase):
-    def test_test_groups_are_separate_fail_fast_steps(self):
+    def workflow(self):
         workflow_path = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
-        workflow = workflow_path.read_text(encoding="utf-8").replace("\r\n", "\n")
-        windows_job = workflow.split("  windows-read-only:\n", 1)[1].split(
-            "\n  check-and-release:\n", 1
-        )[0]
+        return workflow_path.read_text(encoding="utf-8").replace("\r\n", "\n")
+
+    def windows_job(self):
+        workflow = self.workflow()
+        return workflow.split("  windows-checks:\n", 1)[1]
+
+    def test_common_macos_and_windows_jobs_are_explicitly_separate(self):
+        workflow = self.workflow()
+        for job in ("common-checks", "macos-checks", "windows-checks"):
+            self.assertIn(f"  {job}:\n", workflow)
+        self.assertIn(
+            "    needs: [common-checks, macos-checks]\n",
+            self.windows_job(),
+        )
+        self.assertIn(
+            "run: python tools/check_project.py --scope common", workflow
+        )
+        self.assertIn(
+            "run: python tools/check_project.py --scope macos", workflow
+        )
+        self.assertIn(
+            "run: python tools/check_project.py --scope windows --skip-tests",
+            workflow,
+        )
+
+    def test_windows_job_uses_native_tools_and_audits_one_unsigned_package(self):
+        windows_job = self.windows_job()
+        for forbidden in ("make ", "/bin/bash", "plutil", "secrets."):
+            self.assertNotIn(forbidden, windows_job)
+        self.assertIn(
+            "python tools/build_windows.py build --output-dir dist/windows",
+            windows_job,
+        )
+        self.assertIn(
+            "python tools/build_windows.py audit --archive $archives[0].FullName",
+            windows_job,
+        )
+        self.assertIn("$archives.Count -ne 1", windows_job)
+        self.assertIn("dist/windows-repro", windows_job)
+        self.assertIn("not byte-for-byte reproducible", windows_job)
+        self.assertIn("LOCALOPS_RUN_WINDOWS_PACKAGE_SMOKE", windows_job)
+        self.assertIn("tests.windows.test_windows_package_smoke", windows_job)
+        self.assertIn("Windows package smoke was skipped", windows_job)
+        self.assertIn("requirements-build-windows.txt", windows_job)
+
+    def test_test_groups_are_separate_fail_fast_nonzero_steps(self):
+        windows_job = self.windows_job()
         commands = (
-            'run: python -m unittest discover -s tests/windows -p "test_*.py" -v',
-            'run: python -m unittest discover -s tests/contract -p "test_*.py" -v',
-            "run: python -m unittest tests.test_frontend "
+            'python -m unittest discover -s tests/windows -p "test_*.py" -v',
+            'python -m unittest discover -s tests/contract -p "test_*.py" -v',
+            "python -m unittest tests.test_frontend "
             "tests.test_hardening.HttpSecurityTests -v",
+            "python -m unittest tests.windows.test_windows_package_smoke -v",
         )
         self.assertEqual(windows_job.count("python -m unittest"), len(commands))
         for command in commands:
             self.assertIn(command, windows_job)
+        self.assertEqual(windows_job.count("-notmatch 'Ran\\s+"), len(commands))
         self.assertNotIn("continue-on-error", windows_job)
 
 

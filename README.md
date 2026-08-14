@@ -2,11 +2,11 @@
 
 **Preview / Alpha · 源码预览**
 
-总控台是一个本地服务与批处理任务快速启动、运行监测工具。macOS 版本保留完整现有功能；Windows 当前处于 Phase 4 生命周期源码候选，提供安全的本地监听与进程观察、结构化命令配置、显式 macOS 配置导入，以及仅面向 Local Ops 自己创建的 Job Object 进程树控制。共享核心只绑定回环地址；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
+总控台是一个本地服务与批处理任务快速启动、运行监测工具。macOS 版本保留完整现有功能；Windows 当前是 Phase 5 本地实现与 unsigned 自包含打包候选，提供安全的本地监听与进程观察、结构化命令配置、显式 macOS 配置导入，以及仅面向 Local Ops 自己创建的 Job Object 进程树控制。Phase 5 exact-commit CI 和外部发行门禁尚未完成，因此仍是 Preview / Alpha，而不是 Windows Beta。共享核心只绑定回环地址；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
 
 > 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整；`总控台.app` 目前不是可单独复制的自包含应用，也尚不代表经过签名、公证的最终 macOS 发行版。
 
-总控台只服务当前机器和当前用户，不是远程运维、多人协作或公网管理面板。macOS 完整版能够以当前用户权限执行保存的 shell 命令；Windows Phase 4 只允许控制经 SID、generation、PID 创建时间、HMAC/受保护回执和 Job Object 完整验证的自建进程树。外部进程认领与结束仍禁用。不要将监听地址、反向代理、SSH 隧道或端口映射暴露到不受信任的网络。
+总控台只服务当前机器和当前用户，不是远程运维、多人协作或公网管理面板。macOS 完整版能够以当前用户权限执行保存的 shell 命令；Windows 只允许控制经 SID、generation、PID 创建时间、HMAC/受保护回执和 Job Object 完整验证的自建进程树。外部进程认领与结束仍禁用。不要将监听地址、反向代理、SSH 隧道或端口映射暴露到不受信任的网络。
 
 ## 功能
 
@@ -34,7 +34,7 @@
 - macOS 自带的 `ps`、`lsof`、`osascript` 等系统工具。
 - Safari、Chrome 或其他支持 ES Modules 的现代浏览器。
 
-Windows Phase 4 源码候选要求 Windows 11 x64、Python 3.12，以及 `requirements-windows.txt` 中锁定的依赖。Windows NT build 26200（25H2）非管理员本地门禁已通过；实现提交 `06d9b1a37d4b775f4b01f822a021afb93513514c` 也已通过 exact-commit CI run `31768949592` 的 Windows Python 3.12 与完整 macOS regression/release jobs。状态以 `docs/windows-port/STATE.json` 为准。Windows 10、self-contained 打包和干净机器验收属于 Phase 5，因此当前仍不是 Windows Beta 发布。
+Windows 源码运行要求 Windows 11 x64、Python 3.12，以及 `requirements-windows.txt` 中锁定的依赖；unsigned onedir 候选把 Python 3.12 runtime 和 Windows runtime dependencies 一并打包。Phase 4 实现提交 `06d9b1a37d4b775f4b01f822a021afb93513514c` 已通过 exact-commit CI run `31768949592`，仍是最后一个绿色阶段。Phase 5 当前为 `IMPLEMENTED_LOCAL_PASS_CI_PENDING`，状态以 `docs/windows-port/STATE.json` 为准。Windows 10、干净无 Python VM、Defender/SmartScreen、原生选择器/通知、素材审核和 Phase 5 exact-commit CI 尚未完成，因此当前不是 Windows Beta 发布。
 
 ## Windows Phase 4 生命周期源码候选
 
@@ -59,6 +59,22 @@ request/receipt 原子写入会先保护临时文件的 DACL，再替换为公�
 Windows 仍不支持外部进程认领、外部进程结束和总控台重启。不要通过修改前端或直接调用接口绕过 capability 与每应用 `controlAvailable` 门禁。破坏性生命周期测试只能设置 `LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS=1` 后在隔离夹具作用域或 hosted runner 中运行，并且只能操作测试夹具创建的进程；禁止控制任何现有用户进程。
 
 本地 Phase 4 门禁已通过 Windows real discovery 174/174（406.426s）、frontend 24/24、HTTP hardening 6/6（合计 30/30）和 Node 30/30。其中包括 `WIN-LIFE-001..012` 的 12/12、`WIN-SEC-001..014` 的 14/14、HTTP 总控台测试子进程终止后重开，以及 100 次完整启动/Force/释放循环。相同实现已通过上述 exact-commit CI；只有 Phase 5 的 Windows 10、self-contained clean-machine 和发行审计全部通过后，才会把 `windowsBetaReady` 改为 `true`。
+
+## Windows Phase 5 本地打包候选
+
+Phase 5 增加 Python 3.12 + PyInstaller 6.21.0 的 onedir/windowed/x64 unsigned zip、可复现 sidecar/manifest 和发行内容审计。源码 venv 启动 runner 时改用 base Python 并保留 `__PYVENV_LAUNCHER__`，避免 venv redirector 的短命 PID 被误当成受管根；runner 先脱离继承 console 再创建私有 console group。冻结程序以同一 executable 派生 runner 时设置 `PYINSTALLER_RESET_ENVIRONMENT=1`，构建显式包含 `win32timezone`，所有目标 executable 在启动前解析为绝对路径。
+
+在 Windows Python 3.12 环境从项目根目录构建和审计：
+
+```powershell
+py -3.12 -m pip install -r requirements-windows.txt -r requirements-build-windows.txt
+py -3.12 tools\build_windows.py build --output-dir dist\windows
+py -3.12 tools\build_windows.py audit --archive dist\windows\local-ops-1.0.0-windows-x64-unsigned.zip
+```
+
+当前本地证据包括：Windows lifecycle gate 207 tests `OK`、1 个 package-smoke gate skip、120.941s；packaging unit 25 ran / 24 passed / 1 gated skip；focused 109/109、shared contracts 31 passed + 1 symlink-privilege skip、frontend+HTTP hardening 30/30、Node 30/30、common 10/10、project checks 6/6、compile 45，以及 Ruff/diff PASS。current-tree audited package smoke 为 1/1 PASS（25.468s）：解压到只读中文与空格路径，剥离 child PATH 后完成真实 start/log/port、controller close/reopen、Force stop/release/delete，并确认 bundle tree hashes 未变化。测试 harness 本身仍有 Python 和依赖，因此这项证据不等价于“干净 VM 未安装 Python”。
+
+current-tree 的两次独立 build 与 internal/independent audit 均通过。两个 15,155,392-byte archive 字节完全一致，SHA-256 为 `60e0b33b4903bdc58ef905e3673cff87a421a767c460122812d7e099d4ecaa3c`；checksum sidecar file SHA-256 为 `b77c24f9a066e70bf090f8e1c30365b1d485f5c36a20bdb9019011e742858f0f`，manifest sidecar file SHA-256 为 `3b1adfe6ee63d097e5a1aee587ca3428daea383ac8f50f7e3d698fb366033986`，A/B 的 sidecar 内容和字节均一致。Phase 5 的 `implementationCommit` 与 `ciRun` 保持 `null`，`lastGreenPhase=P4`，`windowsBetaReady=false`。开发产物明确为 unsigned；Windows 10、干净无 Python VM、Defender/SmartScreen、原生 picker、Windows Notification Center 和 favicon 品牌审核分别保持 `NOT_RUN`、`DEFERRED` 或 `REVIEW_REQUIRED`，不得从本地 smoke 推断通过。
 
 `VERSION` 是项目版本的唯一权威来源。`Info.plist`、发行包名和发行说明应与它保持一致。
 
@@ -257,7 +273,7 @@ python3 server.py
 
 ## 开发
 
-macOS runtime 无第三方 Python 依赖；Windows runtime 使用 `requirements-windows.txt` 中精确锁定的 `psutil` 与 `pywin32`。重新生成品牌图标派生文件或图标库时需要开发依赖：
+macOS runtime 无第三方 Python 依赖；Windows runtime 使用 `requirements-windows.txt` 中精确锁定的 `psutil` 与 `pywin32`，Windows 打包工具链单独锁定在 `requirements-build-windows.txt`。重新生成品牌图标派生文件或图标库时需要开发依赖：
 
 ```bash
 python3 -m venv .venv
@@ -270,8 +286,10 @@ python3 -m pip install -r requirements-dev.txt
 ```text
 server.py                 共享 Python HTTP、配置与业务核心
 localops/platform/        macOS/Windows 原生 adapter
+localops/windows/         Windows runner、Job、IPC 与冻结入口
 static/                   原生前端、主题、品牌、图标和字体
 tests/                    后端、前端契约、发布与交付检查
+tools/build_windows.py     构建并审计 unsigned Windows x64 onedir zip
 tools/gen_brand_assets.py 从品牌主图生成 favicon 与 macOS App Icon
 tools/gen_icons.py         由 vendored SVG 生成 icons.js
 tools/check_project.py     统一的只读项目检查
@@ -323,6 +341,7 @@ make check
 - 通过 `make release-check` 和人工 UI/安全/升级/回滚验收。
 - 不含任何项目内旧 `data/`、用户 Library 数据、日志、绝对路径、token 或缓存的发行包。
 - 针对目标 Mac 的签名、公证、完整性校验、全新安装和回退证据。
+- Windows 候选还必须在 Phase 5 exact-commit CI、真实 Windows 10/11 非管理员环境、干净无 Python VM、Defender/SmartScreen 和素材审核全部通过后，才可标记为 Beta；当前 unsigned 本地产物不满足该门禁。
 
 ## 参与贡献与安全
 

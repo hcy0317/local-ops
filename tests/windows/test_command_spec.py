@@ -263,6 +263,26 @@ class PreparedInvocationTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "Windows PATH/PATHEXT tests")
 class WindowsDetectionAndPreflightTests(unittest.TestCase):
+    def test_bare_executable_prefers_cwd_before_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cwd = os.path.join(temp_dir, "project")
+            path_dir = os.path.join(temp_dir, "path")
+            os.mkdir(cwd)
+            os.mkdir(path_dir)
+            cwd_tool = os.path.join(cwd, "tool.exe")
+            path_tool = os.path.join(path_dir, "tool.exe")
+            for path in (cwd_tool, path_tool):
+                with open(path, "wb") as stream:
+                    stream.write(b"fixture")
+
+            resolved = resolve_windows_executable(
+                "tool.exe", env={"PATH": path_dir}, cwd=cwd
+            )
+
+        self.assertEqual(
+            os.path.normcase(resolved), os.path.normcase(cwd_tool)
+        )
+
     def test_pathext_resolves_npm_and_pnpm_cmd_shims(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             npm = os.path.join(temp_dir, "npm.CMD")

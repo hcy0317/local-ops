@@ -9,14 +9,12 @@ permissions:
   contents: read
 
 jobs:
-  windows-read-only:
-    name: Windows Phase 2-4 contracts and isolated lifecycle
-    runs-on: windows-2022
+  common-checks:
+    name: Common syntax, contracts, and static resources
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       PYTHONDONTWRITEBYTECODE: "1"
-      # Destructive primitives may target only processes created by the test fixtures.
-      LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS: "1"
 
     steps:
       - name: Check out source
@@ -29,25 +27,21 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Windows runtime dependencies
-        run: python -m pip install --disable-pip-version-check -r requirements-windows.txt
+      - name: Set up Node.js 24.8.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24.8.0"
 
-      - name: Compile and import Windows Phase 4 modules
+      - name: Show toolchain
         run: |
-          python -m compileall -q server.py localops tools tests
-          python -c "import server; import localops.command_spec; import localops.config_import; from localops.platform.windows import WindowsPlatform; assert server.PLATFORM.name == 'windows'; assert WindowsPlatform('.', 'server.py').name == 'windows'"
+          python --version
+          node --version
 
-      - name: Run Windows and fixture-owned lifecycle tests
-        run: python -m unittest discover -s tests/windows -p "test_*.py" -v
+      - name: Run common checks and nonzero test suites
+        run: python tools/check_project.py --scope common
 
-      - name: Run API contract tests
-        run: python -m unittest discover -s tests/contract -p "test_*.py" -v
-
-      - name: Run frontend and HTTP hardening tests
-        run: python -m unittest tests.test_frontend tests.test_hardening.HttpSecurityTests -v
-
-  check-and-release:
-    name: Check and release audit
+  macos-checks:
+    name: macOS regression and source release audit
     runs-on: macos-15
     timeout-minutes: 20
     env:
@@ -65,15 +59,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Show toolchain
-        run: |
-          python --version
-          node --version
+      - name: Run macOS platform checks and full Python regression
+        run: python tools/check_project.py --scope macos
 
-      - name: Run project checks
-        run: make check PYTHON=python
-
-      - name: Build and verify release
+      - name: Build and verify macOS source release
         run: |
           make release PYTHON=python
           make release-verify PYTHON=python
@@ -81,3 +70,137 @@ jobs:
           make release PYTHON=python
           cmp "$RUNNER_TEMP/console-first.zip" dist/console-*.zip
           make release-verify PYTHON=python
+
+  windows-checks:
+    name: Windows lifecycle and unsigned x64 package audit
+    needs: [common-checks, macos-checks]
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      # Destructive primitives may target only processes created by the test fixtures.
+      LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS: "1"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js 24.8.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24.8.0"
+
+      - name: Install Windows runtime dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-windows.txt
+
+      - name: Install pinned Windows build dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-build-windows.txt
+
+      - name: Run Windows project checks
+        run: python tools/check_project.py --scope windows --skip-tests
+
+      - name: Compile and import Windows modules
+        run: |
+          python -m compileall -q server.py localops tools tests
+          python -c "import server; import localops.command_spec; import localops.config_import; import localops.windows.packaged_entry; from localops.platform.windows import WindowsPlatform; assert server.PLATFORM.name == 'windows'; assert WindowsPlatform('.', 'server.py').name == 'windows'"
+
+      - name: Run Windows and fixture-owned lifecycle tests
+        shell: pwsh
+        run: |
+          $output = & python -m unittest discover -s tests/windows -p "test_*.py" -v 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($exitCode -ne 0) { exit $exitCode }
+          if (($output -join "`n") -notmatch 'Ran\s+([1-9][0-9]*)\s+tests?') {
+            throw "Windows test discovery returned no verifiable nonzero test count"
+          }
+
+      - name: Run API contract tests
+        shell: pwsh
+        run: |
+          $output = & python -m unittest discover -s tests/contract -p "test_*.py" -v 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($exitCode -ne 0) { exit $exitCode }
+          if (($output -join "`n") -notmatch 'Ran\s+([1-9][0-9]*)\s+tests?') {
+            throw "Contract test discovery returned no verifiable nonzero test count"
+          }
+
+      - name: Run frontend and HTTP hardening tests
+        shell: pwsh
+        run: |
+          $output = & python -m unittest tests.test_frontend tests.test_hardening.HttpSecurityTests -v 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($exitCode -ne 0) { exit $exitCode }
+          if (($output -join "`n") -notmatch 'Ran\s+([1-9][0-9]*)\s+tests?') {
+            throw "Frontend test command returned no verifiable nonzero test count"
+          }
+
+      - name: Build, reproduce, and audit unsigned Windows x64 package
+        shell: pwsh
+        run: |
+          python tools/build_windows.py build --output-dir dist/windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/build_windows.py build --output-dir dist/windows-repro
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $archives = @(Get-ChildItem -LiteralPath dist/windows -File -Filter "local-ops-*-windows-x64-unsigned.zip")
+          $reproArchives = @(Get-ChildItem -LiteralPath dist/windows-repro -File -Filter "local-ops-*-windows-x64-unsigned.zip")
+          $checksums = @(Get-ChildItem -LiteralPath dist/windows -File -Filter "*.sha256")
+          $manifests = @(Get-ChildItem -LiteralPath dist/windows -File -Filter "*.manifest.json")
+          $reproChecksums = @(Get-ChildItem -LiteralPath dist/windows-repro -File -Filter "*.sha256")
+          $reproManifests = @(Get-ChildItem -LiteralPath dist/windows-repro -File -Filter "*.manifest.json")
+          if ($archives.Count -ne 1 -or $reproArchives.Count -ne 1 -or
+              $checksums.Count -ne 1 -or $reproChecksums.Count -ne 1 -or
+              $manifests.Count -ne 1 -or $reproManifests.Count -ne 1) {
+            throw "Expected exactly one archive, checksum, and manifest from each Windows build"
+          }
+          $primaryHash = (Get-FileHash -LiteralPath $archives[0].FullName -Algorithm SHA256).Hash
+          $reproHash = (Get-FileHash -LiteralPath $reproArchives[0].FullName -Algorithm SHA256).Hash
+          if ($primaryHash -cne $reproHash) {
+            throw "Unsigned Windows package is not byte-for-byte reproducible"
+          }
+          if ((Get-Content -Raw -LiteralPath $checksums[0].FullName) -cne
+              (Get-Content -Raw -LiteralPath $reproChecksums[0].FullName)) {
+            throw "Windows package checksum sidecar is not reproducible"
+          }
+          if ((Get-Content -Raw -LiteralPath $manifests[0].FullName) -cne
+              (Get-Content -Raw -LiteralPath $reproManifests[0].FullName)) {
+            throw "Windows package manifest sidecar is not reproducible"
+          }
+          python tools/build_windows.py audit --archive $archives[0].FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run audited Windows package smoke
+        shell: pwsh
+        run: |
+          $archives = @(Get-ChildItem -LiteralPath dist/windows -File -Filter "local-ops-*-windows-x64-unsigned.zip")
+          if ($archives.Count -ne 1) { throw "Expected exactly one audited Windows package" }
+          $env:LOCALOPS_RUN_WINDOWS_PACKAGE_SMOKE = "1"
+          $env:LOCALOPS_WINDOWS_PACKAGE_ARCHIVE = $archives[0].FullName
+          $output = & python -m unittest tests.windows.test_windows_package_smoke -v 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($exitCode -ne 0) { exit $exitCode }
+          if (($output -join "`n") -notmatch 'Ran\s+1\s+test') {
+            throw "Windows package smoke returned no verifiable test result"
+          }
+          if (($output -join "`n") -match '(?i)skipped') {
+            throw "Windows package smoke was skipped"
+          }
+
+      - name: Upload audited unsigned Windows package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: local-ops-windows-x64-unsigned
+          path: dist/windows/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

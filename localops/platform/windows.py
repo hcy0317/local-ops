@@ -26,7 +26,11 @@ import win32security
 import winerror
 from win32com.shell import shell
 
-from localops.command_spec import CommandSpecError, prepared_invocation
+from localops.command_spec import (
+    CommandSpecError,
+    prepared_invocation,
+    resolve_windows_executable,
+)
 from localops.windows.runner_protocol import (
     PIPE_BUFFER_BYTES,
     ProtocolError,
@@ -91,6 +95,33 @@ class _WindowsRuntimeContext:
 
 def _issue(component: str, code: str, message: str) -> PlatformIssue:
     return PlatformIssue(component, code, message)
+
+
+def _runner_process_settings() -> tuple[str, dict[str, str] | None]:
+    """Return a runner executable whose PID is the long-lived interpreter."""
+    executable = sys.executable
+    environment: dict[str, str] | None = None
+    if bool(getattr(sys, "frozen", False)):
+        environment = dict(os.environ)
+        environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        return executable, environment
+
+    base_executable = getattr(sys, "_base_executable", executable)
+    if (
+        isinstance(base_executable, str)
+        and base_executable
+        and os.path.normcase(os.path.abspath(base_executable))
+        != os.path.normcase(os.path.abspath(executable))
+    ):
+        resolved = resolve_windows_executable(
+            base_executable, env=os.environ, cwd=os.getcwd()
+        )
+        if resolved is None:
+            raise CommandSpecError("Python base executable is unavailable")
+        executable = resolved
+        environment = dict(os.environ)
+        environment["__PYVENV_LAUNCHER__"] = sys.executable
+    return executable, environment
 
 
 class WindowsInstanceLock:
@@ -1125,6 +1156,35 @@ class WindowsPlatform:
         directory_created = False
         try:
             invocation = prepared_invocation(app.command_spec)
+            if isinstance(invocation, list):
+                executable = invocation[0]
+                resolved = resolve_windows_executable(
+                    executable, env=os.environ, cwd=app.cwd
+                )
+                if resolved is None:
+                    raise CommandSpecError("Windows executable is unavailable")
+                invocation = [resolved, *invocation[1:]]
+            else:
+                executable = str(invocation["executable"])
+                resolved = resolve_windows_executable(
+                    executable, env=os.environ, cwd=app.cwd
+                )
+                if resolved is None:
+                    raise CommandSpecError("Windows executable is unavailable")
+                invocation = {**invocation, "executable": resolved}
+            runner_executable, runner_environment = _runner_process_settings()
+            if (
+                isinstance(invocation, list)
+                and runner_environment is not None
+                and runner_environment.get("__PYVENV_LAUNCHER__") == sys.executable
+                and os.path.normcase(os.path.abspath(invocation[0]))
+                == os.path.normcase(os.path.abspath(sys.executable))
+            ):
+                # The Windows venv redirector exits after spawning base Python,
+                # which would make rootPid and its console group stale. The
+                # runner already carries the venv launcher marker, so invoking
+                # base Python directly preserves the venv with one stable root.
+                invocation = [runner_executable, *invocation[1:]]
             directory, request_path, token_path, receipt_path, expected_log = (
                 self._runtime_files(app.app_id, app.generation_id)
             )
@@ -1178,15 +1238,20 @@ class WindowsPlatform:
                 | win32process.CREATE_NEW_PROCESS_GROUP
                 | win32process.CREATE_UNICODE_ENVIRONMENT
             )
-            process = subprocess.Popen(
-                runner_command(sys.executable, app.app_id, app.generation_id),
-                cwd=self.base_dir,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-                creationflags=flags,
-            )
+            with open(expected_log, "ab", buffering=0) as runner_log:
+                self.verify_private_file(expected_log)
+                process = subprocess.Popen(
+                    runner_command(
+                        runner_executable, app.app_id, app.generation_id
+                    ),
+                    cwd=self.base_dir,
+                    env=runner_environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=runner_log,
+                    stderr=runner_log,
+                    close_fds=True,
+                    creationflags=flags,
+                )
             deadline = time.monotonic() + _RUNNER_PREPARE_TIMEOUT
             while time.monotonic() < deadline:
                 if os.path.isfile(receipt_path):

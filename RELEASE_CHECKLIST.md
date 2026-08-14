@@ -61,6 +61,21 @@
 - [x] Phase 4 implementation commit `06d9b1a37d4b775f4b01f822a021afb93513514c` 的 Windows Python 3.12 CI 与完整 macOS regression/release CI 已在 run `31768949592` 同时通过，Phase 4 状态为 `PASS`。
 - [ ] Windows 10、self-contained 打包和干净无 Python VM 仍为 Phase 5；这些项目完成前 `windowsBetaReady=false`。
 
+### Windows Phase 5 打包与 Beta 门禁
+
+- [x] 已实现 Python 3.12 + PyInstaller onedir/windowed/x64 unsigned zip、精确锁定的 build dependencies、版本资源、runtime licenses、checksum/manifest sidecars 与内容审计；构建依赖没有混入源码 runtime dependency policy。
+- [x] 源码 venv runner 使用 base Python + `__PYVENV_LAUNCHER__` 保持真实长期 PID；runner 先 `FreeConsole` 再建立私有 `AllocConsole`；冻结 same-exe child 设置 `PYINSTALLER_RESET_ENVIRONMENT=1`；`win32timezone` 显式打包，目标 executable 在启动前绝对解析。
+- [x] Windows Python 3.12 完整 lifecycle gate 为 207 tests `OK`、1 个 package-smoke gate skip、120.941s；packaging unit 为 25 ran / 24 passed / 1 gated skip；focused 109/109、shared contracts 31 passed + 1 symlink-privilege skip、frontend+HTTP hardening 30/30、Node 30/30、common 10/10、project checks 6/6、compile 45，Ruff 与 diff check 均通过。
+- [x] current-tree audited package smoke 1/1 PASS（25.468s）：只读中文与空格路径、剥离 child PATH、真实 start/log/port、controller close/reopen、Force stop/release/delete、fixture PID/port 清理和 bundle tree hash 不变；测试只控制夹具创建的进程。
+- [x] current-tree 两次独立 build + internal/independent audit 均通过：15,155,392-byte archive A/B 字节一致，SHA-256 `60e0b33b4903bdc58ef905e3673cff87a421a767c460122812d7e099d4ecaa3c`；checksum sidecar file SHA-256 `b77c24f9a066e70bf090f8e1c30365b1d485f5c36a20bdb9019011e742858f0f`、manifest sidecar file SHA-256 `3b1adfe6ee63d097e5a1aee587ca3428daea383ac8f50f7e3d698fb366033986`，A/B sidecar 内容与字节一致。
+- [ ] Phase 5 exact implementation commit 尚未冻结，`implementationCommit=null`、`ciRun=null`；common/macOS/Windows/package jobs 全绿前状态保持 `IMPLEMENTED_LOCAL_PASS_CI_PENDING`，`lastGreenPhase=P4`。
+- [ ] 在独立干净 Windows x64 VM（未安装 Python）从最终 zip 启动并完成 lifecycle smoke；stripped child PATH 只证明 package child 不依赖 PATH，不是 clean-VM 等价证据。
+- [ ] Windows 10 x64 非管理员完整验收仍为 `DEFERRED/NOT_RUN`；不得用 Windows 11 或 hosted runner 结果替代。
+- [ ] Defender 和 SmartScreen 对最终 unsigned artifact 的检查仍为 `NOT_RUN`；任何警告或阻断必须原样记录。
+- [ ] Windows native picker 与 Windows Notification Center 真实投递仍为 `NOT_RUN`；headless picker/Notification object contracts 不代替 OS 级验收。
+- [ ] favicon 品牌素材仍为 `REVIEW_REQUIRED`，需要发布负责人形成书面审核结论。
+- [ ] 当前 artifact 明确为 unsigned development candidate。以上门禁、回滚证据和签字全部完成前，`windowsBetaReady=false`，不得写成 Beta、production-ready 或公开签名发行版。
+
 ## 3. 安全与进程生命周期
 
 - [ ] HTTP 服务仅绑定 `127.0.0.1`，不会因配置或启动方式变为局域网可访问。

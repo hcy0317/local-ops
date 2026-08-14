@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import argparse
 import shutil
 import subprocess
 import tempfile
@@ -38,20 +39,36 @@ def resized(source: Image.Image, size: int) -> Image.Image:
     return source.resize((size, size), Image.Resampling.LANCZOS)
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--windows-ico-only",
+        action="store_true",
+        help="Generate only the Windows multi-size ICO without macOS iconutil.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     if not SOURCE.is_file():
         raise SystemExit(f"缺少品牌主图：{SOURCE}")
     source = Image.open(SOURCE).convert("RGBA")
     if source.width != source.height:
         raise SystemExit("品牌主图必须是正方形")
 
-    resized(source, 32).save(ASSETS / "favicon-32.png", optimize=True)
-    resized(source, 180).save(ASSETS / "apple-touch-icon.png", optimize=True)
     source.save(
         ASSETS / "favicon.ico",
         format="ICO",
-        sizes=[(16, 16), (32, 32), (48, 48)],
+        sizes=[(16, 16), (32, 32), (48, 48), (256, 256)],
     )
+
+    if args.windows_ico_only:
+        print(f"已生成 {ASSETS / 'favicon.ico'}")
+        return
+
+    resized(source, 32).save(ASSETS / "favicon-32.png", optimize=True)
+    resized(source, 180).save(ASSETS / "apple-touch-icon.png", optimize=True)
 
     iconutil = shutil.which("iconutil")
     if not iconutil:

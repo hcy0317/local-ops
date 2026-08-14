@@ -6,7 +6,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from localops.command_spec import direct_command_spec
+from localops.command_spec import shell_command_spec
 from localops.platform.contracts import LaunchRequest, ScanStatus, StopResult
 
 if sys.platform == "win32":
@@ -16,6 +16,7 @@ if sys.platform == "win32":
     import win32process
     import win32security
 
+    from localops.platform import windows as windows_adapter
     from localops.platform.windows import WindowsPlatform
     from localops.windows.runner_protocol import (
         PROTOCOL_VERSION,
@@ -30,6 +31,28 @@ if sys.platform == "win32":
 class WindowsPlatformTests(unittest.TestCase):
     def setUp(self):
         self.platform = WindowsPlatform(os.getcwd(), "server.py")
+
+    def test_source_venv_runner_uses_base_process_with_venv_context(self):
+        venv_python = r"C:\fixture\.venv\Scripts\python.exe"
+        base_python = r"C:\Python312\python.exe"
+        with mock.patch.object(sys, "executable", venv_python), \
+                mock.patch.object(
+                    sys, "_base_executable", base_python, create=True
+                ), \
+                mock.patch.object(sys, "frozen", False, create=True), \
+                mock.patch.object(
+                    windows_adapter, "resolve_windows_executable",
+                    return_value=base_python,
+                ) as resolve:
+            executable, environment = windows_adapter._runner_process_settings()
+
+        self.assertEqual(executable, base_python)
+        self.assertIsNotNone(environment)
+        self.assertEqual(environment["__PYVENV_LAUNCHER__"], venv_python)
+        self.assertNotIn("PYINSTALLER_RESET_ENVIRONMENT", environment)
+        resolve.assert_called_once_with(
+            base_python, env=os.environ, cwd=os.getcwd()
+        )
 
     @staticmethod
     def _create_recovery_record(platform, *, state="exited"):
@@ -723,6 +746,11 @@ class WindowsPlatformTests(unittest.TestCase):
                 )[3]
                 process = mock.Mock(pid=4321)
                 process.poll.return_value = None
+                resolved_shell = os.path.join(
+                    os.environ.get("SystemRoot", r"C:\Windows"),
+                    "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+                )
+                captured_invocations = []
                 public = {
                     "jobName": "LocalOps-fixture",
                     "ownerSid": platform.current_principal().identifier,
@@ -736,14 +764,25 @@ class WindowsPlatformTests(unittest.TestCase):
                 }
 
                 def create_receipt(*_args, **_kwargs):
+                    from localops.windows.runner_protocol import read_json
+
+                    captured_invocations.append(
+                        read_json(platform._runtime_files(
+                            app_id, generation_id
+                        )[1])["invocation"]
+                    )
                     with open(receipt_path, "w", encoding="utf-8") as stream:
                         stream.write("{}")
                     platform.ensure_private_file(receipt_path)
                     return process
 
-                with mock.patch(
+                with mock.patch.object(sys, "frozen", True, create=True), \
+                        mock.patch(
+                            "localops.platform.windows.resolve_windows_executable",
+                            return_value=resolved_shell) as resolve, \
+                        mock.patch(
                         "localops.platform.windows.subprocess.Popen",
-                        side_effect=create_receipt), \
+                        side_effect=create_receipt) as popen, \
                         mock.patch(
                             "localops.platform.windows.validate_receipt",
                             return_value={"identity": public, "members": [6543]}), \
@@ -766,8 +805,8 @@ class WindowsPlatformTests(unittest.TestCase):
                         log_path=os.path.join(
                             platform.runtime_paths().logs_dir, app_id + ".log"
                         ),
-                        command_spec=direct_command_spec(
-                            sys.executable, ["-c", "pass"]
+                        command_spec=shell_command_spec(
+                            "powershell", "exit 0", needs_review=False
                         ),
                         generation_id=generation_id,
                     ))
@@ -777,6 +816,14 @@ class WindowsPlatformTests(unittest.TestCase):
                     result.runtime_identity is not None, retains_identity
                 )
                 self.assertEqual(release.called, abort_ok)
+                self.assertEqual(captured_invocations[0][0], resolved_shell)
+                self.assertEqual(resolve.call_args.args[0], "powershell.exe")
+                self.assertEqual(
+                    popen.call_args.kwargs["env"][
+                        "PYINSTALLER_RESET_ENVIRONMENT"
+                    ],
+                    "1",
+                )
 
 
 if __name__ == "__main__":

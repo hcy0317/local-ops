@@ -2,22 +2,23 @@
   "schemaVersion": 1,
   "task": "local-ops-windows-port",
   "baselineCommit": "a5c3adae1f1fa0bd9f0ac7b090ec422e285d0c0f",
-  "implementationCommit": "06d9b1a37d4b775f4b01f822a021afb93513514c",
-  "ciRun": "31768949592",
-  "branch": "windows-port/phases-1-4",
-  "currentPhase": "P4",
-  "phaseStatus": "PASS",
-  "scopedTarget": "Windows 11 Phase 4",
-  "scopedTargetStatus": "PASS",
+  "implementationCommit": null,
+  "ciRun": null,
+  "branch": "codex/windows-port-phase-5",
+  "currentPhase": "P5",
+  "phaseStatus": "IMPLEMENTED_LOCAL_PASS_CI_PENDING",
+  "scopedTarget": "Windows 11 Phase 5 local unsigned package candidate",
+  "scopedTargetStatus": "IMPLEMENTED_LOCAL_PASS_CI_PENDING",
   "windows10Status": "DEFERRED",
   "lastGreenPhase": "P4",
-  "macosTests": "PASS",
-  "windowsTests": "PASS",
+  "macosTests": "NOT_RUN",
+  "windowsTests": "PASS_LOCAL",
   "windowsBetaReady": false,
   "changedFiles": [
     "MEMORY.md",
     ".github/workflows/ci.yml",
     "AGENTS.md",
+    "ASSET_PROVENANCE.md",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
     "README.md",
@@ -45,10 +46,13 @@
     "localops/platform/windows.py",
     "localops/windows/__init__.py",
     "localops/windows/job_object.py",
+    "localops/windows/packaged_entry.py",
     "localops/windows/runner.py",
     "localops/windows/runner_protocol.py",
+    "requirements-build-windows.txt",
     "requirements-windows.txt",
     "server.py",
+    "static/assets/favicon.ico",
     "static/app.js",
     "static/base.css",
     "static/index.html",
@@ -70,16 +74,21 @@
     "tests/windows/test_command_spec.py",
     "tests/windows/test_runner.py",
     "tests/windows/test_runner_protocol.py",
+    "tests/windows/test_windows_package_smoke.py",
+    "tests/windows/test_windows_packaging.py",
     "tests/windows/test_windows_job_object.py",
     "tests/windows/test_windows_lifecycle.py",
     "tests/windows/test_windows_lifecycle_http.py",
     "tests/windows/test_windows_security_matrix.py",
     "tests/windows/test_windows_phase3_contract.py",
     "tests/test_frontend.py",
+    "tests/test_project_checks.py",
     "tests/test_server.py",
     "tools/build_release.py",
+    "tools/build_windows.py",
     "tools/check_platform_leaks.py",
-    "tools/check_project.py"
+    "tools/check_project.py",
+    "tools/gen_brand_assets.py"
   ],
   "decisions": [
     "P0-D001",
@@ -108,16 +117,25 @@
     "P4-D002",
     "P4-D003",
     "P4-D004",
-    "P4-D005"
+    "P4-D005",
+    "P5-D001",
+    "P5-D002",
+    "P5-D003",
+    "P5-D004",
+    "P5-D005"
   ],
   "assumptions": [
-    "The local Phase 4 gate ran on Windows NT build 26200 (DisplayVersion 25H2), x64, at medium integrity without administrator membership.",
-    "The local Phase 4 Python evidence is 3.13.13; exact-commit CI passed on Windows Python 3.12 and macOS, while Windows 10 remains Phase 5 scope."
+    "The current Phase 5 local gate ran on Windows 11 x64 with Python 3.12 and controlled only fixture-created processes.",
+    "The package-smoke harness retained Python and its test dependencies while only the packaged child's PATH was stripped; this is not clean-VM evidence."
   ],
   "knownBlockers": [],
   "deferredGates": [
     "Windows 10 non-admin validation remains deferred by explicit user scope.",
-    "Windows packaging and clean-machine validation remain Phase 5."
+    "The Phase 5 exact implementation commit and common/macOS/Windows/package CI run are not yet frozen or run.",
+    "An independent clean Windows x64 VM without Python remains NOT_RUN.",
+    "Defender and SmartScreen checks remain NOT_RUN.",
+    "The native Windows picker and Windows Notification Center delivery remain NOT_RUN.",
+    "The favicon brand review remains REVIEW_REQUIRED, and the development artifact remains unsigned."
   ],
   "knownFailures": [
     "Historical failed Phase 4 attempt: exact commit fc29e5637d93b95026a5dbca5e46c638c51b5439 (fc29e56), CI run 31766584905, failed on Windows TokenOwner new-object owner semantics and macOS lifecycle test principal isolation; it is not accepted Phase 4 evidence.",
@@ -125,24 +143,22 @@
     "Historical failed Phase 4 attempt: exact commit b96b5c4293559b7cd17e855cfb055eba39495c02, CI run 31768341494, exposed redirected cp1252 stdout crashing localized console startup; commit 06d9b1a fixed the production output boundary."
   ],
   "verificationLimitations": [
-    "Phase 4 local UI QA used isolated Edge 151; the native Windows picker and Windows Notification Center delivery remain NOT_RUN, while notification permission-denied/granted and object construction/close passed.",
-    "One contract symlink rejection test is skipped because this non-admin Windows session cannot create symlinks."
+    "The read-only Chinese-and-space-path package smoke stripped the packaged child's PATH, but the harness still had Python and dependencies; it does not prove a clean no-Python VM.",
+    "Windows 10, Defender/SmartScreen, the native Windows picker, and Windows Notification Center delivery are NOT_RUN or DEFERRED.",
+    "One shared-contract symlink rejection test is skipped because this non-admin Windows session cannot create symlinks.",
+    "The favicon brand audit is REVIEW_REQUIRED, and the package is an unsigned development artifact."
   ],
   "verifiedResults": [
-    "The gated real Windows test discovery passed 174 of 174 tests in 406.426 seconds using only fixture-created processes.",
-    "WIN-LIFE-001 through WIN-LIFE-012 passed 12 of 12, including real HTTP console subprocess termination/reopen, Job reconnect, runner crash isolation, stale-generation refusal, and 100 full launch/force/release cycles.",
-    "WIN-SEC-001 through WIN-SEC-014 passed all 14 explicit security cases.",
-    "Frontend passed 24 of 24 and HTTP hardening passed 6 of 6 (30 of 30 combined); the lifecycle Node suite passed 30 of 30.",
-    "Isolated Edge 151 UI lifecycle QA passed add, start, log marker, HTTP 200, graceful stop, bad-cwd diagnostic, restore, start, generation-changing restart, final stop, and delete; final runtime identity and records were absent, fixture PIDs and ports were gone, 1280 px and 360 px had no horizontal overflow, and notification permission-denied/granted plus object construction/close passed.",
-    "Focused Edge UI follow-up passed compatibility-blocked edit recovery without changing the structured command, backend compatibility ready and health ok after save, and the banner 400, drawer mask 410, drawer 415, toast 420 layer order; the real drawer close click succeeded at the former overlap point and set aria-hidden true.",
-    "The shared contract suite ran 32 tests: 31 passed and one privileged symlink case skipped.",
-    "Ruff passed for the Phase 4 Python scope.",
-    "Runtime release required exactly three private active-generation records, a signed terminal receipt, an empty Job, and an absent runner before atomic rename committed release; committed tombstone recovery accepted only a private, nonlink allowlisted record subset, performed no process observation or control, and failed closed on unknown entries, widened ACLs, or links.",
-    "Windows TokenOwner handling passed locally: default owner is limited to the current user or Builtin Administrators, only creation-time apply may atomically normalize the Admin default owner to the current user plus the protected DACL, and verify-only existing records reject Admin ownership.",
-    "The Windows CI workflow separates Windows/lifecycle discovery, API contracts, and frontend/HTTP hardening into three independent fail-fast steps without continue-on-error.",
-    "Phase 4 implementation commit 06d9b1a37d4b775f4b01f822a021afb93513514c passed exact-commit CI run 31768949592: Windows Python 3.12 job 94670617580 and macOS regression/release job 94670617652 both passed.",
-    "Historical Phase 3 evidence only: implementation commit 97c417ef1491ac11fdb036c4e4102bfc190c88e6 passed CI run 31698371278 (Windows job 94441279178 and macOS job 94441279120); it is not Phase 4 evidence."
+    "The full Windows Python 3.12 lifecycle-gated discovery ran 207 tests in 120.941 seconds with OK, plus one package-smoke gate skip that was not re-executed inside the full discovery.",
+    "The packaging unit module ran 25 tests: 24 passed and one package-smoke gated test skipped.",
+    "Focused Windows tests passed 109 of 109; shared contracts passed 31 with one symlink-privilege skip.",
+    "Frontend plus HTTP hardening passed 30 of 30, lifecycle Node contracts passed 30 of 30, common tests passed 10 of 10, project checks passed 6 of 6, and compile discovery covered 45 files; Ruff and diff checks passed.",
+    "The current-tree audited package smoke passed 1 of 1 in 25.468 seconds using a read-only Chinese-and-space install path and stripped child PATH. It proved real start, log marker, listener, controller close/reopen, force stop, release, delete, fixture PID/port cleanup, and unchanged bundle tree hashes.",
+    "Two independent current-tree builds plus internal and independent audits passed. The 15155392-byte archive was byte-identical across A/B with SHA-256 60e0b33b4903bdc58ef905e3673cff87a421a767c460122812d7e099d4ecaa3c; checksum sidecar file SHA-256 was b77c24f9a066e70bf090f8e1c30365b1d485f5c36a20bdb9019011e742858f0f and manifest sidecar file SHA-256 was 3b1adfe6ee63d097e5a1aee587ca3428daea383ac8f50f7e3d698fb366033986, with A/B sidecar content and bytes identical.",
+    "The Phase 5 build path emits a Python 3.12 PyInstaller onedir/windowed/x64 unsigned zip with canonical checksum and manifest sidecars and audits version, architecture, dependencies, licenses, unsafe paths, user state, secrets, caches, and absolute-path leakage.",
+    "Source venv runner launch uses base Python plus __PYVENV_LAUNCHER__ to retain a stable real runner PID; runner console setup is FreeConsole then private AllocConsole; frozen same-executable children set PYINSTALLER_RESET_ENVIRONMENT=1; win32timezone is an explicit hidden import; target executables are resolved absolutely before creation.",
+    "Phase 4 implementation commit 06d9b1a37d4b775f4b01f822a021afb93513514c passed exact-commit CI run 31768949592: Windows Python 3.12 job 94670617580 and macOS regression/release job 94670617652 both passed, so lastGreenPhase remains P4."
   ],
-  "nextAction": "Begin Phase 5 CI separation, self-contained Windows packaging, artifact audit, and real-machine Beta gates without changing windowsBetaReady until every required target passes.",
-  "lastVerifiedAt": "2026-08-14T12:15:00+08:00"
+  "nextAction": "Freeze the Phase 5 implementation commit and run exact-commit common/macOS/Windows/package CI; then complete Windows 10, clean no-Python VM, Defender/SmartScreen, native picker/notification, favicon review, and release-signing gates before considering Beta.",
+  "lastVerifiedAt": "2026-08-14T14:56:00+08:00"
 }

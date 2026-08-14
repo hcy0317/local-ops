@@ -28,6 +28,7 @@ if sys.platform == "win32":
 
     from localops.command_spec import command_spec_for_executable, direct_command_spec
     from localops.platform.contracts import LaunchRequest
+    from localops.platform import windows as windows_adapter
     from localops.platform.windows import WindowsPlatform
 
 
@@ -146,7 +147,10 @@ class IsolatedWindowsLifecycleTests(unittest.TestCase):
             command_spec=command_spec,
             generation_id=generation_id,
         ))
-        self.assertTrue(result.ok, (result.code, result.error))
+        self.assertTrue(
+            result.ok,
+            (result.code, result.error, self._console_output_tail(log_path)),
+        )
         self.assertEqual(result.status, "prepared")
         self.assertIsNotNone(result.runtime_identity)
         self.runners.append(result.process)
@@ -174,6 +178,9 @@ class IsolatedWindowsLifecycleTests(unittest.TestCase):
     def _free_port():
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
+            listener.setsockopt(
+                socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1
+            )
             listener.bind(("127.0.0.1", 0))
             return listener.getsockname()[1]
         finally:
@@ -231,8 +238,19 @@ class IsolatedWindowsLifecycleTests(unittest.TestCase):
 
     def _console_port(self):
         for port in range(9600, 9610):
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            probe.settimeout(0.2)
+            try:
+                occupied = probe.connect_ex(("127.0.0.1", port)) == 0
+            finally:
+                probe.close()
+            if occupied:
+                continue
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
+                listener.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1
+                )
                 listener.bind(("127.0.0.1", port))
                 return port
             except OSError:
@@ -273,11 +291,12 @@ class IsolatedWindowsLifecycleTests(unittest.TestCase):
         output_id = uuid.uuid4().hex
         stdout_path = os.path.join(self.temp.name, "console-%s.stdout.log" % output_id)
         stderr_path = os.path.join(self.temp.name, "console-%s.stderr.log" % output_id)
+        executable, environment = windows_adapter._runner_process_settings()
         with open(stdout_path, "wb") as stdout_stream, open(stderr_path, "wb") as stderr_stream:
             process = subprocess.Popen(
-                [sys.executable, "server.py", "--no-browser", "--preferred-port", str(port)],
+                [executable, "server.py", "--no-browser", "--preferred-port", str(port)],
                 cwd=self.repo,
-                env=dict(os.environ),
+                env=environment or dict(os.environ),
                 stdin=subprocess.DEVNULL,
                 stdout=stdout_stream,
                 stderr=stderr_stream,

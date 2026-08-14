@@ -52,6 +52,7 @@ INCLUDE = (
     "tests",
     "tools",
     "requirements-dev.txt",
+    "requirements-build-windows.txt",
     "requirements-windows.txt",
     "Makefile",
 )

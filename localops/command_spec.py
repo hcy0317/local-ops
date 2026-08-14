@@ -259,10 +259,18 @@ def resolve_windows_executable(
                 return os.path.abspath(candidate)
         return None
 
-    directories = (environment.get("PATH") or "").split(os.pathsep)
+    directories = []
+    if cwd:
+        directories.append(cwd)
+    directories.extend((environment.get("PATH") or "").split(os.pathsep))
+    checked: set[str] = set()
     for directory in directories:
         if not directory or not is_local_windows_path(directory):
             continue
+        key = os.path.normcase(os.path.abspath(directory))
+        if key in checked:
+            continue
+        checked.add(key)
         for name in names:
             candidate = os.path.join(directory, name)
             if os.path.isfile(candidate):

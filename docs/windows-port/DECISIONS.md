@@ -1,5 +1,45 @@
 # Windows Port Decisions
 
+## P5-D001 — Build one audited unsigned onedir archive
+
+- Status: Implemented locally; exact-commit CI pending
+- Phase: P5
+- Decision: Build on Windows Python 3.12 with a pinned PyInstaller toolchain as a windowed PE32+ x64 onedir bundle, then emit a deterministically ordered unsigned zip plus canonical checksum and manifest sidecars. Audit the version resource, architecture, embedded data, runtime distributions, license files, unsigned marker, unsafe paths, user data, logs, runtime records, credentials, caches, and absolute-path leakage before accepting an artifact.
+- Reason: A source checkout that runs is not a distributable Windows product, and a self-contained archive is safe only when its exact contents and provenance are reviewable.
+- Consequence: Build-only dependencies stay separate from runtime dependencies. The development artifact remains explicitly unsigned, and its final hashes must come from the exact current tree.
+
+## P5-D002 — Preserve the real runner PID across a source venv redirector
+
+- Status: Implemented locally; exact-commit CI pending
+- Phase: P5
+- Decision: When `sys.executable` is a Windows venv redirector, launch the runner with the resolved base Python executable and set `__PYVENV_LAUNCHER__` to the venv interpreter. Resolve every target executable to an absolute path before suspended creation.
+- Reason: The venv redirector exits after handing off to base Python, so persisting its short-lived PID breaks runner identity and Job ownership. Relative executable lookup can also change between validation and launch.
+- Consequence: The recorded runner PID belongs to the long-lived interpreter while imports still use the intended venv. Failure to resolve an absolute executable fails before user code is created.
+
+## P5-D003 — Give every runner a private console group
+
+- Status: Implemented locally; exact-commit CI pending
+- Phase: P5
+- Decision: The runner first calls `FreeConsole`, then creates its own `AllocConsole`, and only afterwards creates the managed target suspended and assigns it to the private Job.
+- Reason: A runner that inherits the controller or test console cannot provide a stable private console process group for graceful control and may couple fixture behavior to an unrelated console lifetime.
+- Consequence: Graceful console control stays scoped to the runner-owned generation, while explicit Force remains the separately authenticated Job termination path.
+
+## P5-D004 — Reset frozen child state and declare dynamic imports
+
+- Status: Implemented locally; exact-commit CI pending
+- Phase: P5
+- Decision: A frozen console that launches the same executable as its runner sets `PYINSTALLER_RESET_ENVIRONMENT=1`; the build declares `win32timezone` as a hidden import and uses the dedicated packaged entry point to dispatch console or runner mode.
+- Reason: Reusing the parent PyInstaller extraction environment can corrupt same-executable child startup, and dynamically imported pywin32 modules are not reliably discovered by static collection.
+- Consequence: The packaged runner starts from a fresh frozen environment with the required Windows runtime modules present. Missing frozen-state or import evidence fails package tests/audit rather than surfacing on a user machine.
+
+## P5-D005 — Keep local package evidence separate from Beta acceptance
+
+- Status: Implemented locally; release acceptance pending
+- Phase: P5
+- Decision: Treat read-only Chinese-and-space-path package smoke with a stripped child `PATH` as local package evidence only. It does not prove an independent clean VM without Python. Keep `windowsBetaReady=false`, `implementationCommit=null`, and `ciRun=null` until exact-commit common/macOS/Windows/package CI and the external Windows 10, clean-VM, Defender/SmartScreen, native picker/notification, and asset-review gates are complete.
+- Reason: The smoke harness still has Python and test dependencies, and headless API contracts cannot prove OS integration or release reputation checks.
+- Consequence: Phase 5 may be `IMPLEMENTED_LOCAL_PASS_CI_PENDING` while `lastGreenPhase` remains P4. No local or hosted result may be relabeled as Windows 10, clean-machine, signed, or Beta evidence.
+
 ## P4-D001 — Bind every managed app generation to one runner-owned Job
 
 - Status: Accepted

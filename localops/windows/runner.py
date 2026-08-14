@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Mapping
+from typing import Callable, Mapping, TextIO
 
 import pywintypes
 import win32api
@@ -137,9 +137,11 @@ def create_suspended_process(
     console_allocated = False
     creation_error: BaseException | None = None
     try:
-        # The detached runner allocates a private console only long enough for
-        # the target process group to inherit it. The target is the sole member
-        # after the runner detaches, so later CTRL_BREAK can address rootPid.
+        # A venv redirector can reattach the source runner despite the original
+        # DETACHED_PROCESS flag. FreeConsole affects only this exact runner and
+        # is also successful when no console is attached. Allocate a fresh,
+        # private console so CTRL_BREAK can never target the controller console.
+        win32console.FreeConsole()
         win32console.AllocConsole()
         console_allocated = True
         process_handle, thread_handle, process_id, thread_id = win32process.CreateProcess(
@@ -579,6 +581,49 @@ def _runtime_files(platform: WindowsPlatform, app_id: str, generation_id: str):
     )
 
 
+def bind_windowed_runner_output(
+    platform: WindowsPlatform, log_path: str
+) -> TextIO | None:
+    """Keep sanitized runner startup failures visible in the private app log."""
+    frozen = bool(getattr(sys, "frozen", False))
+    try:
+        interactive_stderr = bool(
+            sys.stderr is not None and sys.stderr.isatty()
+        )
+    except (AttributeError, OSError, ValueError):
+        interactive_stderr = False
+    if not frozen and interactive_stderr:
+        return None
+    platform.verify_private_directory(os.path.dirname(log_path))
+    platform.verify_private_file(log_path)
+    flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(log_path, flags)
+    try:
+        platform.verify_private_file(log_path)
+        stream = os.fdopen(
+            fd,
+            "a",
+            encoding="utf-8",
+            errors="backslashreplace",
+            buffering=1,
+        )
+        fd = -1
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    sys.stdout = stream
+    sys.stderr = stream
+    return stream
+
+
+def _write_runner_error(value: str) -> None:
+    try:
+        if sys.stderr is not None:
+            print(value, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
 def run(app_id: str, generation_id: str) -> int:
     app_id = validate_app_id(app_id)
     generation_id = validate_generation_id(generation_id)
@@ -587,6 +632,7 @@ def run(app_id: str, generation_id: str) -> int:
     directory, request_path, token_path, receipt_path, expected_log = _runtime_files(
         platform, app_id, generation_id
     )
+    bind_windowed_runner_output(platform, expected_log)
     for path, directory_flag in (
         (directory, True), (request_path, False), (token_path, False),
     ):
@@ -656,10 +702,19 @@ def main(argv: list[str] | None = None) -> int:
         arguments = parser.parse_args(argv)
         return run(arguments.app_id, arguments.generation_id)
     except ProtocolError as exc:
-        print(exc.code, file=sys.stderr)
+        _write_runner_error(exc.code)
         return 1
-    except Exception:
-        print("RUNNER_START_FAILED", file=sys.stderr)
+    except pywintypes.error as exc:
+        winerror_code = exc.args[0] if exc.args and isinstance(exc.args[0], int) else -1
+        function = exc.args[1] if len(exc.args) > 1 else "win32"
+        if not isinstance(function, str) or not function.replace("_", "").isalnum():
+            function = "win32"
+        _write_runner_error(
+            "RUNNER_START_FAILED:error:%d:%s" % (winerror_code, function)
+        )
+        return 1
+    except Exception as exc:
+        _write_runner_error("RUNNER_START_FAILED:%s" % type(exc).__name__)
         return 1
 
 

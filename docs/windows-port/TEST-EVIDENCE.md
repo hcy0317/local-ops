@@ -1,5 +1,100 @@
 # Windows Port Test Evidence
 
+## Phase 5 — IMPLEMENTED_LOCAL_PASS_CI_PENDING
+
+This section records current local Phase 5 implementation evidence. It is not
+an accepted exact-commit gate: `implementationCommit=null`, `ciRun=null`,
+`lastGreenPhase=P4`, and `windowsBetaReady=false`. All lifecycle tests remained
+limited to their own fixture processes.
+
+### Full Windows Python 3.12 gate — PASS_LOCAL
+
+```powershell
+$env:LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS = "1"
+py -3.12 -B -m unittest discover -s tests -p "test_*.py" -v
+```
+
+- Ran: 207 tests
+- Result: `OK`
+- Skipped: 1 package-smoke test because the full discovery did not repeat the
+  separate opt-in package gate
+- Duration: 120.941 seconds
+
+### Packaging and current artifact status — PASS_LOCAL
+
+- Packaging unit module: 25 ran, 24 passed, one opt-in package-smoke gate
+  skipped.
+- Build form: Windows Python 3.12, PyInstaller 6.21.0,
+  onedir/windowed/PE32+ x64, unsigned zip.
+- Audit scope: version and architecture, embedded data, pinned runtime/build
+  distributions, runtime licenses, unsafe paths, user data, logs,
+  runtime/token/credential material, caches, and absolute-path leakage.
+- Reproducible build A/B: PASS; two independent builds plus internal and
+  independent audits passed, and both 15,155,392-byte archives were
+  byte-identical.
+- Archive SHA-256:
+  `60e0b33b4903bdc58ef905e3673cff87a421a767c460122812d7e099d4ecaa3c`.
+- Checksum sidecar file SHA-256:
+  `b77c24f9a066e70bf090f8e1c30365b1d485f5c36a20bdb9019011e742858f0f`.
+- Manifest sidecar file SHA-256:
+  `3b1adfe6ee63d097e5a1aee587ca3428daea383ac8f50f7e3d698fb366033986`.
+- The A/B checksum and manifest sidecars were identical in both content and
+  bytes.
+
+### Audited package smoke — PASS_LOCAL (1/1)
+
+- Duration: 25.468 seconds.
+- Path/permissions: extracted under a read-only Chinese-and-space path.
+- Runtime isolation: the packaged child's `PATH` contained no Python; the test
+  harness still had Python and dependencies.
+- Journey: real start → log marker → listener → controller close/reopen →
+  explicit Force stop → generation release → app delete.
+- Final state: fixture PIDs and ports were gone, runtime records were released,
+  and every bundle-tree hash matched the pre-run tree.
+- Safety boundary: only processes created by the isolated fixture were
+  controlled.
+- Limitation: stripped child `PATH` is not equivalent to an independent clean
+  Windows VM without Python.
+
+### Supporting local checks — PASS
+
+- Focused Windows scope: 109/109.
+- Shared contracts: 31 passed, one privileged symlink test skipped.
+- Frontend + HTTP hardening: 30/30.
+- Lifecycle Node contracts: 30/30.
+- Common tests: 10/10.
+- Project checks: 6/6.
+- Compile discovery: 45 files.
+- Ruff and `git diff --check`: PASS.
+
+### Runner and frozen-runtime regression coverage — PASS_LOCAL
+
+- Source venv redirector: base Python + `__PYVENV_LAUNCHER__` retains the venv
+  while the persisted runner PID identifies the real long-lived interpreter.
+- Console ownership: `FreeConsole` precedes private `AllocConsole` and target
+  creation.
+- Frozen child: same-executable runner launch sets
+  `PYINSTALLER_RESET_ENVIRONMENT=1`.
+- Dynamic runtime: `win32timezone` is an explicit hidden import.
+- Launch resolution: the target executable is absolute before suspended
+  creation.
+
+### Phase 5 acceptance limitations
+
+| Gate | Status | Evidence boundary |
+| --- | --- | --- |
+| Phase 5 exact implementation commit / CI run | NOT_RUN | Both identifiers remain `null`; P4 is still last green |
+| Windows 10 x64 non-admin | DEFERRED / NOT_RUN | User deferred Win10 until Windows 11 work is stable |
+| Independent clean VM without Python | NOT_RUN | Stripped child PATH does not substitute for this environment |
+| Defender / SmartScreen | NOT_RUN | Current-tree artifact exists, but no OS reputation/security scan was run |
+| Native Windows picker | NOT_RUN | Headless/API coverage is not an OS-dialog acceptance test |
+| Windows Notification Center delivery | NOT_RUN | Notification object tests do not prove native delivery |
+| Favicon brand approval | REVIEW_REQUIRED | Release owner must record a human brand decision |
+| Signing | UNSIGNED | Current output is a development artifact, not a public signed release |
+| Windows Beta | FALSE | Every required Phase 5 and Spec 3.2 gate must pass first |
+
+---
+
 ## Phase 4 — PASS
 
 The authorized local gate passed on 2026-08-14 on Windows NT build 26200

@@ -1,13 +1,16 @@
 # Windows Port Test Evidence
 
-## Phase 5 — IMPLEMENTED_LOCAL_PASS_CI_PENDING
+## Phase 5 — IMPLEMENTED_UNVERIFIED
 
-This section records current local Phase 5 implementation evidence. It is not
-an accepted exact-commit gate: `implementationCommit=null`, `ciRun=null`,
-`lastGreenPhase=P4`, and `windowsBetaReady=false`. All lifecycle tests remained
-limited to their own fixture processes.
+The exact-CI engineering candidate at implementation commit
+`5daddece8a06d1fdd382d1814e58be7b777ceae4` passed CI run `31780819809`, so
+`scopedTargetStatus=PASS`. The complete Phase 5 Gate is not accepted because
+external environment and release checks remain open; therefore
+`phaseStatus=IMPLEMENTED_UNVERIFIED`, `lastGreenPhase=P4`, and
+`windowsBetaReady=false`. All lifecycle tests remained limited to their own
+fixture processes.
 
-### Full Windows Python 3.12 gate — PASS_LOCAL
+### Full Windows Python 3.12 gate — PASS (local run)
 
 ```powershell
 $env:LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS = "1"
@@ -20,7 +23,7 @@ py -3.12 -B -m unittest discover -s tests -p "test_*.py" -v
   separate opt-in package gate
 - Duration: 120.941 seconds
 
-### Packaging and current artifact status — PASS_LOCAL
+### Packaging and exact-CI artifact status — PASS
 
 - Packaging unit module: 25 ran, 24 passed, one opt-in package-smoke gate
   skipped.
@@ -29,21 +32,19 @@ py -3.12 -B -m unittest discover -s tests -p "test_*.py" -v
 - Audit scope: version and architecture, embedded data, pinned runtime/build
   distributions, runtime licenses, unsafe paths, user data, logs,
   runtime/token/credential material, caches, and absolute-path leakage.
-- Reproducible build A/B: PASS; two independent builds plus internal and
-  independent audits passed, and both 15,155,392-byte archives were
-  byte-identical.
+- Reproducible build A/B: PASS in exact-commit CI; two independent builds plus
+  internal and independent audits passed, and both 18,649,468-byte archives
+  were byte-identical.
 - Archive SHA-256:
-  `60e0b33b4903bdc58ef905e3673cff87a421a767c460122812d7e099d4ecaa3c`.
-- Checksum sidecar file SHA-256:
-  `b77c24f9a066e70bf090f8e1c30365b1d485f5c36a20bdb9019011e742858f0f`.
-- Manifest sidecar file SHA-256:
-  `3b1adfe6ee63d097e5a1aee587ca3428daea383ac8f50f7e3d698fb366033986`.
-- The A/B checksum and manifest sidecars were identical in both content and
-  bytes.
+  `b227e6244bf18d337d0244cd032e58c20ed84afe7d56286b9f73cb59d408eebe`.
+- Checksum sidecar: 107 bytes, SHA-256
+  `347154c1cdafe03777a56bbda23e5ad37610d203823cc44105c54b28fec44009`.
+- Manifest sidecar: 219,889 bytes, SHA-256
+  `e78bb8bda187094689c7d78585f8c7c2c3855379b779c337c885050bb99bf0ae`.
 
-### Audited package smoke — PASS_LOCAL (1/1)
+### Audited package smoke — PASS (local run, 1/1)
 
-- Duration: 25.468 seconds.
+- Duration: 24.209 seconds.
 - Path/permissions: extracted under a read-only Chinese-and-space path.
 - Runtime isolation: the packaged child's `PATH` contained no Python; the test
   harness still had Python and dependencies.
@@ -67,7 +68,7 @@ py -3.12 -B -m unittest discover -s tests -p "test_*.py" -v
 - Compile discovery: 45 files.
 - Ruff and `git diff --check`: PASS.
 
-### Runner and frozen-runtime regression coverage — PASS_LOCAL
+### Runner and frozen-runtime regression coverage — PASS (local run)
 
 - Source venv redirector: base Python + `__PYVENV_LAUNCHER__` retains the venv
   while the persisted runner PID identifies the real long-lived interpreter.
@@ -79,12 +80,32 @@ py -3.12 -B -m unittest discover -s tests -p "test_*.py" -v
 - Launch resolution: the target executable is absolute before suspended
   creation.
 
+### Exact-commit CI — PASS
+
+- Accepted engineering-candidate commit:
+  `5daddece8a06d1fdd382d1814e58be7b777ceae4`.
+- Accepted run: `31780819809`, conclusion `SUCCESS`.
+- Common job `94705997033`: `SUCCESS`.
+- macOS full regression and source-release job `94705997092`: `SUCCESS`.
+- Windows lifecycle, contracts, frontend/hardening, two-build reproduction,
+  audit, package smoke, and upload job `94706274519`: `SUCCESS`.
+- Uploaded GitHub artifact: id `9211730738`, name
+  `local-ops-windows-x64-unsigned`, size 18,870,044 bytes, outer digest
+  `sha256:a084fcc3794e9a57d5cd116992f2b42637df6f11ebd1d71f32568b6f8cff35c6`.
+  This outer digest is distinct from the inner archive SHA-256 above.
+- Historical failed Phase 5 attempt: commit `503401f`, run `31778658261`,
+  source-test fixture path defect; not accepted evidence.
+- Historical failed Phase 5 attempt: commit `52a2981`, run `31779137215`,
+  Windows cp1252 CI stdio defect; not accepted evidence.
+- Historical failed Phase 5 attempt: commit `12df546`, run `31779647391`,
+  hosted-administrator package-smoke ACL defect; not accepted evidence.
+
 ### Phase 5 acceptance limitations
 
 | Gate | Status | Evidence boundary |
 | --- | --- | --- |
-| Phase 5 exact implementation commit / CI run | NOT_RUN | Both identifiers remain `null`; P4 is still last green |
-| Windows 10 x64 non-admin | DEFERRED / NOT_RUN | User deferred Win10 until Windows 11 work is stable |
+| Phase 5 exact-CI engineering candidate | PASS | Commit `5daddece8a06d1fdd382d1814e58be7b777ceae4`, run `31780819809`; this does not close external gates |
+| Windows 10 x64 non-admin | SKIPPED | User explicitly deferred Win10 until Windows 11 work is stable |
 | Independent clean VM without Python | NOT_RUN | Stripped child PATH does not substitute for this environment |
 | Defender / SmartScreen | NOT_RUN | Current-tree artifact exists, but no OS reputation/security scan was run |
 | Native Windows picker | NOT_RUN | Headless/API coverage is not an OS-dialog acceptance test |
@@ -183,7 +204,7 @@ All cases are in `tests/windows/test_windows_security_matrix.py`.
   control. Unknown entries, widened ACLs, links, and non-derived paths fail
   closed and remain untouched.
 
-### Isolated Edge UI lifecycle flow — PASS_LOCAL
+### Isolated Edge UI lifecycle flow — PASS (local run)
 
 - Host/browser: isolated Windows 11 fixture, Edge 151, console port 9601, CDP
   port 9224. The existing user console and processes were outside the fixture.
@@ -231,12 +252,12 @@ All cases are in `tests/windows/test_windows_security_matrix.py`.
 - The Windows workflow now runs Windows/lifecycle discovery, API contracts, and
   frontend/HTTP hardening as three independent fail-fast steps without
   `continue-on-error`.
-- Phase 4 local Edge lifecycle QA: `PASS_LOCAL`; native picker and Windows Notification Center delivery: `NOT_RUN`
+- Phase 4 local Edge lifecycle QA: `PASS` (local evidence); native picker and Windows Notification Center delivery: `NOT_RUN`
 - `lastGreenPhase`: `P4`
 
 ### Deferred beyond Phase 4
 
-- Windows 10 non-admin validation: `DEFERRED`
+- Windows 10 non-admin validation: `SKIPPED` (explicit user scope)
 - Self-contained package / clean VM without Python: `NOT_RUN` (Phase 5)
 - `windowsBetaReady`: `false`
 
@@ -496,7 +517,7 @@ python -m unittest discover -s tests/contract -p 'test_*.py' -v
 | Check | Status | Reason |
 | --- | --- | --- |
 | Windows 11 x64 non-admin | PASS | Real source process, browser UI, config round-trip, DACL, monitoring, and fail-closed controls passed on exact candidate `c5a31a8` |
-| Windows 10 x64 non-admin | DEFERRED | Explicitly deferred until after the Windows 11 target is complete |
+| Windows 10 x64 non-admin | SKIPPED | Explicit user scope; deferred until after the Windows 11 target is complete |
 | Windows Python 3.12 branch CI | PASS | Run `31686699247`, job `94404329291`, implementation commit `c5a31a8` |
 | Current Phase 2 macOS regression/release CI | PASS | Run `31686699247`, job `94404329372`; project checks, release build, and verification passed |
 | Windows Phase 2 control gate | PASS | Lifecycle remains disabled until Phase 4; adapter, HTTP, browser controls, and no-side-effect tests agree |
@@ -565,7 +586,7 @@ The Windows 11 Phase 2 target was `PASS`. The original cross-version Phase 2 gat
 | Gate | Status | Evidence / limitation |
 | --- | --- | --- |
 | Phase 3 browser screenshot/click QA | NOT_RUN | `browser-harness --doctor` reports Chrome running but daemon/active CDP connections unavailable (0); no visual PASS is claimed |
-| Windows 10 non-admin | DEFERRED | Explicit user scope; no Win10 claim |
+| Windows 10 non-admin | SKIPPED | Explicit user scope; no Win10 claim |
 | Phase 4 lifecycle at the Phase 3 checkpoint | NOT_STARTED | No runner, Job Object, generation, runtime identity, or lifecycle side effect was present in the Phase 3 candidate |
 | Phase 3 Windows Python 3.12 exact-commit CI | PASS | Historical Phase 3 commit `97c417ef1491ac11fdb036c4e4102bfc190c88e6`, run `31698371278`, job `94441279178`; not Phase 4 evidence |
 | Phase 3 macOS complete regression/release CI | PASS | Historical Phase 3 commit `97c417ef1491ac11fdb036c4e4102bfc190c88e6`, run `31698371278`, job `94441279120`; not Phase 4 evidence |

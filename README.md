@@ -2,7 +2,7 @@
 
 **Preview / Alpha · 源码预览**
 
-总控台是一个本地服务与批处理任务快速启动、运行监测工具。macOS 版本保留完整现有功能；Windows 当前是 Phase 5 本地实现与 unsigned 自包含打包候选，提供安全的本地监听与进程观察、结构化命令配置、显式 macOS 配置导入，以及仅面向 Local Ops 自己创建的 Job Object 进程树控制。Phase 5 exact-commit CI 和外部发行门禁尚未完成，因此仍是 Preview / Alpha，而不是 Windows Beta。共享核心只绑定回环地址；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
+总控台是一个本地服务与批处理任务快速启动、运行监测工具。macOS 版本保留完整现有功能；Windows 当前是通过 exact-commit CI 的 Phase 5 unsigned engineering candidate，提供安全的本地监听与进程观察、结构化命令配置、显式 macOS 配置导入，以及仅面向 Local Ops 自己创建的 Job Object 进程树控制。Windows 10、独立干净无 Python VM、Defender/SmartScreen、原生集成、品牌审核与签名门禁尚未完成，因此仍是 Preview / Alpha，而不是 Windows Beta。共享核心只绑定回环地址；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
 
 > 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整；`总控台.app` 目前不是可单独复制的自包含应用，也尚不代表经过签名、公证的最终 macOS 发行版。
 
@@ -34,7 +34,7 @@
 - macOS 自带的 `ps`、`lsof`、`osascript` 等系统工具。
 - Safari、Chrome 或其他支持 ES Modules 的现代浏览器。
 
-Windows 源码运行要求 Windows 11 x64、Python 3.12，以及 `requirements-windows.txt` 中锁定的依赖；unsigned onedir 候选把 Python 3.12 runtime 和 Windows runtime dependencies 一并打包。Phase 4 实现提交 `06d9b1a37d4b775f4b01f822a021afb93513514c` 已通过 exact-commit CI run `31768949592`，仍是最后一个绿色阶段。Phase 5 当前为 `IMPLEMENTED_LOCAL_PASS_CI_PENDING`，状态以 `docs/windows-port/STATE.json` 为准。Windows 10、干净无 Python VM、Defender/SmartScreen、原生选择器/通知、素材审核和 Phase 5 exact-commit CI 尚未完成，因此当前不是 Windows Beta 发布。
+Windows 源码运行要求 Windows 11 x64、Python 3.12，以及 `requirements-windows.txt` 中锁定的依赖；unsigned onedir 候选把 Python 3.12 runtime 和 Windows runtime dependencies 一并打包。Phase 5 implementation commit `5daddece8a06d1fdd382d1814e58be7b777ceae4` 已通过 exact-commit CI run `31780819809`，其 exact-CI engineering candidate 为 `PASS`。完整 Phase 5 Gate 尚未关闭，因此 `phaseStatus=IMPLEMENTED_UNVERIFIED`、`lastGreenPhase=P4`、`windowsBetaReady=false`；状态以 `docs/windows-port/STATE.json` 为准。Windows 10、干净无 Python VM、Defender/SmartScreen、原生选择器/通知、素材审核和签名仍未完成，因此当前不是 Windows Beta 发布。
 
 ## Windows Phase 4 生命周期源码候选
 
@@ -72,9 +72,9 @@ py -3.12 tools\build_windows.py build --output-dir dist\windows
 py -3.12 tools\build_windows.py audit --archive dist\windows\local-ops-1.0.0-windows-x64-unsigned.zip
 ```
 
-当前本地证据包括：Windows lifecycle gate 207 tests `OK`、1 个 package-smoke gate skip、120.941s；packaging unit 25 ran / 24 passed / 1 gated skip；focused 109/109、shared contracts 31 passed + 1 symlink-privilege skip、frontend+HTTP hardening 30/30、Node 30/30、common 10/10、project checks 6/6、compile 45，以及 Ruff/diff PASS。current-tree audited package smoke 为 1/1 PASS（25.468s）：解压到只读中文与空格路径，剥离 child PATH 后完成真实 start/log/port、controller close/reopen、Force stop/release/delete，并确认 bundle tree hashes 未变化。测试 harness 本身仍有 Python 和依赖，因此这项证据不等价于“干净 VM 未安装 Python”。
+当前本地证据包括：Windows lifecycle gate 207 tests `OK`、1 个 package-smoke gate skip、120.941s；packaging unit 25 ran / 24 passed / 1 gated skip；focused 109/109、shared contracts 31 passed + 1 symlink-privilege skip、frontend+HTTP hardening 30/30、Node 30/30、common 10/10、project checks 6/6、compile 45，以及 Ruff/diff PASS。最新 audited package smoke 为 1/1 PASS（24.209s）：解压到只读中文与空格路径，剥离 child PATH 后完成真实 start/log/port、controller close/reopen、Force stop/release/delete，并确认 bundle tree hashes 未变化。测试 harness 本身仍有 Python 和依赖，因此这项证据不等价于“干净 VM 未安装 Python”。
 
-current-tree 的两次独立 build 与 internal/independent audit 均通过。两个 15,155,392-byte archive 字节完全一致，SHA-256 为 `60e0b33b4903bdc58ef905e3673cff87a421a767c460122812d7e099d4ecaa3c`；checksum sidecar file SHA-256 为 `b77c24f9a066e70bf090f8e1c30365b1d485f5c36a20bdb9019011e742858f0f`，manifest sidecar file SHA-256 为 `3b1adfe6ee63d097e5a1aee587ca3428daea383ac8f50f7e3d698fb366033986`，A/B 的 sidecar 内容和字节均一致。Phase 5 的 `implementationCommit` 与 `ciRun` 保持 `null`，`lastGreenPhase=P4`，`windowsBetaReady=false`。开发产物明确为 unsigned；Windows 10、干净无 Python VM、Defender/SmartScreen、原生 picker、Windows Notification Center 和 favicon 品牌审核分别保持 `NOT_RUN`、`DEFERRED` 或 `REVIEW_REQUIRED`，不得从本地 smoke 推断通过。
+exact-commit CI run `31780819809` 的 common job `94705997033`、macOS full/source-release job `94705997092` 和 Windows lifecycle/contracts/frontend/hardening/reproduce/audit/package-smoke/upload job `94706274519` 均成功。CI 两次独立 build 生成字节一致的 18,649,468-byte archive，SHA-256 为 `b227e6244bf18d337d0244cd032e58c20ed84afe7d56286b9f73cb59d408eebe`；107-byte checksum sidecar SHA-256 为 `347154c1cdafe03777a56bbda23e5ad37610d203823cc44105c54b28fec44009`；219,889-byte manifest SHA-256 为 `e78bb8bda187094689c7d78585f8c7c2c3855379b779c337c885050bb99bf0ae`。上传的 GitHub artifact id `9211730738`、name `local-ops-windows-x64-unsigned`、size 18,870,044 bytes、digest `sha256:a084fcc3794e9a57d5cd116992f2b42637df6f11ebd1d71f32568b6f8cff35c6`；该 digest 是 GitHub artifact 容器摘要，不是内层 zip SHA。开发产物仍为 unsigned；Windows 10、干净无 Python VM、Defender/SmartScreen、原生 picker、Windows Notification Center 和 favicon 品牌审核分别保持 `SKIPPED`、`NOT_RUN` 或 `REVIEW_REQUIRED`，不得从 CI 或本地 smoke 推断通过。
 
 `VERSION` 是项目版本的唯一权威来源。`Info.plist`、发行包名和发行说明应与它保持一致。
 
@@ -341,7 +341,7 @@ make check
 - 通过 `make release-check` 和人工 UI/安全/升级/回滚验收。
 - 不含任何项目内旧 `data/`、用户 Library 数据、日志、绝对路径、token 或缓存的发行包。
 - 针对目标 Mac 的签名、公证、完整性校验、全新安装和回退证据。
-- Windows 候选还必须在 Phase 5 exact-commit CI、真实 Windows 10/11 非管理员环境、干净无 Python VM、Defender/SmartScreen 和素材审核全部通过后，才可标记为 Beta；当前 unsigned 本地产物不满足该门禁。
+- Windows exact-commit engineering candidate 已通过 CI，但还必须完成真实 Windows 10 非管理员环境、独立干净无 Python VM、Defender/SmartScreen、原生 picker/Notification Center、素材审核和签名门禁，才可标记为 Beta；当前 unsigned 产物不满足该门禁。
 
 ## 参与贡献与安全
 

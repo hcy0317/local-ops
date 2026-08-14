@@ -2,17 +2,17 @@
   "schemaVersion": 1,
   "task": "local-ops-windows-port",
   "baselineCommit": "a5c3adae1f1fa0bd9f0ac7b090ec422e285d0c0f",
-  "implementationCommit": null,
-  "ciRun": null,
+  "implementationCommit": "5daddece8a06d1fdd382d1814e58be7b777ceae4",
+  "ciRun": "31780819809",
   "branch": "codex/windows-port-phase-5",
   "currentPhase": "P5",
-  "phaseStatus": "IMPLEMENTED_LOCAL_PASS_CI_PENDING",
-  "scopedTarget": "Windows 11 Phase 5 local unsigned package candidate",
-  "scopedTargetStatus": "IMPLEMENTED_LOCAL_PASS_CI_PENDING",
-  "windows10Status": "DEFERRED",
+  "phaseStatus": "IMPLEMENTED_UNVERIFIED",
+  "scopedTarget": "Phase 5 exact-CI engineering candidate",
+  "scopedTargetStatus": "PASS",
+  "windows10Status": "SKIPPED",
   "lastGreenPhase": "P4",
-  "macosTests": "NOT_RUN",
-  "windowsTests": "PASS_LOCAL",
+  "macosTests": "PASS",
+  "windowsTests": "PASS",
   "windowsBetaReady": false,
   "changedFiles": [
     "MEMORY.md",
@@ -82,6 +82,7 @@
     "tests/windows/test_windows_security_matrix.py",
     "tests/windows/test_windows_phase3_contract.py",
     "tests/test_frontend.py",
+    "tests/test_hardening.py",
     "tests/test_project_checks.py",
     "tests/test_server.py",
     "tools/build_release.py",
@@ -130,8 +131,7 @@
   ],
   "knownBlockers": [],
   "deferredGates": [
-    "Windows 10 non-admin validation remains deferred by explicit user scope.",
-    "The Phase 5 exact implementation commit and common/macOS/Windows/package CI run are not yet frozen or run.",
+    "Windows 10 non-admin validation is SKIPPED because the user explicitly deferred it until Windows 11 is stable.",
     "An independent clean Windows x64 VM without Python remains NOT_RUN.",
     "Defender and SmartScreen checks remain NOT_RUN.",
     "The native Windows picker and Windows Notification Center delivery remain NOT_RUN.",
@@ -140,11 +140,14 @@
   "knownFailures": [
     "Historical failed Phase 4 attempt: exact commit fc29e5637d93b95026a5dbca5e46c638c51b5439 (fc29e56), CI run 31766584905, failed on Windows TokenOwner new-object owner semantics and macOS lifecycle test principal isolation; it is not accepted Phase 4 evidence.",
     "Historical failed Phase 4 attempt: exact commit c3a9fa9e83c6d4cfcf87b5310be0bd764ea58dc5, CI run 31767880432, exposed the eager non-Windows Job Object test decorator and the hosted Windows console readiness diagnostic gap.",
-    "Historical failed Phase 4 attempt: exact commit b96b5c4293559b7cd17e855cfb055eba39495c02, CI run 31768341494, exposed redirected cp1252 stdout crashing localized console startup; commit 06d9b1a fixed the production output boundary."
+    "Historical failed Phase 4 attempt: exact commit b96b5c4293559b7cd17e855cfb055eba39495c02, CI run 31768341494, exposed redirected cp1252 stdout crashing localized console startup; commit 06d9b1a fixed the production output boundary.",
+    "Historical failed Phase 5 attempt: commit 503401f, CI run 31778658261, exposed a source-test fixture path defect; it is not accepted evidence.",
+    "Historical failed Phase 5 attempt: commit 52a2981, CI run 31779137215, exposed Windows cp1252 CI stdio handling; it is not accepted evidence.",
+    "Historical failed Phase 5 attempt: commit 12df546, CI run 31779647391, exposed hosted-administrator package-smoke ACL handling; it is not accepted evidence."
   ],
   "verificationLimitations": [
     "The read-only Chinese-and-space-path package smoke stripped the packaged child's PATH, but the harness still had Python and dependencies; it does not prove a clean no-Python VM.",
-    "Windows 10, Defender/SmartScreen, the native Windows picker, and Windows Notification Center delivery are NOT_RUN or DEFERRED.",
+    "Windows 10 is SKIPPED by explicit user scope; Defender/SmartScreen, the native Windows picker, and Windows Notification Center delivery remain NOT_RUN.",
     "One shared-contract symlink rejection test is skipped because this non-admin Windows session cannot create symlinks.",
     "The favicon brand audit is REVIEW_REQUIRED, and the package is an unsigned development artifact."
   ],
@@ -153,12 +156,14 @@
     "The packaging unit module ran 25 tests: 24 passed and one package-smoke gated test skipped.",
     "Focused Windows tests passed 109 of 109; shared contracts passed 31 with one symlink-privilege skip.",
     "Frontend plus HTTP hardening passed 30 of 30, lifecycle Node contracts passed 30 of 30, common tests passed 10 of 10, project checks passed 6 of 6, and compile discovery covered 45 files; Ruff and diff checks passed.",
-    "The current-tree audited package smoke passed 1 of 1 in 25.468 seconds using a read-only Chinese-and-space install path and stripped child PATH. It proved real start, log marker, listener, controller close/reopen, force stop, release, delete, fixture PID/port cleanup, and unchanged bundle tree hashes.",
-    "Two independent current-tree builds plus internal and independent audits passed. The 15155392-byte archive was byte-identical across A/B with SHA-256 60e0b33b4903bdc58ef905e3673cff87a421a767c460122812d7e099d4ecaa3c; checksum sidecar file SHA-256 was b77c24f9a066e70bf090f8e1c30365b1d485f5c36a20bdb9019011e742858f0f and manifest sidecar file SHA-256 was 3b1adfe6ee63d097e5a1aee587ca3428daea383ac8f50f7e3d698fb366033986, with A/B sidecar content and bytes identical.",
+    "The latest local audited package smoke passed 1 of 1 in 24.209 seconds using a read-only Chinese-and-space install path and stripped child PATH. It proved real start, log marker, listener, controller close/reopen, force stop, release, delete, fixture PID/port cleanup, and unchanged bundle tree hashes.",
+    "Exact-commit CI reproduced and audited an 18649468-byte archive with SHA-256 b227e6244bf18d337d0244cd032e58c20ed84afe7d56286b9f73cb59d408eebe; its 107-byte checksum sidecar SHA-256 was 347154c1cdafe03777a56bbda23e5ad37610d203823cc44105c54b28fec44009 and its 219889-byte manifest SHA-256 was e78bb8bda187094689c7d78585f8c7c2c3855379b779c337c885050bb99bf0ae.",
     "The Phase 5 build path emits a Python 3.12 PyInstaller onedir/windowed/x64 unsigned zip with canonical checksum and manifest sidecars and audits version, architecture, dependencies, licenses, unsafe paths, user state, secrets, caches, and absolute-path leakage.",
     "Source venv runner launch uses base Python plus __PYVENV_LAUNCHER__ to retain a stable real runner PID; runner console setup is FreeConsole then private AllocConsole; frozen same-executable children set PYINSTALLER_RESET_ENVIRONMENT=1; win32timezone is an explicit hidden import; target executables are resolved absolutely before creation.",
-    "Phase 4 implementation commit 06d9b1a37d4b775f4b01f822a021afb93513514c passed exact-commit CI run 31768949592: Windows Python 3.12 job 94670617580 and macOS regression/release job 94670617652 both passed, so lastGreenPhase remains P4."
+    "Phase 5 exact-CI engineering candidate commit 5daddece8a06d1fdd382d1814e58be7b777ceae4 passed run 31780819809: common job 94705997033, macOS full/source-release job 94705997092, and Windows lifecycle/contracts/frontend/hardening/reproduce/audit/package-smoke/upload job 94706274519 all succeeded.",
+    "GitHub artifact 9211730738, named local-ops-windows-x64-unsigned, is 18870044 bytes with outer digest sha256:a084fcc3794e9a57d5cd116992f2b42637df6f11ebd1d71f32568b6f8cff35c6; this is distinct from the inner archive SHA-256.",
+    "Phase 4 implementation commit 06d9b1a37d4b775f4b01f822a021afb93513514c passed exact-commit CI run 31768949592 and remains the last fully closed phase because Phase 5 external gates are incomplete."
   ],
-  "nextAction": "Freeze the Phase 5 implementation commit and run exact-commit common/macOS/Windows/package CI; then complete Windows 10, clean no-Python VM, Defender/SmartScreen, native picker/notification, favicon review, and release-signing gates before considering Beta.",
-  "lastVerifiedAt": "2026-08-14T14:56:00+08:00"
+  "nextAction": "Complete the remaining external Phase 5 gates: Windows 10 when user scope resumes, an independent clean no-Python VM, Defender/SmartScreen, native picker/Notification Center, favicon brand review, and the signing/release decision before considering Beta.",
+  "lastVerifiedAt": "2026-08-14T15:56:48+08:00"
 }

@@ -38,6 +38,7 @@
 
 ### Changed
 
+- Windows Phase 5 exact-CI engineering candidate `5daddece8a06d1fdd382d1814e58be7b777ceae4` 已通过 run `31780819809` 的 common、macOS full/source-release 与 Windows lifecycle/package gates，并上传可审计 unsigned artifact；完整 Phase 5 外部验收仍未关闭，因此状态保持 `IMPLEMENTED_UNVERIFIED`、`windowsBetaReady=false`。
 - Windows capability 现在只为完整验证的 Local Ops Job 开启 `launch_managed/stop_managed/force_stop_managed`；`kill_external/attach_external/restart_console` 保持关闭。
 - Windows 浏览器界面现在同时按全局 capability 与每应用 `lifecycleStatus/controlAvailable` 呈现操作，并为每次启动、停止、重启、运行中修改和删除冻结 `expectedGeneration`；外部进程控制入口仍保持禁用。
 - 默认将配置/图标移至 `~/Library/Application Support/总控台`，日志移至 `~/Library/Logs/总控台`。新目标不存在时仅首次复制旧 `data/`，不删除原文件。

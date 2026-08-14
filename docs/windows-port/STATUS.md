@@ -1,6 +1,6 @@
 # Windows Port Status
 
-## Phase 5 — IMPLEMENTED_LOCAL_PASS_CI_PENDING
+## Phase 5 — IMPLEMENTED_UNVERIFIED
 
 The current Windows 11 x64 tree implements the Python 3.12 PyInstaller
 onedir/windowed/x64 unsigned package, deterministic checksum/manifest
@@ -27,7 +27,7 @@ Current local verification:
   symlink-privilege skip;
 - frontend + HTTP hardening: 30/30; lifecycle Node contracts: 30/30;
 - common: 10/10; project checks: 6/6; compile: 45; Ruff/diff: PASS;
-- current-tree audited package smoke: 1/1 PASS in 25.468s.
+- latest local audited package smoke: 1/1 PASS in 24.209s.
 
 The package smoke extracted the bundle under a read-only Chinese-and-space
 path, stripped the packaged child's `PATH`, and completed real start, log
@@ -36,29 +36,43 @@ All fixture PIDs and ports were gone and the bundle tree hashes were unchanged.
 The harness itself still had Python and test dependencies, so this evidence is
 not equivalent to an independent clean VM without Python.
 
-Two independent current-tree builds and both internal and independent audits
-passed. The 15,155,392-byte archive A/B is byte-identical with SHA-256
-`60e0b33b4903bdc58ef905e3673cff87a421a767c460122812d7e099d4ecaa3c`.
-The checksum sidecar file SHA-256 is
-`b77c24f9a066e70bf090f8e1c30365b1d485f5c36a20bdb9019011e742858f0f`;
-the manifest sidecar file SHA-256 is
-`3b1adfe6ee63d097e5a1aee587ca3428daea383ac8f50f7e3d698fb366033986`.
-A/B sidecar content and bytes are identical.
+Implementation commit `5daddece8a06d1fdd382d1814e58be7b777ceae4`
+passed exact-commit CI run `31780819809`. Common job `94705997033`, macOS
+full/source-release job `94705997092`, and Windows
+lifecycle/contracts/frontend/hardening/two-build-reproduce/audit/package-smoke/upload
+job `94706274519` all succeeded. Exact CI reproduced and audited an
+18,649,468-byte archive with SHA-256
+`b227e6244bf18d337d0244cd032e58c20ed84afe7d56286b9f73cb59d408eebe`.
+Its 107-byte checksum sidecar SHA-256 is
+`347154c1cdafe03777a56bbda23e5ad37610d203823cc44105c54b28fec44009`;
+its 219,889-byte manifest SHA-256 is
+`e78bb8bda187094689c7d78585f8c7c2c3855379b779c337c885050bb99bf0ae`.
 
-No Phase 5 exact implementation commit or CI run has been frozen:
-`implementationCommit=null`, `ciRun=null`. `lastGreenPhase` remains P4 and
-`windowsBetaReady=false`. Windows 10 is deferred/`NOT_RUN`; an independent
-clean no-Python VM, Defender/SmartScreen, native Windows picker, and Windows
-Notification Center delivery are `NOT_RUN`; favicon brand approval is
-`REVIEW_REQUIRED`; and the development artifact is unsigned.
+GitHub artifact `9211730738`, named `local-ops-windows-x64-unsigned`, is
+18,870,044 bytes with outer digest
+`sha256:a084fcc3794e9a57d5cd116992f2b42637df6f11ebd1d71f32568b6f8cff35c6`.
+The outer digest is distinct from the inner zip SHA-256.
+
+Earlier Phase 5 runs are historical failures, not accepted evidence. Run
+`31778658261` at commit `503401f` exposed a source-test fixture path defect;
+run `31779137215` at commit `52a2981` exposed Windows cp1252 CI stdio handling;
+run `31779647391` at commit `12df546` exposed hosted-administrator
+package-smoke ACL handling.
+
+The exact-CI engineering candidate has `scopedTargetStatus=PASS`, but the full
+Phase 5 Gate remains incomplete. Therefore `phaseStatus=IMPLEMENTED_UNVERIFIED`,
+`lastGreenPhase=P4`, and `windowsBetaReady=false`. Windows 10 is `SKIPPED`
+because the user explicitly deferred it; an independent clean no-Python VM,
+Defender/SmartScreen, native Windows picker, and Windows Notification Center
+delivery are `NOT_RUN`; favicon brand approval is `REVIEW_REQUIRED`; and the
+development artifact is unsigned.
 
 ## Current result
 
-**P5 IMPLEMENTED_LOCAL_PASS_CI_PENDING / LAST GREEN P4 / WINDOWS BETA FALSE.**
+**P5 IMPLEMENTED_UNVERIFIED / EXACT-CI ENGINEERING CANDIDATE PASS / LAST GREEN P4 / WINDOWS BETA FALSE.**
 
-The next acceptance step is an exact Phase 5 commit and
-common/macOS/Windows/package CI. None of the remaining external or release
-gates may be inferred from the local smoke.
+The next acceptance work is limited to the remaining external and release
+gates. None may be inferred from local or hosted CI evidence.
 
 ## Phase 4 — PASS
 
@@ -93,7 +107,7 @@ Phase 4 implementation commit
 CI run `31768949592`. Windows Python 3.12 job `94670617580` passed the
 fixture-owned lifecycle, API contract, frontend, and HTTP hardening gates;
 macOS job `94670617652` passed the complete regression, release, and
-reproducibility audit. `lastGreenPhase` is P4.
+reproducibility audit. P4 remains the last fully closed phase.
 
 Earlier runs remain historical failures, not accepted evidence. Run
 `31766584905` exposed Windows `TokenOwner` semantics and macOS fake-principal

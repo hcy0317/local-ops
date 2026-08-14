@@ -12,7 +12,7 @@
 
 - 每 2 秒查看当前用户的本地监听服务、CPU、内存和运行时长。
 - 保存常用服务或批处理任务，集中启动、停止、重启、查日志和诊断。
-- 在当前页面会话中发现新出现的、尚未管理的监听端口，可直接加入启动台或忽略隐藏。
+- 在当前页面会话中发现新出现的、尚未管理的监听端口。macOS 可原子认领后加入启动台；Windows 只观察或创建未认领配置，不会控制现有进程。
 - 运行前检查工作目录、脚本和运行时；明确失效时直接给出修复入口，不必先失败一次。
 - 从项目文件夹识别常用启动命令，但不安装依赖、不执行项目代码。
 - macOS 通过运行 token、进程组和当前 UID 联合识别受控进程；Windows 通过 SID、generation、PID 创建时间、签名回执和 Job 成员关系识别受管 Job。两个平台都不会因端口相同就结束外部进程。
@@ -36,7 +36,7 @@
 
 Windows 源码运行要求 Windows 11 x64、Python 3.12，以及 `requirements-windows.txt` 中锁定的依赖；unsigned onedir 候选把 Python 3.12 runtime 和 Windows runtime dependencies 一并打包。Phase 5 implementation commit `5daddece8a06d1fdd382d1814e58be7b777ceae4` 已通过 exact-commit CI run `31780819809`，其 exact-CI engineering candidate 为 `PASS`。完整 Phase 5 Gate 尚未关闭，因此 `phaseStatus=IMPLEMENTED_UNVERIFIED`、`lastGreenPhase=P4`、`windowsBetaReady=false`；状态以 `docs/windows-port/STATE.json` 为准。Windows 10、干净无 Python VM、Defender/SmartScreen、原生选择器/通知、素材审核和签名仍未完成，因此当前不是 Windows Beta 发布。
 
-## Windows Phase 4 生命周期源码候选
+## Windows 适配版：生命周期与安全
 
 在 PowerShell 中从项目根目录运行：
 
@@ -48,7 +48,7 @@ py -3.12 -m venv .venv
 
 Windows 用户数据固定写入 `%LOCALAPPDATA%\LocalOps\`。最终私有对象必须由当前用户 SID 拥有，并只向当前用户、SYSTEM 和 Administrators 授予受保护 DACL。Windows 新对象 owner 来自 token 的 `TokenOwner`；若管理员 token 的默认 owner 是 Builtin Administrators，只有 creation-time apply 才会在一次安全描述符更新中把 owner 归一为当前用户并同时写入 protected DACL。既有记录是 verify-only，Admin-owned 或其他 owner 一律拒绝。同一用户、同一数据目录通过 Named Mutex 保证只有一个写者。自定义数据或日志目录会拒绝盘符根、用户主目录、项目根目录、UNC 共享根以及 symlink/junction 路径。ACL 验证失败时配置进入只读保护。
 
-本阶段保留 Phase 3 的 IPv4/IPv6 监听、进程信息、原生选择器、schema v2、结构化 `commandSpec`、项目识别和显式导入，并增加受 generation CAS 保护的启动、普通停止、显式强制停止与重启。旧 `command` 字段继续保留；POSIX 命令仍只会标记为 `needs_review`，不会被猜测性转换或执行。
+本阶段保留 Phase 3 的 IPv4/IPv6 监听、进程信息、Windows picker adapter、schema v2、结构化 `commandSpec`、项目识别和显式导入，并增加受 generation CAS 保护的启动、普通停止、显式强制停止与重启。真实 Windows native picker 与 Notification Center 投递仍是发行前验收项，现有 headless/API 测试不能替代。旧 `command` 字段继续保留；POSIX 命令仍只会标记为 `needs_review`，不会被猜测性转换或执行。
 
 Windows 不会自动发现或导入项目内旧 `data/` 或 macOS 配置。设置中心的导入向导只接受用户明确选择的本地 JSON 文件，并按“预览 → 路径映射 → 选择 → 提交”执行；预览零写入，提交不覆盖同 ID 应用、清空旧运行身份，并可在目标未发生后续修改时回滚。UNC/设备路径不会被探测或导入。
 
@@ -60,7 +60,7 @@ Windows 仍不支持外部进程认领、外部进程结束和总控台重启。
 
 本地 Phase 4 门禁已通过 Windows real discovery 174/174（406.426s）、frontend 24/24、HTTP hardening 6/6（合计 30/30）和 Node 30/30。其中包括 `WIN-LIFE-001..012` 的 12/12、`WIN-SEC-001..014` 的 14/14、HTTP 总控台测试子进程终止后重开，以及 100 次完整启动/Force/释放循环。相同实现已通过上述 exact-commit CI；只有 Phase 5 的 Windows 10、self-contained clean-machine 和发行审计全部通过后，才会把 `windowsBetaReady` 改为 `true`。
 
-## Windows Phase 5 本地打包候选
+## Windows 适配版：打包与验证
 
 Phase 5 增加 Python 3.12 + PyInstaller 6.21.0 的 onedir/windowed/x64 unsigned zip、可复现 sidecar/manifest 和发行内容审计。源码 venv 启动 runner 时改用 base Python 并保留 `__PYVENV_LAUNCHER__`，避免 venv redirector 的短命 PID 被误当成受管根；runner 先脱离继承 console 再创建私有 console group。冻结程序以同一 executable 派生 runner 时设置 `PYINSTALLER_RESET_ENVIRONMENT=1`，构建显式包含 `win32timezone`，所有目标 executable 在启动前解析为绝对路径。
 
@@ -79,6 +79,18 @@ exact-commit CI run `31780819809` 的 common job `94705997033`、macOS full/sour
 `VERSION` 是项目版本的唯一权威来源。`Info.plist`、发行包名和发行说明应与它保持一致。
 
 ## 安装
+
+### Windows 适配版
+
+源码模式使用上文的 Python 3.12 环境。打包候选无需目标机器预装 Python：
+
+1. 从 Windows CI artifact 或本地 `tools\build_windows.py build` 输出取得 `local-ops-<VERSION>-windows-x64-unsigned.zip`、同名 `.sha256` 与 manifest。
+2. 校验 SHA-256，并将 ZIP 完整解压到当前用户可读取的固定目录；不要只移动 `LocalOps.exe`，它依赖同目录的 `_internal` 与静态资源。
+3. 双击 `LocalOps.exe`。程序只绑定回环地址，并自动打开浏览器；用户配置、图标、日志和 runtime records 写入 `%LOCALAPPDATA%\LocalOps\`，不会写入程序目录。
+
+当前 ZIP 明确标记为 `UNSIGNED DEVELOPMENT BUILD`，不是 Windows Beta 或签名发行版。若 Defender/SmartScreen 阻止运行，应保留并记录结果，使用源码模式或自行从已审核源码构建；不要关闭系统安全保护来绕过门禁。
+
+### macOS
 
 总控台以完整项目目录运行，`总控台.app` 是项目内启动器，不是可以单独复制的自包含应用。
 
@@ -102,7 +114,26 @@ exact-commit CI run `31780819809` 的 common job `94705997033`、macOS full/sour
 
 ## 运行
 
-启动总控台有且只有三种方式，效果相同，按习惯选择：
+### Windows
+
+| 方式 | 操作 | 适用场景 |
+| --- | --- | --- |
+| 打包候选 | 双击解压目录中的 `LocalOps.exe` | 日常试用，无终端窗口，不要求预装 Python |
+| 源码 | `.\.venv\Scripts\python.exe server.py` | 开发、调试和查看终端输出 |
+
+源码模式可指定浏览器与优先端口；打包候选接受相同参数：
+
+```powershell
+.\.venv\Scripts\python.exe server.py --no-browser
+.\.venv\Scripts\python.exe server.py --preferred-port 9603
+.\LocalOps.exe --no-browser --preferred-port 9603
+```
+
+Windows 当前不提供总控台自身的网页“重启 / 停止”操作。需要结束总控台时，只结束这次启动的精确 `LocalOps.exe`/Python 控制台进程；不要按端口、进程名或模糊 PID 批量结束。由启动台创建的受管 Job 不会因为浏览器关闭而停止。
+
+### macOS
+
+启动总控台有三种方式，效果相同，按习惯选择：
 
 | 方式 | 操作 | 适用场景 |
 | --- | --- | --- |
@@ -117,9 +148,9 @@ python3 server.py --no-browser        # 只启动服务，不自动打开浏览�
 python3 server.py --preferred-port 9603  # 在 9600-9609 内指定优先端口
 ```
 
-启动后程序只绑定 `127.0.0.1`，从 9600 起尝试端口，被占用则递增（最多 10 个），并自动打开浏览器。命令行参数、环境变量（`CONSOLE_DATA_DIR` / `CONSOLE_LOG_DIR`）见下文“数据、隐私与备份”。
+两个平台启动后都只绑定 `127.0.0.1`，从 9600 起尝试端口，被占用则递增（最多 10 个），并默认打开浏览器。命令行参数、环境变量（`CONSOLE_DATA_DIR` / `CONSOLE_LOG_DIR`）见下文“数据、隐私与备份”。
 
-**实际地址在哪里看**：顶栏「重启 :9600」按钮上直接显示当前端口；或看终端输出 / `~/Library/Logs/总控台/console.log`。浏览器手动访问 `http://127.0.0.1:端口号/` 即可。
+**实际地址在哪里看**：macOS 顶栏「重启 :9600」按钮显示当前端口；Windows 可看浏览器地址、源码终端输出或 `%LOCALAPPDATA%\LocalOps\logs\console.log`。浏览器手动访问 `http://127.0.0.1:端口号/` 即可。
 
 **停止与重启**：macOS 顶栏「重启 / 停止」控制的是总控台自身（网页服务）。停止总控台**不会**停止启动台里已经运行的应用——它们是独立进程组，会继续运行；下次打开总控台时会自动重新识别。重启总控台会加载磁盘上的最新代码，同样不影响运行中的应用。Windows Phase 4 的总控台重启/停止控制保持禁用；受管 Job 由独立 runner 持有，因此测试创建的总控台进程退出并重开后仍可重新验证和控制同一 generation。
 
@@ -135,25 +166,25 @@ python3 server.py --preferred-port 9603  # 在 9600-9609 内指定优先端口
 - **排序**：鼠标拖拽，或聚焦卡片后按空格进入键盘排序（方向键移动，空格确认）。
 - **批量停止**：右侧「快捷操作」里可一键停止全部运行中的应用（有确认框，逐个安全停止，绝不按端口杀进程）。
 
-### 服务监控（看这台 Mac 在跑什么）
+### 服务监控（查看本机服务）
 
 - **概览卡**：在线服务/后台应用/总 CPU/总内存（带最近一分钟负载曲线）/端口警告/最后更新。
-- **服务表格**：每个服务的 PID、端口、目录、负载、时长、状态，以及**启动者徽标**——溯源显示这个进程是哪个 AI 助手（Codex/Claude/Kimi 等）、编辑器（VS Code/Cursor 等）、终端或总控台启动的。点端口直接打开服务；行尾按钮可加入启动台、置顶、隐藏、展开完整命令或安全结束进程。
-- **发现新端口**：页面打开期间新出现的监听端口会单独提醒，可一键「加入启动台」（自动识别项目并原子认领进程）、「忽略并隐藏」或「暂时关闭」。
+- **服务表格**：每个服务的 PID、端口、目录、负载、时长、状态，以及**启动者徽标**——溯源显示这个进程是哪个 AI 助手（Codex/Claude/Kimi 等）、编辑器（VS Code/Cursor 等）、终端或总控台启动的。点端口直接打开服务；macOS 可认领或安全结束符合所有权校验的进程，Windows 只观察、置顶、隐藏或创建未认领配置，外部认领/结束入口保持禁用。
+- **发现新端口**：页面打开期间新出现的监听端口会单独提醒。macOS 可自动识别并原子认领；Windows 可保存未认领配置或忽略隐藏，但不会把监听端口、PID 或 cwd 当作控制权证明。
 - **后台与已隐藏**：系统/GUI 应用进程默认折叠在「应用后台」；被隐藏的服务可随时恢复。
 - **关注的进程**：输入关键字（如 `ffmpeg`）回车，匹配进程实时列出。
 
-### 日志中心（⌘J）
+### 日志中心（⌘J / Ctrl+J）
 
-导航轨「日志中心」或快捷键 ⌘J（⌘L 是浏览器保留键）：所有应用按运行中优先排列，点开任意一行看实时日志；底部固定总控台自身日志入口。
+导航轨「日志中心」，或使用 macOS `⌘J` / Windows `Ctrl+J`：所有应用按运行中优先排列，点开任意一行看实时日志；底部固定总控台自身日志入口。
 
 ### 设置中心
 
-导航轨齿轮：任务完成通知开关（系统通知，切走页面也能收到）、外观三态（自动/浅色/深色）、版本/端口/工作目录/数据目录信息。
+导航轨齿轮：任务完成通知开关、外观三态（自动/浅色/深色）、版本/端口/工作目录/数据目录信息。浏览器 Notification API 已接入；Windows Notification Center 真实投递仍未完成发行验收。
 
-### 命令面板（⌘K）
+### 命令面板（⌘K / Ctrl+K）
 
-全局搜索并执行：添加服务/任务、启动/停止/重启任意应用、打开页面、查看日志、切换视图、开关任务通知、查看总控台日志等，全键盘操作。
+使用 macOS `⌘K` / Windows `Ctrl+K` 全局搜索并执行：添加服务/任务、启动/停止/重启任意应用、打开页面、查看日志、切换视图、开关任务通知、查看总控台日志等，全键盘操作。
 
 ### 使用要点
 
@@ -172,25 +203,27 @@ python3 server.py --preferred-port 9603  # 在 9600-9609 内指定优先端口
 
 ## 数据、隐私与备份
 
-运行数据与程序目录分离，默认放在 macOS 用户资料库：
+运行数据与程序目录分离：
 
-| 路径 | 内容 | 备份建议 |
+| 平台 | 数据目录 | 日志目录 |
 | --- | --- | --- |
-| `~/Library/Application Support/总控台/config.json` | 应用命令、本地路径、端口、标记和运行识别信息 | 必须 |
-| `~/Library/Application Support/总控台/config.json.bak` | 上一份已知良好的配置 | 必须 |
-| `~/Library/Application Support/总控台/icons/` | 用户上传的图标和站点图标 | 按需 |
-| `~/Library/Logs/总控台/` | 应用与总控台运行日志 | 通常不需 |
+| macOS | `~/Library/Application Support/总控台/` | `~/Library/Logs/总控台/` |
+| Windows | `%LOCALAPPDATA%\LocalOps\` | `%LOCALAPPDATA%\LocalOps\logs\` |
 
-目录权限会收紧为 `0700`，配置、图标和日志文件为 `0600`。这些文件仍可能含个人路径、完整 shell 命令和日志内容；不应进入 Git，也不应随发行包或故障报告对外传播。
+`config.json`、`config.json.bak` 和 `icons/` 应备份；日志通常不需要。Windows 的 `runtime/` 保存受管 generation 的私有 request/token/receipt，不应手动复制到另一台机器或纳入普通配置备份。
+
+macOS 目录权限会收紧为 `0700`，配置、图标和日志文件为 `0600`。Windows 私有目录和文件必须由当前用户 SID 拥有，DACL 只允许当前用户、SYSTEM 与 Administrators；既有宽权限、错误 owner、link/junction 或不可信 runtime record 会 fail closed。这些数据可能含个人路径、完整命令和日志内容，不应进入 Git、发行包或未脱敏的故障报告。
 
 ### 旧版数据首次迁移
 
-如果新目标目录尚不存在，首次启动会将项目内旧 `data/config.json{,.bak}` 和 `data/icons/` 安全复制到 Application Support，将 `data/logs/` 复制到 Library Logs。迁移使用临时目录后原子落位，并且：
+macOS 新目标目录尚不存在时，首次启动会将项目内旧 `data/config.json{,.bak}` 和 `data/icons/` 安全复制到 Application Support，将 `data/logs/` 复制到 Library Logs。迁移使用临时目录后原子落位，并且：
 
 - 旧 `data/` 始终保留，不会自动删除。
 - 目标已存在时绝不覆盖或合并，避免把更新的用户数据换回旧版。
 - 符号链接和非普通文件不会被复制。
 - 显式设置 `CONSOLE_DATA_DIR` 或 `CONSOLE_LOG_DIR` 时，对应目录不执行旧数据自动迁移。
+
+Windows 不会自动复制项目内旧 `data/` 或猜测转换 macOS 配置。需要迁移时，在设置中心显式选择 JSON，先预览并映射路径，再选择应用提交；blocked/conflict 项不会被静默覆盖，提交后在目标配置未继续变化时可以回滚。
 
 需要自定义路径时：
 
@@ -200,19 +233,25 @@ CONSOLE_LOG_DIR="/private/path/console-logs" \
 python3 server.py
 ```
 
-自定义值必须是非空的绝对路径，并指向总控台专用的非符号链接子目录；不要直接填 `/`、用户主目录或项目根目录。
+```powershell
+$env:CONSOLE_DATA_DIR = 'D:\LocalOpsData'
+$env:CONSOLE_LOG_DIR = 'D:\LocalOpsData\logs'
+.\.venv\Scripts\python.exe server.py
+```
+
+自定义值必须是非空绝对路径，并指向总控台专用的非链接子目录；不要直接填盘符根、用户主目录或项目根目录。Windows 还会拒绝 UNC 共享根、symlink 和 junction 路径。
 
 ### 备份
 
 1. 不再执行新的启动、停止或编辑操作。
-2. 停止总控台。
-3. 将 `~/Library/Application Support/总控台/` 复制到受保护的备份目录。
+2. Windows 必须先在启动台逐个停止并释放全部受管 generation，再停止总控台；macOS 也建议先停止不希望继续运行的应用。
+3. 将 macOS `~/Library/Application Support/总控台/` 或 Windows `%LOCALAPPDATA%\LocalOps\`（排除 `runtime/` 和通常不需要的 `logs/`）复制到受保护的备份目录。
 4. 记录当前 `VERSION`，以便恢复时匹配配置格式。
 
 ### 恢复
 
-1. 确保总控台已停止，并另存当前 `~/Library/Application Support/总控台/`。
-2. 将备份中的 `config.json` 和 `icons/` 复制回对应位置，权限分别设为 `0600` 和 `0700`。
+1. 确保总控台已停止，并另存当前平台的数据目录。
+2. 将备份中的 `config.json` 和 `icons/` 复制回对应位置。macOS 恢复 `0600`/`0700` 权限；Windows 由程序重新验证当前用户 owner 与私有 DACL，不要复制其他机器的 `runtime/`。
 3. 重新启动，逐项确认命令、工作目录和端口。
 
 如果主配置损坏，程序会验证 `config.json.bak` 并恢复主文件。如果两份都不可用，服务进入只读保护状态，不会用空配置覆盖它们。`config.json.bak` 保留的是每次修改之前的上一份良好配置，而不是主文件的同内容副本。
@@ -220,9 +259,9 @@ python3 server.py
 ## 升级
 
 1. 阅读 `CHANGELOG.md`，确认是否有配置或平台变更。
-2. 停止总控台并完整备份 `~/Library/Application Support/总控台/`。
-3. 用新版本替换程序文件；用户数据保持在 Library 目录中。
-4. 运行 `make check`。
+2. 停止总控台并备份当前平台的数据目录。
+3. 用新版本替换程序文件；Windows onedir 包必须整体替换，不能只覆盖 `LocalOps.exe`。用户数据保持在独立数据目录中。
+4. 源码 checkout 在 macOS 运行 `make check`，在 Windows 运行 `py -3.12 tools\check_project.py --scope windows`；打包用户使用已经通过对应审计的完整 ZIP。
 5. 启动后检查应用数量、主题、关注关键字和一个可控服务的完整启停。
 
 当前配置为 schema v2，启动时逐版执行显式、幂等迁移。v2 保留旧 `command`，Windows Phase 4 只会执行通过静态预检的结构化 `commandSpec`；POSIX/待复核命令仍不可执行。新程序不会静默降级它不认识的更高 schema；回退程序时仍应同时恢复与该版本匹配的数据备份。
@@ -231,41 +270,43 @@ python3 server.py
 
 1. 如果不希望已启动的服务继续运行，先在启动台逐个停止它们。
 2. 停止总控台。
-3. 按需导出 `~/Library/Application Support/总控台/` 备份。
-4. 将整个项目目录移到废纸篓。
-5. 确认不再需要数据后，手动删除 `~/Library/Application Support/总控台/` 和 `~/Library/Logs/总控台/`。
+3. 按需导出当前平台的数据目录备份。
+4. 将整个项目目录或 Windows 解压后的完整 onedir 目录移到废纸篓/回收站。
+5. 确认不再需要数据后，手动删除 macOS Application Support/Library Logs，或 Windows `%LOCALAPPDATA%\LocalOps\`。
 
-程序不会安装系统启动项，卸载时也不会自动删除用户数据。
+程序不会安装系统服务或系统启动项，卸载时也不会自动删除用户数据。
 
 ## 安全边界
 
-总控台不是多用户服务器或远程管理面板。它能以当前 macOS 用户的权限执行你保存的 shell 命令，因此：
+总控台不是多用户服务器或远程管理面板。它能以当前用户权限执行已保存并通过平台校验的命令，因此：
 
 - 只添加你已检查且信任的命令和工作目录。
 - 不要将服务绑定到 `0.0.0.0`，不要通过反向代理、SSH 隧道或端口映射对外暴露。
 - 不要在共享或不受信任的用户账户中运行。
-- 不要把 Application Support 中的 `config.json`、Library Logs 日志或故障截图未经脱敏就上传。
+- 不要把平台数据目录中的 `config.json`、日志或故障截图未经脱敏就上传。
 - 本地回环绑定只是第一层边界，不能替代写接口的 Host/Origin/控制令牌防护。发布验收时必须执行 `RELEASE_CHECKLIST.md` 中的安全项。
+
+Windows 只会启动和控制由本次 Local Ops generation 创建、加入 Job Object 并通过 SID/PID 创建时间/HMAC 回执复验的进程树。外部认领、外部结束和总控台重启保持禁用；不要用 `taskkill /T`、端口匹配或裸 PID 替代产品的所有权校验。
 
 ## 故障排查
 
 ### 双击后没有界面
 
-- 确认 `python3 --version` 可用且符合要求。
-- 查看 `~/Library/Logs/总控台/console.log`。
-- 用 `python3 server.py` 从终端启动，直接查看错误。
-- 不要单独移动 `总控台.app`；它必须保持在项目根目录。
+- macOS：确认 `python3 --version` 可用，查看 `~/Library/Logs/总控台/console.log`，并可用 `python3 server.py` 查看终端错误；不要单独移动 `总控台.app`。
+- Windows 源码：确认 Python 3.12 与 `requirements-windows.txt` 已安装，用 `.\.venv\Scripts\python.exe server.py` 查看错误。
+- Windows 打包候选：保持 `LocalOps.exe` 与 `_internal`/静态资源的完整目录结构，查看 `%LOCALAPPDATA%\LocalOps\logs\console.log`。当前 unsigned 构建被 Defender/SmartScreen 阻止时应保留原始结果，不要绕过系统保护。
 
 ### 9600 打不开
 
-程序可能已选择 9601–9609。查看终端输出或 `~/Library/Logs/总控台/console.log` 中的实际地址。服务可访问时，`GET /api/health` 会返回程序版本、配置 schema 和降级原因，且不会执行 `ps/lsof` 扫描。
+程序可能已选择 9601–9609。查看浏览器地址、终端输出或当前平台的 `console.log`。服务可访问时，`GET /api/health` 会返回程序版本、配置 schema 和降级原因，且不会执行进程扫描。
 
 ### 应用启动失败
 
 - 先打开该应用的日志和“启动诊断”。
 - 确认工作目录仍然存在、命令可在普通 shell 中运行。
 - 检查启动瞬间配置端口是否正被其他进程占用；不同项目允许保存相同的常见开发端口。
-- Finder 启动的应用不会读取你的 shell 配置；总控台会补入常用 Node/Homebrew 路径，但非标准安装仍可能需要显式绝对路径。
+- macOS Finder 启动不会读取 shell 配置；总控台会补入常用 Node/Homebrew 路径，但非标准安装仍可能需要显式绝对路径。
+- Windows 只执行已通过预检的结构化 `commandSpec`；确认 executable 能从工作目录或 `PATH`/`PATHEXT` 唯一解析。POSIX 命令和待复核 shell 文本不会被猜测性转换后执行。
 
 ### 配置丢失或损坏
 

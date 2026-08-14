@@ -4,7 +4,7 @@
   "baselineCommit": "a5c3adae1f1fa0bd9f0ac7b090ec422e285d0c0f",
   "implementationCommit": "5daddece8a06d1fdd382d1814e58be7b777ceae4",
   "ciRun": "31780819809",
-  "branch": "codex/windows-port-phase-5",
+  "branch": "codex/windows-native-adaptation",
   "currentPhase": "P5",
   "phaseStatus": "IMPLEMENTED_UNVERIFIED",
   "scopedTarget": "Phase 5 exact-CI engineering candidate",
@@ -165,5 +165,5 @@
     "Phase 4 implementation commit 06d9b1a37d4b775f4b01f822a021afb93513514c passed exact-commit CI run 31768949592 and remains the last fully closed phase because Phase 5 external gates are incomplete."
   ],
   "nextAction": "Complete the remaining external Phase 5 gates: Windows 10 when user scope resumes, an independent clean no-Python VM, Defender/SmartScreen, native picker/Notification Center, favicon brand review, and the signing/release decision before considering Beta.",
-  "lastVerifiedAt": "2026-08-14T15:56:48+08:00"
+  "lastVerifiedAt": "2026-08-14T17:03:13+08:00"
 }

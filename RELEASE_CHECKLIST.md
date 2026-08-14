@@ -58,7 +58,7 @@
 - [ ] 普通停止超时保留身份且不自动 Force；显式 Force 重做完整验证并只对受管 Job 调用 `TerminateJobObject`。
 - [ ] 禁止 `taskkill /T`、裸 PID `TerminateProcess`、Windows `os.kill(pid, 0)` 和 `psutil.children()` 所有权证明；外部 attach/kill 与总控台重启仍关闭。
 - [ ] `WIN-LIFE-001..012` 与 `WIN-SEC-001..014` 在设置 `LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS=1` 的隔离夹具作用域或 Windows runner 中只操作测试自身创建的进程并通过。
-- [ ] 本地门禁通过后状态仅为 `LOCAL_PASS_CI_PENDING`；精确实现 commit 的 Windows Python 3.12 CI 与完整 macOS regression/release CI 同时通过后，才将 Phase 4 改为 `PASS`。
+- [x] Phase 4 implementation commit `06d9b1a37d4b775f4b01f822a021afb93513514c` 的 Windows Python 3.12 CI 与完整 macOS regression/release CI 已在 run `31768949592` 同时通过，Phase 4 状态为 `PASS`。
 - [ ] Windows 10、self-contained 打包和干净无 Python VM 仍为 Phase 5；这些项目完成前 `windowsBetaReady=false`。
 
 ## 3. 安全与进程生命周期

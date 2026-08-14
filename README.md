@@ -34,7 +34,7 @@
 - macOS 自带的 `ps`、`lsof`、`osascript` 等系统工具。
 - Safari、Chrome 或其他支持 ES Modules 的现代浏览器。
 
-Windows Phase 4 源码候选要求 Windows 11 x64、Python 3.12，以及 `requirements-windows.txt` 中锁定的依赖。当前 `LOCAL_PASS_CI_PENDING`：Windows NT build 26200（25H2）非管理员本地门禁已通过，但本地使用的是 Python 3.13.13。精确提交 `fc29e5637d93b95026a5dbca5e46c638c51b5439` 的 CI run `31766584905` 因 Windows owner semantics 与 macOS test principal isolation 失败；该 run 只是历史失败尝试，修复后的新 exact-commit Windows Python 3.12 CI 与完整 macOS 回归尚未运行。状态以 `docs/windows-port/STATE.json` 为准。Windows 10、self-contained 打包和干净机器验收属于 Phase 5，因此不构成 Windows Beta 发布。
+Windows Phase 4 源码候选要求 Windows 11 x64、Python 3.12，以及 `requirements-windows.txt` 中锁定的依赖。Windows NT build 26200（25H2）非管理员本地门禁已通过；实现提交 `06d9b1a37d4b775f4b01f822a021afb93513514c` 也已通过 exact-commit CI run `31768949592` 的 Windows Python 3.12 与完整 macOS regression/release jobs。状态以 `docs/windows-port/STATE.json` 为准。Windows 10、self-contained 打包和干净机器验收属于 Phase 5，因此当前仍不是 Windows Beta 发布。
 
 ## Windows Phase 4 生命周期源码候选
 
@@ -58,7 +58,7 @@ request/receipt 原子写入会先保护临时文件的 DACL，再替换为公�
 
 Windows 仍不支持外部进程认领、外部进程结束和总控台重启。不要通过修改前端或直接调用接口绕过 capability 与每应用 `controlAvailable` 门禁。破坏性生命周期测试只能设置 `LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS=1` 后在隔离夹具作用域或 hosted runner 中运行，并且只能操作测试夹具创建的进程；禁止控制任何现有用户进程。
 
-本地 Phase 4 门禁已通过 Windows real discovery 174/174（406.426s）、frontend 24/24、HTTP hardening 6/6（合计 30/30）和 Node 30/30。其中包括 `WIN-LIFE-001..012` 的 12/12、`WIN-SEC-001..014` 的 14/14、HTTP 总控台测试子进程终止后重开，以及 100 次完整启动/Force/释放循环。该结果不是精确提交 CI，也不把 `windowsBetaReady` 改为 `true`。
+本地 Phase 4 门禁已通过 Windows real discovery 174/174（406.426s）、frontend 24/24、HTTP hardening 6/6（合计 30/30）和 Node 30/30。其中包括 `WIN-LIFE-001..012` 的 12/12、`WIN-SEC-001..014` 的 14/14、HTTP 总控台测试子进程终止后重开，以及 100 次完整启动/Force/释放循环。相同实现已通过上述 exact-commit CI；只有 Phase 5 的 Windows 10、self-contained clean-machine 和发行审计全部通过后，才会把 `windowsBetaReady` 改为 `true`。
 
 `VERSION` 是项目版本的唯一权威来源。`Info.plist`、发行包名和发行说明应与它保持一致。
 

@@ -1,15 +1,16 @@
 # Windows Port Test Evidence
 
-## Phase 4 local gate — LOCAL_PASS_CI_PENDING
+## Phase 4 — PASS
 
 The authorized local gate passed on 2026-08-14 on Windows NT build 26200
 (DisplayVersion 25H2), x64, at medium integrity without administrator
 membership. Local Python was 3.13.13 and Node.js was 24.16.0. All destructive
 operations were restricted to processes created by the test fixtures.
 
-This evidence does not close Phase 4. `implementationCommit` and `ciRun` remain
-`null`; Windows Python 3.12 and the complete macOS regression/release job must
-pass against the same exact commit before Phase 4 can be marked `PASS`.
+Local evidence is closed by exact-commit CI for implementation commit
+`06d9b1a37d4b775f4b01f822a021afb93513514c` and run `31768949592`.
+Windows Python 3.12 job `94670617580` and complete macOS
+regression/release/reproducibility job `94670617652` both passed.
 
 ### Gated real Windows discovery — PASS (174/174)
 
@@ -23,8 +24,8 @@ python -B -m unittest discover -s tests\windows -p "test_*.py" -v
 - Failed/errors/skipped: 0
 - `WIN-LIFE-001..012`: 12/12 test methods passed.
 - `WIN-SEC-001..014`: all 14 explicit cases passed.
-- Accepted candidate commit: `null` (the fixed candidate is not committed yet)
-- Accepted CI run/job: `null` (the failed attempt is recorded below)
+- Accepted candidate commit: `06d9b1a37d4b775f4b01f822a021afb93513514c`
+- Accepted CI run: `31768949592`
 
 ### WIN-LIFE mapping — PASS
 
@@ -110,7 +111,13 @@ All cases are in `tests/windows/test_windows_security_matrix.py`.
 - Limitation: headless QA did not invoke the native OS picker or prove delivery
   through Windows Notification Center. Those native paths remain `NOT_RUN`.
 
-### Exact-commit CI — PENDING AFTER FAILED ATTEMPT
+### Exact-commit CI — PASS
+
+- Accepted implementation commit:
+  `06d9b1a37d4b775f4b01f822a021afb93513514c` (`06d9b1a`).
+- Accepted run: `31768949592`, conclusion `SUCCESS`.
+- Windows Python 3.12 job `94670617580`: `SUCCESS`.
+- macOS regression/release/reproducibility job `94670617652`: `SUCCESS`.
 
 - Historical failed attempt: exact commit
   `fc29e5637d93b95026a5dbca5e46c638c51b5439` (`fc29e56`), run
@@ -120,15 +127,17 @@ All cases are in `tests/windows/test_windows_security_matrix.py`.
   the current user would always be the initial owner.
 - macOS failure: Windows lifecycle fixtures did not isolate the fake platform
   principal globals from the host principal.
-- The attempt does not populate `implementationCommit` or `ciRun` and does not
-  advance `lastGreenPhase` beyond P3.
-- Fixed-candidate Windows Python 3.12 exact-commit CI: `NOT_RUN`
-- Fixed-candidate complete macOS regression/release/reproducibility CI: `NOT_RUN`
+- Later historical failures were commit `c3a9fa9e83c6d4cfcf87b5310be0bd764ea58dc5`,
+  run `31767880432`, and commit
+  `b96b5c4293559b7cd17e855cfb055eba39495c02`, run `31768341494`.
+  They exposed the eager non-Windows Job Object decorator, hosted-console
+  diagnostics, and strict-cp1252 redirected output. They are not accepted
+  evidence.
 - The Windows workflow now runs Windows/lifecycle discovery, API contracts, and
   frontend/HTTP hardening as three independent fail-fast steps without
   `continue-on-error`.
 - Phase 4 local Edge lifecycle QA: `PASS_LOCAL`; native picker and Windows Notification Center delivery: `NOT_RUN`
-- `lastGreenPhase`: `P3`
+- `lastGreenPhase`: `P4`
 
 ### Deferred beyond Phase 4
 

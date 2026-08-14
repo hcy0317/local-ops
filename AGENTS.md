@@ -1,6 +1,6 @@
 # 总控台 (Console)
 
-本地服务监控与快速启动控制台。共享 HTTP/配置核心使用 Python 3 标准库，macOS runtime 保持零第三方依赖；Windows adapter 使用 `requirements-windows.txt` 中精确锁定的 `psutil` 与 `pywin32`。前端仍为无构建原生 HTML/CSS/JavaScript。macOS 推荐双击 `总控台.app` 后台运行；Windows Phase 4 以源码方式提供监控和仅针对 Local Ops 自建 Job 的受管生命周期。当前状态为 `LOCAL_PASS_CI_PENDING`，不得在精确提交 Windows Python 3.12 与完整 macOS CI 前写成 Phase 4 PASS。
+本地服务监控与快速启动控制台。共享 HTTP/配置核心使用 Python 3 标准库，macOS runtime 保持零第三方依赖；Windows adapter 使用 `requirements-windows.txt` 中精确锁定的 `psutil` 与 `pywin32`。前端仍为无构建原生 HTML/CSS/JavaScript。macOS 推荐双击 `总控台.app` 后台运行；Windows Phase 4 已通过源码方式提供监控和仅针对 Local Ops 自建 Job 的受管生命周期，当前进入 Phase 5 打包与 Beta 验收。Windows 10、self-contained clean-machine smoke 和全部发行门禁完成前不得写成 Windows Beta Ready。
 
 ## 结构
 
@@ -116,7 +116,7 @@
 - **Windows TokenOwner 边界**：Windows 新对象 owner 来自 access token 的 `TokenOwner`。平台只接受 `TokenOwner` 为当前用户或 Builtin Administrators；仅在 creation-time apply 路径观察到 Admin 默认 owner 时，才通过一次安全描述符更新把 owner 归一为当前用户并同时写入原 protected DACL。verify-only 的既有记录必须已经由当前用户拥有，Admin-owned 记录同样拒绝，不能先修复再信任。
 - **Windows runtime 原子性与清理**：request/receipt 临时文件必须先应用并验证私有 DACL，再 `os.replace`；重连与清理只做 verify-only，不得自动修复已放宽 ACL。释放 active generation 前必须同时证明目录恰好包含三个私有 runtime records、terminal receipt 签名有效、Job 已空且 runner 不再存在；将目录原子 rename 为严格派生的 cleanup tombstone 是 release commit。commit 后的恢复只删除 private、nonlink tombstone 中三个 runtime record 的 allowlisted subset，且不得观察或控制任何进程；未知项、宽 ACL 或 link 一律 fail closed。
 - **Windows 生命周期测试**：只有隔离夹具作用域或 hosted runner 可以设置 `LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS=1`，且测试只能结束自身创建的 fixture 进程；禁止针对现有用户进程运行。
-- **Phase 4 当前证据**：Windows build 26200/25H2 非管理员本地 real discovery 为 174/174 PASS（406.426s），frontend 为 24/24、HTTP hardening 为 6/6（合计 30/30）、Node 为 30/30，`WIN-LIFE-001..012` 为 12/12，`WIN-SEC-001..014` 为 14/14；本地 Python 是 3.13.13。精确提交 `fc29e5637d93b95026a5dbca5e46c638c51b5439` 的 CI run `31766584905` 因 Windows owner semantics 与 macOS test principal isolation 失败，只作为历史失败尝试；`implementationCommit`/`ciRun` 仍为空，`lastGreenPhase` 仍为 P3，修复后的新 exact-commit CI 尚未运行。
+- **Phase 4 当前证据**：Windows build 26200/25H2 非管理员本地 real discovery 为 174/174 PASS（406.426s），frontend 为 24/24、HTTP hardening 为 6/6（合计 30/30）、Node 为 30/30，`WIN-LIFE-001..012` 为 12/12，`WIN-SEC-001..014` 为 14/14；本地 Python 是 3.13.13。实现提交 `06d9b1a37d4b775f4b01f822a021afb93513514c` 已通过 exact-commit CI run `31768949592`：Windows Python 3.12 job `94670617580` 与完整 macOS regression/release job `94670617652` 均为 PASS。`lastGreenPhase=P4`；Windows 10、打包和 clean-machine Beta 门禁仍属 Phase 5。
 - **任务取消协议**：一次性任务内部的“用户主动取消”以退出码 **130** 通知总控台；0 表示成功，其余表示失败。不要通过日志文字猜测状态
 - **配置健康**：`inspect_app_health` 只解析确定无歧义的简单命令并执行 stat/权限/PATH 检查，不执行命令、不展开变量/通配符。相对脚本按配置 cwd（空值时用户主目录）解析；复杂或动态命令返回 unknown
 - **运行中编辑**：编辑面板打开时立即显示“停止服务”。点击只调用 stop，面板保持打开且当前草稿不变；停止成功后用户继续编辑并普通保存。名称/图标仍可在运行中直接保存。`stopBeforeUpdate:true` 保留为 API 客户端的原子停止更新能力，但不是默认前端流程。

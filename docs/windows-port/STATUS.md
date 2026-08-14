@@ -1,6 +1,6 @@
 # Windows Port Status
 
-## Phase 4 local gate — LOCAL_PASS_CI_PENDING
+## Phase 4 — PASS
 
 The Phase 4 source candidate implements the runner/Job ownership model,
 protected Named Pipe IPC and receipts, generation compare-and-swap, and the
@@ -28,15 +28,20 @@ recovery handles only a private, nonlink allowlisted record subset and performs
 no process observation or control. The atomic request/receipt writers protect
 their temporary files before replacement.
 
-This is not the final Phase 4 PASS. Exact commit
-`fc29e5637d93b95026a5dbca5e46c638c51b5439` (`fc29e56`) produced failed CI
-run `31766584905`: Windows exposed the administrator-token `TokenOwner`
-new-object owner semantics, and macOS exposed lifecycle test fixtures that had
-not isolated the fake platform principal from the host principal. This is a
-historical failed attempt, not Phase 4 green evidence. `implementationCommit`
-and `ciRun` remain unset. The fixed candidate must be committed and both the
-Windows Python 3.12 and complete macOS regression/release jobs must pass on that
-new exact commit before `lastGreenPhase` can move beyond P3.
+Phase 4 implementation commit
+`06d9b1a37d4b775f4b01f822a021afb93513514c` (`06d9b1a`) passed exact-commit
+CI run `31768949592`. Windows Python 3.12 job `94670617580` passed the
+fixture-owned lifecycle, API contract, frontend, and HTTP hardening gates;
+macOS job `94670617652` passed the complete regression, release, and
+reproducibility audit. `lastGreenPhase` is P4.
+
+Earlier runs remain historical failures, not accepted evidence. Run
+`31766584905` exposed Windows `TokenOwner` semantics and macOS fake-principal
+test isolation; run `31767880432` exposed an eager non-Windows Job Object test
+decorator and insufficient hosted-console diagnostics; run `31768341494`
+exposed localized startup crashing when redirected stdout used strict cp1252.
+The accepted commit configures CLI diagnostic streams as UTF-8 before any
+entry-point branch, so redirected output cannot terminate the service.
 
 The current Windows workflow separates lifecycle/Windows discovery, API
 contracts, and frontend/HTTP hardening into three independent fail-fast steps
@@ -68,10 +73,10 @@ readiness remain Phase 5 scope. `windowsBetaReady=false`.
 
 ## Current result
 
-**P4 LOCAL_PASS_CI_PENDING / WIN11 LOCAL FIXTURES PASS / WIN10 DEFERRED.**
+**P4 PASS / EXACT-COMMIT WINDOWS + MACOS CI PASS / WIN10 PHASE 5.**
 
-No final Phase 4 PASS, implementation commit, or CI run is claimed in this
-document.
+Windows 10, self-contained packaging, and clean-machine Beta gates remain
+Phase 5 work; therefore `windowsBetaReady=false`.
 
 ## Phase 3 last-green result
 

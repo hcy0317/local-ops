@@ -2,17 +2,17 @@
   "schemaVersion": 1,
   "task": "local-ops-windows-port",
   "baselineCommit": "a5c3adae1f1fa0bd9f0ac7b090ec422e285d0c0f",
-  "implementationCommit": null,
-  "ciRun": null,
+  "implementationCommit": "06d9b1a37d4b775f4b01f822a021afb93513514c",
+  "ciRun": "31768949592",
   "branch": "windows-port/phases-1-4",
   "currentPhase": "P4",
-  "phaseStatus": "LOCAL_PASS_CI_PENDING",
+  "phaseStatus": "PASS",
   "scopedTarget": "Windows 11 Phase 4",
-  "scopedTargetStatus": "LOCAL_PASS_CI_PENDING",
+  "scopedTargetStatus": "PASS",
   "windows10Status": "DEFERRED",
-  "lastGreenPhase": "P3",
-  "macosTests": "NOT_RUN",
-  "windowsTests": "PASS_LOCAL",
+  "lastGreenPhase": "P4",
+  "macosTests": "PASS",
+  "windowsTests": "PASS",
   "windowsBetaReady": false,
   "changedFiles": [
     "MEMORY.md",
@@ -112,21 +112,21 @@
   ],
   "assumptions": [
     "The local Phase 4 gate ran on Windows NT build 26200 (DisplayVersion 25H2), x64, at medium integrity without administrator membership.",
-    "The local Phase 4 Python evidence is 3.13.13; Windows Python 3.12 and macOS evidence must come from exact-commit CI, and Windows 10 remains deferred."
+    "The local Phase 4 Python evidence is 3.13.13; exact-commit CI passed on Windows Python 3.12 and macOS, while Windows 10 remains Phase 5 scope."
   ],
   "knownBlockers": [],
   "deferredGates": [
     "Windows 10 non-admin validation remains deferred by explicit user scope.",
-    "Phase 4 passed the authorized fixture-only local Windows 11 gate but remains pending exact-commit Windows Python 3.12 and complete macOS CI.",
     "Windows packaging and clean-machine validation remain Phase 5."
   ],
   "knownFailures": [
-    "Historical failed Phase 4 attempt: exact commit fc29e5637d93b95026a5dbca5e46c638c51b5439 (fc29e56), CI run 31766584905, failed on Windows TokenOwner new-object owner semantics and macOS lifecycle test principal isolation; it is not accepted Phase 4 evidence."
+    "Historical failed Phase 4 attempt: exact commit fc29e5637d93b95026a5dbca5e46c638c51b5439 (fc29e56), CI run 31766584905, failed on Windows TokenOwner new-object owner semantics and macOS lifecycle test principal isolation; it is not accepted Phase 4 evidence.",
+    "Historical failed Phase 4 attempt: exact commit c3a9fa9e83c6d4cfcf87b5310be0bd764ea58dc5, CI run 31767880432, exposed the eager non-Windows Job Object test decorator and the hosted Windows console readiness diagnostic gap.",
+    "Historical failed Phase 4 attempt: exact commit b96b5c4293559b7cd17e855cfb055eba39495c02, CI run 31768341494, exposed redirected cp1252 stdout crashing localized console startup; commit 06d9b1a fixed the production output boundary."
   ],
   "verificationLimitations": [
     "Phase 4 local UI QA used isolated Edge 151; the native Windows picker and Windows Notification Center delivery remain NOT_RUN, while notification permission-denied/granted and object construction/close passed.",
-    "One contract symlink rejection test is skipped because this non-admin Windows session cannot create symlinks.",
-    "No passing Phase 4 implementation commit or CI run exists yet; failed run 31766584905 is historical only, and the fixed candidate has not run exact-commit Windows Python 3.12 or macOS regression/release CI."
+    "One contract symlink rejection test is skipped because this non-admin Windows session cannot create symlinks."
   ],
   "verifiedResults": [
     "The gated real Windows test discovery passed 174 of 174 tests in 406.426 seconds using only fixture-created processes.",
@@ -140,8 +140,9 @@
     "Runtime release required exactly three private active-generation records, a signed terminal receipt, an empty Job, and an absent runner before atomic rename committed release; committed tombstone recovery accepted only a private, nonlink allowlisted record subset, performed no process observation or control, and failed closed on unknown entries, widened ACLs, or links.",
     "Windows TokenOwner handling passed locally: default owner is limited to the current user or Builtin Administrators, only creation-time apply may atomically normalize the Admin default owner to the current user plus the protected DACL, and verify-only existing records reject Admin ownership.",
     "The Windows CI workflow separates Windows/lifecycle discovery, API contracts, and frontend/HTTP hardening into three independent fail-fast steps without continue-on-error.",
+    "Phase 4 implementation commit 06d9b1a37d4b775f4b01f822a021afb93513514c passed exact-commit CI run 31768949592: Windows Python 3.12 job 94670617580 and macOS regression/release job 94670617652 both passed.",
     "Historical Phase 3 evidence only: implementation commit 97c417ef1491ac11fdb036c4e4102bfc190c88e6 passed CI run 31698371278 (Windows job 94441279178 and macOS job 94441279120); it is not Phase 4 evidence."
   ],
-  "nextAction": "Create a new Phase 4 fix commit after fc29e56, run Windows Python 3.12 and complete macOS regression/release CI against that new exact commit, and record only a passing run before any Phase 4 PASS claim.",
-  "lastVerifiedAt": "2026-08-14T11:44:53+08:00"
+  "nextAction": "Begin Phase 5 CI separation, self-contained Windows packaging, artifact audit, and real-machine Beta gates without changing windowsBetaReady until every required target passes.",
+  "lastVerifiedAt": "2026-08-14T12:15:00+08:00"
 }

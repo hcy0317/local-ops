@@ -1070,6 +1070,7 @@ class WindowsPlatform:
                 raise ProtocolError(
                     "RUNTIME_IDENTITY_UNVERIFIED", "runtime is not safely terminal"
                 )
+            self._wake_terminal_runner(identity)
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline:
                 observation = self._observe_process(int(identity.runner_pid or 0))
@@ -1096,6 +1097,20 @@ class WindowsPlatform:
                 False, str(exc), still_running=False, status="unknown",
                 code=getattr(exc, "code", "RUNTIME_CONTROL_FAILED"),
             )
+
+    def _wake_terminal_runner(self, identity: RuntimeIdentity) -> None:
+        """Release a runner whose pipe thread is still waiting after Job exit."""
+        try:
+            pipe = self._connect_pipe(identity, timeout=0.5)
+        except ProtocolError:
+            return
+        try:
+            # A terminal runner accepts no more work. Connecting and closing an
+            # authenticated-identity-bound pipe only releases ConnectNamedPipe;
+            # the server observes EOF and completes its existing shutdown path.
+            pass
+        finally:
+            pipe.Close()
 
     @staticmethod
     def _bounded_directory_names(path: str, limit: int) -> tuple[str, ...]:

@@ -594,6 +594,40 @@ class WindowsPlatformTests(unittest.TestCase):
             self.assertFalse(os.path.lexists(tombstone))
             unlink.assert_not_called()
 
+    def test_release_managed_wakes_exact_terminal_runner_before_waiting(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+                os.environ, {
+                    "CONSOLE_DATA_DIR": os.path.join(temp_dir, "data"),
+                    "CONSOLE_LOG_DIR": os.path.join(temp_dir, "logs"),
+                }):
+            platform = WindowsPlatform(os.getcwd(), "server.py")
+            self._create_recovery_record(platform)
+            with mock.patch.object(platform, "_observe_process", return_value=None):
+                identity = platform.recover_managed_cleanups()[0]
+            runner_alive = (identity.owner, float(identity.runner_create_time))
+            pipe = mock.Mock()
+            inspection = SimpleNamespace(
+                verified=True,
+                status="exited",
+                members=(),
+            )
+
+            with mock.patch.object(platform, "_runtime_context"), \
+                    mock.patch.object(
+                        platform, "inspect_managed", return_value=inspection
+                    ), mock.patch.object(
+                        platform,
+                        "_observe_process",
+                        side_effect=(runner_alive, None),
+                    ), mock.patch.object(
+                        platform, "_connect_pipe", return_value=pipe
+                    ) as connect:
+                result = platform.release_managed(identity)
+
+            self.assertTrue(result.ok, (result.code, result.error))
+            connect.assert_called_once_with(identity, timeout=0.5)
+            pipe.Close.assert_called_once_with()
+
     def test_release_managed_commits_before_rmdir_and_recovers_tombstone(self):
         with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
                 os.environ, {

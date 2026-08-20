@@ -2012,8 +2012,6 @@ def get_state_snapshot(cfg, console_port):
             if cached is not None and now - _state_cache["mono"] < STATE_CACHE_TTL:
                 return cached
 
-        # Only an authenticated terminal receipt may mutate during reconciliation.
-        reconcile_windows_terminal_runtimes(cfg)
         while True:
             with _state_cache_lock:
                 epoch = int(_state_cache.get("epoch", 0))
@@ -2682,6 +2680,28 @@ def reconcile_windows_terminal_runtimes(cfg):
         terminal = _inspect_windows_terminal(identity)
         if terminal is not None:
             _clear_windows_generation(cfg, app, terminal)
+
+
+def start_windows_runtime_reconciler(cfg, interval=30.0):
+    """Run authenticated terminal cleanup without delaying HTTP state reads."""
+    stop = threading.Event()
+    if PLATFORM.name != "windows":
+        return stop
+
+    def _reconcile_loop():
+        while not stop.is_set():
+            try:
+                reconcile_windows_terminal_runtimes(cfg)
+            except Exception:
+                LOG.exception("Windows runtime background reconciliation failed")
+            stop.wait(max(1.0, float(interval)))
+
+    threading.Thread(
+        target=_reconcile_loop,
+        name="windows-runtime-reconciler",
+        daemon=True,
+    ).start()
+    return stop
 
 
 def startup_failure_message(app_id, code):
@@ -5770,6 +5790,7 @@ def _run_console(preferred_port=None, open_browser=True, storage_issues=None):
         sys.exit(1)
 
     print("总控台已启动: http://%s:%d/  (Ctrl+C 停止)" % (HOST, port), flush=True)
+    reconcile_stop = start_windows_runtime_reconciler(cfg)
     if open_browser:
         open_browser_later(port)
     try:
@@ -5777,6 +5798,7 @@ def _run_console(preferred_port=None, open_browser=True, storage_issues=None):
     except KeyboardInterrupt:
         pass
     finally:
+        reconcile_stop.set()
         server.server_close()
         print("已停止", flush=True)
 

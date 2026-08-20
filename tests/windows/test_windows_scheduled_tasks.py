@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -155,6 +156,40 @@ class WindowsHealthTests(unittest.TestCase):
         self.assertEqual(platform.verify_private_file.call_count, 2)
         platform.ensure_private_directory.assert_not_called()
         platform.ensure_private_file.assert_not_called()
+
+
+class RuntimeReconciliationSchedulingTests(unittest.TestCase):
+    def test_state_snapshot_never_runs_terminal_cleanup_inline(self):
+        cfg = SimpleNamespace(
+            snapshot=lambda: dict(server.Config.DEFAULT),
+            health_info=lambda: {"issues": []},
+        )
+        cache = {"mono": 0.0, "state": None, "epoch": 0}
+        with mock.patch.object(server, "_state_cache_lock", threading.Lock()), \
+                mock.patch.object(server, "_state_build_lock", threading.Lock()), \
+                mock.patch.object(server, "_state_cache", cache), \
+                mock.patch.object(
+                    server, "reconcile_windows_terminal_runtimes",
+                    side_effect=AssertionError("cleanup blocked state response"),
+                ), \
+                mock.patch.object(
+                    server, "build_state", return_value={"degraded": False}
+                ):
+            state = server.get_state_snapshot(cfg, 9600)
+
+        self.assertEqual(state, {"degraded": False})
+
+    def test_windows_reconciler_runs_outside_request_path(self):
+        called = threading.Event()
+        platform = SimpleNamespace(name="windows")
+        with mock.patch.object(server, "PLATFORM", platform), \
+                mock.patch.object(
+                    server, "reconcile_windows_terminal_runtimes",
+                    side_effect=lambda _cfg: called.set(),
+                ):
+            stop = server.start_windows_runtime_reconciler(object())
+            self.assertTrue(called.wait(1))
+            stop.set()
 
 
 if __name__ == "__main__":

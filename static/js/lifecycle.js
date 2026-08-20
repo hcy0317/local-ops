@@ -24,6 +24,8 @@ export function lifecycleSnapshot(app, platform = 'unknown') {
   const macos = platform === 'macos';
   const hasExplicitStatus = !!app && LIFECYCLE_STATUSES.has(app.lifecycleStatus);
   const hasExplicitControl = !!app && typeof app.controlAvailable === 'boolean';
+  const externalScheduled = !!app
+    && app.runtimeSource === 'windowsTaskScheduler';
   const status = (!windows && !macos) || (windows && (!hasExplicitStatus || !hasExplicitControl))
     ? 'unknown' : normalizedStatus(app);
   const generation = generationId(app);
@@ -42,7 +44,7 @@ export function lifecycleSnapshot(app, platform = 'unknown') {
     expectedGeneration: status === 'stopped' ? null : generation,
     canStart,
     canManage,
-    canDelete: canStart || canManage,
+    canDelete: externalScheduled || canStart || canManage,
     busy: status === 'starting' || status === 'stopping',
     uncertain: status === 'orphaned' || status === 'unknown',
   });

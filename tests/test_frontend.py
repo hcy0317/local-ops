@@ -225,6 +225,18 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("const isTask = modalKind === 'task'", overlays)
         self.assertIn("const stopVerb = isTask ? '中止任务' : '停止服务'", overlays)
 
+    def test_windows_scheduled_tasks_are_selectable_and_render_native_state(self):
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="scheduledTaskField"', html)
+        self.assertIn('id="fScheduledTaskPath"', html)
+        self.assertIn("'/api/windows/scheduled-tasks'", overlays)
+        self.assertIn("scheduledTaskPath", overlays)
+        self.assertIn("app.runtimeSource === 'windowsTaskScheduler'", launchpad)
+        self.assertIn("app.scheduledTask", launchpad)
+
     def test_health_notice_does_not_report_connection_loss(self):
         app = (ROOT / "static/app.js").read_text(encoding="utf-8")
         widgets = (ROOT / "static/js/widgets.js").read_text(encoding="utf-8")

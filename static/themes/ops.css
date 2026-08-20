@@ -99,14 +99,14 @@ body {
 }
 [hidden] { display: none !important; }
 button { font: inherit; color: inherit; background: none; border: none; padding: 0; cursor: pointer; }
-input, textarea { font: inherit; color: var(--ink); }
+input, textarea, select { font: inherit; color: var(--ink); }
 ::selection { background: var(--accent); color: var(--on-accent); }
 
 .mono { font-family: var(--font-mono); }
 .ic { display: inline-flex; align-items: center; justify-content: center; flex: none; }
 .ic svg { display: block; }
 
-button:focus-visible, input:focus-visible, textarea:focus-visible, a.icon-btn:focus-visible, [tabindex]:focus-visible {
+button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, a.icon-btn:focus-visible, [tabindex]:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring) !important;
 }
@@ -710,14 +710,15 @@ body.dragging-on { cursor: grabbing; user-select: none; -webkit-user-select: non
   font-size: 12.5px; font-weight: 700; color: var(--ink-2);
 }
 .req { color: var(--red); margin-left: 2px; }
-.field input, .field textarea {
+.field input, .field textarea, .field select {
   width: 100%; padding: 8px 12px;
   border: 1px solid var(--line-2); border-radius: 8px;
   background: var(--card); font-size: 13px;
   transition: border-color 0.13s ease, box-shadow 0.13s ease;
 }
 .field textarea { font-family: var(--font-mono); font-size: 11.5px; line-height: 1.6; resize: vertical; min-height: 64px; }
-.field input:focus, .field textarea:focus { outline: none; border-color: var(--accent); box-shadow: var(--focus-ring); }
+.field select { width: 100%; height: 38px; }
+.field input:focus, .field textarea:focus, .field select:focus { outline: none; border-color: var(--accent); box-shadow: var(--focus-ring); }
 .field input.invalid, .field textarea.invalid { border-color: var(--red); }
 .field input.invalid:focus, .field textarea.invalid:focus { box-shadow: 0 0 0 2.5px color-mix(in srgb, var(--red) 30%, transparent); }
 .field input::placeholder, .field textarea::placeholder { color: var(--ink-4); }

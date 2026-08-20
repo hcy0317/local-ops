@@ -19,6 +19,8 @@ from .contracts import (
     RuntimeIdentity,
     RuntimePaths,
     ScanStatus,
+    ScheduledTaskRunResult,
+    ScheduledTaskSnapshot,
     StopResult,
 )
 
@@ -45,6 +47,8 @@ class FakePlatform:
             attach_external=True,
             pick_path=True,
             restart_console=True,
+            monitor_scheduled_tasks=False,
+            run_scheduled_tasks=False,
         )
     )
     paths: RuntimePaths = field(
@@ -65,6 +69,12 @@ class FakePlatform:
     )
     groups: ProcessSnapshot = field(
         default_factory=lambda: ProcessSnapshot(status=ScanStatus.OK)
+    )
+    scheduled: ScheduledTaskSnapshot = field(
+        default_factory=lambda: ScheduledTaskSnapshot(status=ScanStatus.OK)
+    )
+    scheduled_run_result: ScheduledTaskRunResult = field(
+        default_factory=lambda: ScheduledTaskRunResult(False, "", "unsupported")
     )
     launch_result: ManagedRuntime = field(default_factory=lambda: ManagedRuntime(ok=True))
     activation_result: ManagedActivation = field(
@@ -114,6 +124,11 @@ class FakePlatform:
         self, pids: set[int] | None = None, *, with_owner: bool = True,
     ) -> ProcessSnapshot:
         self.calls.append(("process_snapshot", (pids, with_owner)))
+        return self.processes
+
+    def processes_matching_keywords(self, keywords: list[str]) -> ProcessSnapshot:
+        normalized = tuple(str(value) for value in keywords)
+        self.calls.append(("processes_matching_keywords", normalized))
         return self.processes
 
     def process_cwds(self, pids: set[int]) -> CwdSnapshot:
@@ -169,6 +184,18 @@ class FakePlatform:
 
     def pid_alive(self, pid: int) -> bool:
         return pid in self.alive_pids
+
+    def scheduled_tasks(self, paths: set[str] | None = None) -> ScheduledTaskSnapshot:
+        normalized = None if paths is None else frozenset(paths)
+        self.calls.append(("scheduled_tasks", normalized))
+        return self.scheduled
+
+    def run_scheduled_task(self, path: str) -> ScheduledTaskRunResult:
+        self.calls.append(("run_scheduled_task", path))
+        result = self.scheduled_run_result
+        if result.task_path:
+            return result
+        return ScheduledTaskRunResult(result.ok, path, result.error, result.code)
 
     def pick_path(self, kind: Literal["dir", "script"]) -> PickResult:
         self.calls.append(("pick_path", kind))

@@ -12,6 +12,7 @@
 
 - 每 2 秒查看当前用户的本地监听服务、CPU、内存和运行时长。
 - 保存常用服务或批处理任务，集中启动、停止、重启、查日志和诊断。
+- Windows 可关联现有 Task Scheduler 任务，读取其真实启用、就绪、排队、运行、最近结果和引擎 PID；长期 Guard 归入“服务”，一次性任务归入“批处理任务”。
 - 在当前页面会话中发现新出现的、尚未管理的监听端口。macOS 可原子认领后加入启动台；Windows 只观察或创建未认领配置，不会控制现有进程。
 - 运行前检查工作目录、脚本和运行时；明确失效时直接给出修复入口，不必先失败一次。
 - 从项目文件夹识别常用启动命令，但不安装依赖、不执行项目代码。
@@ -57,6 +58,18 @@ Windows runner 是每个受管应用 Job Object 的唯一长期句柄持有者�
 request/receipt 原子写入会先保护临时文件的 DACL，再替换为公开可见的最终文件。释放 active generation 前必须验证目录恰好包含三个私有 runtime records、terminal receipt 签名有效、Job 已空且 runner 不再存在；随后将 active 目录原子 rename 为严格派生的 cleanup tombstone，这次 rename 是 release commit。commit 后的恢复只删除 private、nonlink tombstone 中三个 runtime record 的 allowlisted subset，不做任何进程观察或控制；未知项、宽 ACL 或 link 会 fail closed 并保留 tombstone。
 
 Windows 仍不支持外部进程认领、外部进程结束和总控台重启。不要通过修改前端或直接调用接口绕过 capability 与每应用 `controlAvailable` 门禁。破坏性生命周期测试只能设置 `LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS=1` 后在隔离夹具作用域或 hosted runner 中运行，并且只能操作测试夹具创建的进程；禁止控制任何现有用户进程。
+
+### Windows 计划任务监控
+
+添加或编辑卡片时可以选择一个现有 Windows 计划任务。总控台保存规范化的 `scheduledTaskPath`，状态刷新时只查询已经关联的任务；任务选择器按需读取非 Microsoft 系统任务，因此不会在每次轮询时遍历完整任务库。
+
+- 持续运行的 Guard、守护器和常驻服务应选择“长期服务”；运行中的卡片显示 Task Scheduler 的真实运行态和引擎 PID。
+- 同步、导入、备份等执行后退出的入口应选择“批处理任务”；卡片显示最近运行时间与 Task Scheduler 的结果码。
+- “运行”调用 Task Scheduler COM API，由原任务自身的账号、提权级别和 `MultipleInstances` 策略决定行为。总控台不会复制任务动作，也不会绕开 `IgnoreNew`。
+- 外部任务不是 Local Ops Job。总控台不提供停止或重启；删除卡片只移除监控配置，不停止、禁用或删除 Windows 计划任务。
+- 受保护系统进程或工作目录不可读取属于预期的 Windows 可见性限制，只显示提示，不再把健康状态错误标记为“降级”。任务库读取失败、配置损坏或关键组件扫描失败仍会进入降级状态。
+
+接口和状态字段见 [`docs/windows-task-scheduler.md`](docs/windows-task-scheduler.md)。
 
 本地 Phase 4 门禁已通过 Windows real discovery 174/174（406.426s）、frontend 24/24、HTTP hardening 6/6（合计 30/30）和 Node 30/30。其中包括 `WIN-LIFE-001..012` 的 12/12、`WIN-SEC-001..014` 的 14/14、HTTP 总控台测试子进程终止后重开，以及 100 次完整启动/Force/释放循环。相同实现已通过上述 exact-commit CI；只有 Phase 5 的 Windows 10、self-contained clean-machine 和发行审计全部通过后，才会把 `windowsBetaReady` 改为 `true`。
 

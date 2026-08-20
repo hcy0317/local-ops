@@ -278,6 +278,9 @@ function updateAppCard(card, app) {
   /* 状态副行：运行态、端口冲突，以及服务/任务上次退出结果。 */
   const kind = app.kind || 'service';
   const isTask = kind === 'task';
+  const isScheduled = app.runtimeSource === 'windowsTaskScheduler';
+  const scheduledState = isScheduled && app.scheduledTask
+    ? app.scheduledTask.state : '';
   const lifecycle = lifecycleSnapshot(app, currentPlatform());
   const taskStatus = isTask && app.lastExit ? taskExitStatus(app.lastExit) : '';
   const taskFinished = isTask && !app.running && !!app.lastExit;
@@ -298,7 +301,19 @@ function updateAppCard(card, app) {
   let stTxt = app.running ? '运行中' : (app.port ? '已停止' : '未运行');
   let stFail = false;
   let taskHistoryText = '';
-  if (lifecycle.status === 'starting') {
+  if (isScheduled && scheduledState === 'running') {
+    stTxt = '运行中 · Windows 计划任务';
+  } else if (isScheduled && scheduledState === 'ready') {
+    stTxt = isTask ? '就绪 · 等待运行' : '计划任务就绪';
+  } else if (isScheduled && scheduledState === 'queued') {
+    stTxt = '已排队 · Windows 计划任务';
+  } else if (isScheduled && scheduledState === 'disabled') {
+    stTxt = '计划任务已禁用';
+    stFail = true;
+  } else if (isScheduled && scheduledState === 'missing') {
+    stTxt = '计划任务不存在';
+    stFail = true;
+  } else if (lifecycle.status === 'starting') {
     stTxt = '启动中';
   } else if (lifecycle.status === 'stopping') {
     stTxt = '停止中';
@@ -422,12 +437,16 @@ function updateAppCard(card, app) {
   r.edit.setAttribute('aria-label', '编辑 ' + appName);
   r.del.setAttribute('aria-label', '删除 ' + appName);
   card.setAttribute('aria-label', appName + '，' + stTxt);
-  const canLaunch = hasCapability('launch_managed');
+  const canLaunch = hasCapability(
+    isScheduled ? 'run_scheduled_tasks' : 'launch_managed'
+  );
   const canStop = hasCapability('stop_managed');
   const canToggle = lifecycle.canManage ? canStop
     : lifecycle.canStart ? canLaunch : false;
-  r.restart.hidden = !lifecycle.canManage || kind !== 'service' || !canStop || !canLaunch;
-  r.del.disabled = !lifecycle.canDelete || (lifecycle.canManage && !canStop);
+  r.restart.hidden = isScheduled || !lifecycle.canManage
+    || kind !== 'service' || !canStop || !canLaunch;
+  r.del.disabled = !lifecycle.canDelete
+    || (!isScheduled && lifecycle.canManage && !canStop);
   r.del.title = r.del.disabled ? platformPresentation().lifecycleNotice : '删除';
   const blocked = !canToggle || (!app.running &&
     (!!app.portConflict || !!app.portOccupied || !!healthIssue || platformBlocked));
@@ -458,11 +477,14 @@ async function toggleApp(id, button, capturedIntent) {
   const app = findApp(id);
   if (!app) return;
   const isTask = (app.kind || 'service') === 'task';
+  const isScheduled = app.runtimeSource === 'windowsTaskScheduler';
   const intent = capturedIntent || lifecycleSnapshot(app, currentPlatform());
   const starting = intent.status === 'stopped';
   const capability = starting ? 'launch_managed' : 'stop_managed';
+  const effectiveCapability = starting && isScheduled
+    ? 'run_scheduled_tasks' : capability;
   if ((!starting && !intent.canManage) || (starting && !intent.canStart)
-      || !hasCapability(capability)) {
+      || !hasCapability(effectiveCapability)) {
     toast(platformPresentation().lifecycleNotice);
     return;
   }
@@ -509,7 +531,10 @@ async function toggleApp(id, button, capturedIntent) {
       delete button.dataset.busy;
       const latest = findApp(id);
       const latestLifecycle = lifecycleSnapshot(latest, currentPlatform());
-      const latestCapability = latestLifecycle.canManage ? 'stop_managed' : 'launch_managed';
+      const latestScheduled = latest
+        && latest.runtimeSource === 'windowsTaskScheduler';
+      const latestCapability = latestLifecycle.canManage ? 'stop_managed'
+        : latestScheduled ? 'run_scheduled_tasks' : 'launch_managed';
       const latestCompatibility = latest && latest.platformCompatibility;
       const incompatible = currentPlatform() === 'windows' && latestCompatibility &&
         (latestCompatibility.status === 'needs_review' || latestCompatibility.status === 'blocked');
@@ -555,18 +580,22 @@ function confirmRestartApp(app) {
 
 function confirmDeleteApp(app) {
   const intent = lifecycleSnapshot(app, currentPlatform());
-  if (!intent.canDelete || (intent.canManage && !hasCapability('stop_managed'))) {
+  const isScheduled = app.runtimeSource === 'windowsTaskScheduler';
+  if (!intent.canDelete || (!isScheduled && intent.canManage
+      && !hasCapability('stop_managed'))) {
     toast(platformPresentation().lifecycleNotice);
     return;
   }
   openConfirm({
     title: '删除应用',
     bodyHtml: '确定要删除 <b>' + escapeHtml(app.name || '') + '</b> 吗？' +
-      '<div class="confirm-detail">' + (app.running ? '将先停止该应用，并' : '将') +
-      '删除其图标与日志。</div>',
+      '<div class="confirm-detail">' + (isScheduled
+        ? '只删除监控卡片，不会停止或删除 Windows 计划任务。'
+        : (app.running ? '将先停止该应用，并' : '将') + '删除其图标与日志。') + '</div>',
     okText: '删除',
     onOk: async () => {
-      if (!intent.canDelete || (intent.canManage && !hasCapability('stop_managed'))) {
+      if (!intent.canDelete || (!isScheduled && intent.canManage
+          && !hasCapability('stop_managed'))) {
         toast(platformPresentation().lifecycleNotice);
         return;
       }

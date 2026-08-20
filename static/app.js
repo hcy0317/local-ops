@@ -217,6 +217,7 @@ const HEALTH_COMPONENT_NAMES = {
   apps: '启动台',
   version: '版本',
   config: '配置',
+  scheduled_tasks: 'Windows 计划任务',
 };
 function stateHealthNotice(data) {
   if (!data) return '';

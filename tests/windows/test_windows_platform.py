@@ -418,6 +418,33 @@ class WindowsPlatformTests(unittest.TestCase):
         self.assertEqual(snapshot.status, ScanStatus.PARTIAL)
         self.assertEqual(snapshot.processes, {})
         self.assertTrue(any(issue.code == "access_denied" for issue in snapshot.issues))
+        self.assertTrue(all(not issue.degrades for issue in snapshot.issues))
+
+    def test_keyword_scan_queries_only_wmi_matches(self):
+        rows = [{
+            "pid": os.getpid(),
+            "name": "pwsh.exe",
+            "command_line": "pwsh -File memos-guard.ps1",
+        }]
+        with mock.patch.object(
+                self.platform, "_query_process_keyword_rows", return_value=rows
+        ) as query:
+            snapshot = self.platform.processes_matching_keywords(
+                ["memos-guard.ps1"]
+            )
+
+        query.assert_called_once_with(("memos-guard.ps1",))
+        self.assertEqual(snapshot.status, ScanStatus.OK)
+        self.assertIn(os.getpid(), snapshot.processes)
+        self.assertIn("memos-guard.ps1", snapshot.processes[os.getpid()]["args"])
+
+    def test_protected_process_cwd_is_advisory(self):
+        with mock.patch("psutil.Process") as process:
+            process.return_value.cwd.side_effect = psutil.AccessDenied(42)
+            snapshot = self.platform.process_cwds({42})
+
+        self.assertEqual(snapshot.status, ScanStatus.PARTIAL)
+        self.assertFalse(snapshot.issues[0].degrades)
 
     def test_native_picker_returns_path_and_cancel_without_side_effects(self):
         root = mock.Mock()

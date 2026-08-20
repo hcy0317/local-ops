@@ -3,6 +3,7 @@ import unittest
 from unittest import mock
 
 from localops.platform.contracts import (
+    CwdSnapshot,
     ListenerSnapshot,
     PlatformIssue,
     ProcessSnapshot,
@@ -79,6 +80,35 @@ class FakePlatformContractTests(unittest.TestCase):
             "code": "access_denied",
             "error": "one row hidden",
         }, state["degradedReasons"])
+
+    def test_expected_windows_visibility_gap_is_advisory_not_degraded(self):
+        issue = PlatformIssue(
+            "process_cwds",
+            "access_denied",
+            "one protected process directory is hidden",
+            degrades=False,
+        )
+        fake = FakePlatform(cwds=CwdSnapshot(
+            ScanStatus.PARTIAL, {}, (issue,)
+        ))
+
+        def build_services(*_args):
+            server.lsof_cwds({42})
+            return [], set()
+
+        with mock.patch.object(server, "PLATFORM", fake), \
+                mock.patch.object(server, "build_services", side_effect=build_services), \
+                mock.patch.object(server, "build_watched", return_value=[]), \
+                mock.patch.object(server, "build_apps", return_value=[]):
+            state = server.build_state(dict(server.Config.DEFAULT), 9600, {})
+
+        self.assertFalse(state["degraded"])
+        self.assertEqual(state["degradedReasons"], [])
+        self.assertIn({
+            "component": "process_cwds",
+            "code": "access_denied",
+            "message": "one protected process directory is hidden",
+        }, state["visibilityNotices"])
 
 
 class MacOSPlatformParsingTests(unittest.TestCase):

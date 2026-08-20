@@ -779,6 +779,7 @@ class Config:
     APP_DEFAULT = {"id": None, "name": "", "command": "", "cwd": None,
                    "commandSpec": None, "runtimeIdentity": None,
                    "importStatus": "needs_review",
+                   "scheduledTaskPath": None,
                    "port": None, "emoji": None, "glyph": None, "icon": None,
                    "favicon": None, "kind": "service", "lastPid": None,
                    "lastPgid": None, "runToken": None,
@@ -1406,7 +1407,11 @@ def build_watched(keywords):
         normalized.append((keyword, lowered))
     if not normalized:
         return []
-    snap = ps_snapshot(None, with_uid=True)
+    snapshot = PLATFORM.processes_matching_keywords(
+        [keyword for keyword, _ in normalized]
+    )
+    _record_platform_issues(snapshot.status, snapshot.issues)
+    snap = snapshot.processes
     result = []
     for pid, info in sorted(snap.items()):
         if pid == SELF_PID or not process_owned_by_current(info):
@@ -1560,7 +1565,141 @@ def listener_app_owners(
     }
 
 
-def build_apps(cfg, listeners, groups=None):
+def scheduled_task_path(app):
+    value = app.get("scheduledTaskPath") if isinstance(app, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def build_scheduled_task_index(cfg):
+    paths = {
+        value for value in (
+            scheduled_task_path(app) for app in (cfg.get("apps") or [])
+        ) if value
+    }
+    if not paths:
+        return {}
+    snapshot = PLATFORM.scheduled_tasks(paths)
+    _record_platform_issues(snapshot.status, snapshot.issues)
+    return snapshot.tasks
+
+
+def scheduled_task_health(task):
+    if not isinstance(task, dict) or task.get("state") == "missing":
+        return {
+            "status": "error",
+            "blocking": True,
+            "issues": [{
+                "kind": "scheduled-task-missing",
+                "title": "Windows 计划任务不存在",
+                "detail": "请重新选择一个已注册的 Windows 计划任务。",
+                "action": "select-scheduled-task",
+            }],
+        }
+    if not task.get("enabled") or task.get("state") == "disabled":
+        return {
+            "status": "error",
+            "blocking": True,
+            "issues": [{
+                "kind": "scheduled-task-disabled",
+                "title": "Windows 计划任务已禁用",
+                "detail": "请先在任务计划程序中启用该任务。",
+                "action": "select-scheduled-task",
+            }],
+        }
+    return {"status": "ok", "blocking": False, "issues": []}
+
+
+def scheduled_task_last_exit(app, task):
+    if ((app.get("kind") or "service") != "task"
+            or not isinstance(task, dict)
+            or task.get("state") in ("running", "queued", "missing")):
+        return public_last_exit(app)
+    result = task.get("lastResult")
+    ended_at = task.get("lastRunAt")
+    if not isinstance(result, int) or not isinstance(ended_at, int):
+        return public_last_exit(app)
+    return {
+        "code": result,
+        "at": ended_at,
+        "status": "succeeded" if result == 0 else "failed",
+    }
+
+
+def scheduled_task_app_row(app, task):
+    task = task if isinstance(task, dict) else {
+        "path": scheduled_task_path(app),
+        "name": scheduled_task_path(app),
+        "state": "missing",
+        "enabled": False,
+        "enginePids": [],
+    }
+    state = task.get("state") or "unknown"
+    running = state == "running"
+    lifecycle_status = (
+        "running" if running else "starting" if state == "queued"
+        else "unknown" if state in ("missing", "unknown") else "stopped"
+    )
+    engine_pids = [
+        int(pid) for pid in (task.get("enginePids") or [])
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+    ]
+    started_at = task.get("lastRunAt")
+    uptime = (
+        max(0, int(time.time()) - started_at)
+        if running and isinstance(started_at, int) else None
+    )
+    health = scheduled_task_health(task)
+    can_run = (
+        state == "ready" and bool(task.get("enabled"))
+        and bool(getattr(PLATFORM.capabilities, "run_scheduled_tasks", False))
+    )
+    issue = None
+    if health["blocking"]:
+        first = health["issues"][0]
+        issue = {"code": first["kind"], "message": first["detail"]}
+    command_spec = app.get("commandSpec")
+    if command_spec is None:
+        command_spec = legacy_command_spec(app.get("command") or "")
+    return {
+        "id": app["id"],
+        "name": app["name"],
+        "command": app["command"],
+        "commandSpec": command_spec,
+        "runtimeIdentity": None,
+        "runtimeSource": "windowsTaskScheduler",
+        "scheduledTask": task,
+        "scheduledTaskPath": scheduled_task_path(app),
+        "lifecycleStatus": lifecycle_status,
+        "controlAvailable": can_run,
+        "runtimeIssue": issue,
+        "importStatus": "ready",
+        "platformCompatibility": {"status": "ready", "reasons": []},
+        "cwd": None,
+        "port": None,
+        "emoji": app.get("emoji"),
+        "glyph": app.get("glyph"),
+        "icon": app.get("icon"),
+        "favicon": app.get("favicon"),
+        "running": running,
+        "pid": engine_pids[0] if engine_pids else None,
+        "uptimeSec": uptime,
+        "kind": app.get("kind") or "service",
+        "attached": False,
+        "lastExit": scheduled_task_last_exit(app, task),
+        "health": health,
+        "ports": [],
+        "openHosts": {},
+        "listening": False,
+        "portOccupied": False,
+        "portOccupiedPid": None,
+        "portOwner": None,
+        "portConflict": False,
+        "portConflictApps": [],
+        "legacyManaged": False,
+    }
+
+
+def build_apps(cfg, listeners, groups=None, scheduled_tasks=None):
     """token 校验通过或严格命中旧版身份的进程才算 running。
 
     多张卡片可共享配置端口；只有当前真实监听者不属于本卡片时才返回
@@ -1570,8 +1709,10 @@ def build_apps(cfg, listeners, groups=None):
     for pid, port in listeners:
         port_map.setdefault(port, []).append(pid)
     apps_cfg = cfg.get("apps") or []
+    scheduled_tasks = scheduled_tasks or {}
     runtime_states = (
-        {app["id"]: inspect_windows_runtime(app) for app in apps_cfg}
+        {app["id"]: inspect_windows_runtime(app) for app in apps_cfg
+         if not scheduled_task_path(app)}
         if PLATFORM.name == "windows" else {}
     )
     if PLATFORM.name == "windows":
@@ -1605,6 +1746,12 @@ def build_apps(cfg, listeners, groups=None):
 
     apps = []
     for app in apps_cfg:
+        task_path = scheduled_task_path(app)
+        if task_path:
+            apps.append(scheduled_task_app_row(
+                app, scheduled_tasks.get(task_path.casefold())
+            ))
+            continue
         runtime_state = runtime_states.get(app["id"])
         managed_live = managed.get(app["id"], [])
         legacy_pid = (
@@ -1687,6 +1834,9 @@ def build_apps(cfg, listeners, groups=None):
             "id": app["id"], "name": app["name"], "command": app["command"],
             "commandSpec": command_spec,
             "runtimeIdentity": app.get("runtimeIdentity"),
+            "runtimeSource": "managed",
+            "scheduledTask": None,
+            "scheduledTaskPath": None,
             "lifecycleStatus": (
                 runtime_state["status"]
                 if runtime_state is not None
@@ -1732,6 +1882,7 @@ def build_apps(cfg, listeners, groups=None):
 def build_state(cfg, console_port, config_health=None):
     _begin_platform_scan_cycle()
     degraded_reasons = []
+    visibility_notices = []
     # 一次 pgid 快照供 build_services / build_apps 共享，避免每轮两次全量 ps。
     needs_groups = any(
         app.get("runToken")
@@ -1756,7 +1907,14 @@ def build_state(cfg, console_port, config_health=None):
         watched = []
         degraded_reasons.append({"component": "watched"})
     try:
-        apps = build_apps(cfg, listeners, groups)
+        scheduled_tasks = build_scheduled_task_index(cfg)
+    except Exception:
+        LOG.exception("构建 Windows 计划任务状态失败")
+        scheduled_tasks = {}
+        if any(scheduled_task_path(app) for app in (cfg.get("apps") or [])):
+            degraded_reasons.append({"component": "scheduled_tasks"})
+    try:
+        apps = build_apps(cfg, listeners, groups, scheduled_tasks)
     except Exception:
         LOG.exception("构建启动台状态失败")
         apps = []
@@ -1767,13 +1925,22 @@ def build_state(cfg, console_port, config_health=None):
     for issue in (config_health or {}).get("issues", []):
         degraded_reasons.append({"component": "config", "error": issue})
     for issue in _consume_platform_scan_issues():
-        reason = {
-            "component": issue.component,
-            "code": issue.code,
-            "error": issue.message,
-        }
-        if reason not in degraded_reasons:
-            degraded_reasons.append(reason)
+        if getattr(issue, "degrades", True):
+            reason = {
+                "component": issue.component,
+                "code": issue.code,
+                "error": issue.message,
+            }
+            if reason not in degraded_reasons:
+                degraded_reasons.append(reason)
+        else:
+            notice = {
+                "component": issue.component,
+                "code": issue.code,
+                "message": issue.message,
+            }
+            if notice not in visibility_notices:
+                visibility_notices.append(notice)
     platform_metadata = PLATFORM.platform_metadata()
     platform_name = platform_metadata.get("platform", PLATFORM.name)
     if platform_name == "windows":
@@ -1809,6 +1976,7 @@ def build_state(cfg, console_port, config_health=None):
         },
         "degraded": bool(degraded_reasons),
         "degradedReasons": degraded_reasons,
+        "visibilityNotices": visibility_notices,
         "configHealth": dict(config_health or {}),
         "uiTheme": cfg.get("uiTheme") or DEFAULT_UI_THEME,
         "themes": list_themes(),
@@ -1872,6 +2040,11 @@ def build_health(cfg):
             issues.append("%s 目录不存在" % label)
         elif not os.access(path, os.R_OK | os.W_OK | os.X_OK):
             issues.append("%s 目录不可读写" % label)
+        elif PLATFORM.name == "windows":
+            try:
+                PLATFORM.verify_private_directory(path)
+            except (OSError, PermissionError) as e:
+                issues.append("%s 目录 ACL 不符合私有权限要求: %s" % (label, e))
         else:
             try:
                 mode = os.lstat(path).st_mode
@@ -1890,7 +2063,12 @@ def build_health(cfg):
         except OSError as e:
             issues.append("无法检查 %s: %s" % (label, e))
             continue
-        if not stat.S_ISREG(mode) or mode & 0o077:
+        if PLATFORM.name == "windows":
+            try:
+                PLATFORM.verify_private_file(path)
+            except (OSError, PermissionError) as e:
+                issues.append("%s 文件 ACL 不符合私有权限要求: %s" % (label, e))
+        elif not stat.S_ISREG(mode) or mode & 0o077:
             issues.append("%s 文件权限不是 0600" % label)
     degraded = bool(issues)
     snapshot = cfg.snapshot()
@@ -2387,6 +2565,30 @@ def start_windows_app(cfg, app):
     # Resume may have reached the runner even when its response was lost. Keep
     # the persisted identity so a later authenticated inspect can reconcile it.
     return _windows_lifecycle_result(False, code="LAUNCH_ACTIVATE_FAILED")
+
+
+def start_scheduled_task_app(platform, app):
+    path = scheduled_task_path(app)
+    if not path:
+        return {
+            "ok": False,
+            "error": "应用没有关联 Windows 计划任务",
+            "code": "SCHEDULED_TASK_NOT_CONFIGURED",
+        }
+    result = platform.run_scheduled_task(path)
+    payload = {
+        "ok": bool(getattr(result, "ok", False)),
+        "taskPath": getattr(result, "task_path", path) or path,
+        "runtimeSource": "windowsTaskScheduler",
+    }
+    if not payload["ok"]:
+        payload["error"] = (
+            getattr(result, "error", None) or "Windows 计划任务启动失败"
+        )
+        payload["code"] = (
+            getattr(result, "code", None) or "SCHEDULED_TASK_RUN_FAILED"
+        )
+    return payload
 
 
 def stop_windows_app(cfg, app, *, force=False, timeout=APP_STOP_TIMEOUT_SEC):
@@ -3700,10 +3902,43 @@ def validate_port(value):
     return port, None
 
 
+def normalize_scheduled_task_path(value):
+    if value is None or value == "":
+        return None, None
+    if not isinstance(value, str):
+        return None, "scheduledTaskPath 必须是字符串或 null"
+    if any(ord(char) < 32 for char in value) or '"' in value:
+        return None, "scheduledTaskPath 包含非法字符"
+    normalized = "\\" + value.strip().replace("/", "\\").lstrip("\\")
+    parts = normalized.split("\\")[1:]
+    if (len(normalized) > 512 or not parts or any(
+            not part or part in (".", "..") for part in parts)):
+        return None, "scheduledTaskPath 不是有效的 Windows 计划任务路径"
+    return normalized, None
+
+
+def scheduled_task_command(path):
+    return 'schtasks.exe /Run /TN "%s"' % path
+
+
+def scheduled_task_command_spec(path):
+    executable = os.path.join(
+        os.environ.get("SystemRoot") or r"C:\Windows", "System32", "schtasks.exe"
+    )
+    return direct_command_spec(executable, ["/Run", "/TN", path])
+
+
 def validate_app_fields(data, partial):
     """校验/规范化应用字段。partial=True 时仅校验出现的字段。
     返回 (fields, error)：fields 为规范化后的字段子集。"""
     fields = {}
+    if "scheduledTaskPath" in data:
+        task_path, err = normalize_scheduled_task_path(data["scheduledTaskPath"])
+        if err:
+            return None, err
+        fields["scheduledTaskPath"] = task_path
+    elif not partial:
+        fields["scheduledTaskPath"] = None
     for key in ("name", "command"):
         if key in data:
             v = data[key]
@@ -3758,6 +3993,12 @@ def validate_app_fields(data, partial):
         fields["kind"] = "service"
     if fields.get("kind") == "task":
         fields["port"] = None  # 批处理任务无端口语义
+    task_path = fields.get("scheduledTaskPath")
+    if task_path:
+        fields["command"] = scheduled_task_command(task_path)
+        fields["commandSpec"] = scheduled_task_command_spec(task_path)
+        fields["cwd"] = None
+        fields["port"] = None
     return fields, None
 
 
@@ -4131,6 +4372,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(get_state_snapshot(self.server.cfg,
                                                   self.server.console_port))
                 return
+            if path == "/api/windows/scheduled-tasks":
+                self.handle_scheduled_tasks_list(parsed.query)
+                return
             if path == "/api/console/log":
                 self.handle_console_log(parsed.query)
                 return
@@ -4176,6 +4420,35 @@ class Handler(BaseHTTPRequestHandler):
             self._send(b"404 Not Found", 404, set_cookie=False)
             return
         self._send(data, 200, ctype, set_cookie=False)
+
+    def handle_scheduled_tasks_list(self, query):
+        if not self._require_capability(
+                "monitor_scheduled_tasks",
+                "当前平台未启用 Windows 计划任务监控"):
+            return
+        snapshot = PLATFORM.scheduled_tasks(None)
+        if snapshot.status is ScanStatus.FAILED:
+            message = (
+                snapshot.issues[0].message if snapshot.issues
+                else "Windows 计划任务读取失败"
+            )
+            self.send_err(503, message, "SCHEDULED_TASK_QUERY_FAILED")
+            return
+        params = urllib.parse.parse_qs(query or "", keep_blank_values=True)
+        include_system = (params.get("includeSystem") or [""])[0] == "1"
+        tasks = [
+            dict(task) for task in snapshot.tasks.values()
+            if include_system or not str(task.get("path") or "").casefold().startswith(
+                "\\microsoft\\"
+            )
+        ]
+        tasks.sort(key=lambda item: str(item.get("path") or "").casefold())
+        self.send_json({
+            "ok": True,
+            "tasks": tasks,
+            "partial": snapshot.status is ScanStatus.PARTIAL,
+            "issues": [issue.message for issue in snapshot.issues],
+        })
 
     def serve_icon(self, path):
         name = os.path.basename(urllib.parse.unquote(path[len("/icons/"):]))
@@ -4592,8 +4865,11 @@ class Handler(BaseHTTPRequestHandler):
                "command": fields["command"], "cwd": fields["cwd"],
                "commandSpec": fields["commandSpec"],
                "runtimeIdentity": None,
-               "importStatus": command_import_status(
-                   fields["commandSpec"], fields["cwd"]),
+               "scheduledTaskPath": fields["scheduledTaskPath"],
+               "importStatus": (
+                   "ready" if fields["scheduledTaskPath"] else
+                   command_import_status(fields["commandSpec"], fields["cwd"])
+               ),
                "port": fields["port"], "emoji": fields["emoji"],
                "glyph": fields["glyph"], "kind": fields["kind"],
                "icon": None, "favicon": None, "lastPid": None,
@@ -4723,9 +4999,6 @@ class Handler(BaseHTTPRequestHandler):
             data = self._read_json_request()
             if data is None:
                 return
-        if not self._require_capability(
-                "launch_managed", "当前平台或阶段未启用应用启动"):
-            return
         valid, expected_generation = self._expected_generation(data)
         if not valid:
             return
@@ -4733,6 +5006,24 @@ class Handler(BaseHTTPRequestHandler):
         if app is None:
             return
         if not self._generation_matches(app, expected_generation):
+            return
+        if scheduled_task_path(app):
+            if not self._require_capability(
+                    "run_scheduled_tasks", "当前平台未启用 Windows 计划任务运行"):
+                return
+            if expected_generation is not None:
+                self.send_err(
+                    409, "计划任务监控不使用受管运行代次",
+                    "GENERATION_MISMATCH",
+                )
+                return
+            result = start_scheduled_task_app(PLATFORM, app)
+            if result.get("ok"):
+                invalidate_state_cache()
+            self.send_json(result, 200 if result.get("ok") else 409)
+            return
+        if not self._require_capability(
+                "launch_managed", "当前平台或阶段未启用应用启动"):
             return
         if PLATFORM.name == "windows" and expected_generation is not None:
             self.send_err(
@@ -4821,6 +5112,13 @@ class Handler(BaseHTTPRequestHandler):
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
+        if scheduled_task_path(app):
+            self.send_err(
+                409,
+                "Windows 计划任务由系统调度器管理；总控台只监控，不会强制停止",
+                "SCHEDULED_TASK_MONITOR_ONLY",
+            )
+            return
         if not self._generation_matches(app, expected_generation):
             return
         if PLATFORM.name == "windows":
@@ -4891,6 +5189,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         _, app = self._get_app_or_404(app_id)
         if app is None:
+            return
+        if scheduled_task_path(app):
+            self.send_err(
+                409,
+                "Windows 计划任务监控不提供重启；请等待任务结束后重新运行",
+                "SCHEDULED_TASK_MONITOR_ONLY",
+            )
             return
         if not self._generation_matches(app, expected_generation):
             return
@@ -5064,7 +5369,10 @@ class Handler(BaseHTTPRequestHandler):
             if not fields:
                 self.send_err(400, "没有可更新的字段")
                 return
-            lifecycle_fields = {"command", "commandSpec", "cwd", "port", "kind"}
+            lifecycle_fields = {
+                "command", "commandSpec", "cwd", "port", "kind",
+                "scheduledTaskPath",
+            }
             lifecycle_changed = any(
                 key in fields and fields[key] != app.get(key)
                 for key in lifecycle_fields)
@@ -5121,9 +5429,14 @@ class Handler(BaseHTTPRequestHandler):
 
             def op(c, target):
                 target.update(fields)
-                if "commandSpec" in fields or "cwd" in fields:
-                    target["importStatus"] = command_import_status(
-                        target["commandSpec"], target.get("cwd"))
+                if ("commandSpec" in fields or "cwd" in fields
+                        or "scheduledTaskPath" in fields):
+                    target["importStatus"] = (
+                        "ready" if target.get("scheduledTaskPath") else
+                        command_import_status(
+                            target["commandSpec"], target.get("cwd")
+                        )
+                    )
                 return dict(target)
 
             mutation_generation = (

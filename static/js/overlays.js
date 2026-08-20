@@ -14,6 +14,10 @@ import { lifecyclePayload, lifecycleSnapshot, sameLifecycleGeneration,
 const appModalMask = $('#appModalMask'), appModal = $('#appModal'), appModalTitle = $('#appModalTitle');
 const fName = $('#fName'), fCmd = $('#fCmd'), fCwd = $('#fCwd'), fPort = $('#fPort');
 const kindRow = $('#kindRow'), portField = $('#portField'), fCmdLabel = $('#fCmdLabel');
+const scheduledTaskField = $('#scheduledTaskField');
+const fScheduledTaskPath = $('#fScheduledTaskPath');
+const btnRefreshScheduledTasks = $('#btnRefreshScheduledTasks');
+const cwdField = $('#cwdField');
 const btnPickScript = $('#btnPickScript'), btnPickCwd = $('#btnPickCwd');
 const btnDetectProject = $('#btnDetectProject');
 const detectPanel = $('#detectPanel'), detectSummary = $('#detectSummary');
@@ -162,6 +166,97 @@ let pendingAttach = null;     // 从服务监控添加时待认领的来源进�
 let detectingProject = false; // 认领流程必须等项目命令识别完成后再允许保存
 let selectedCommandSpec = null;
 let selectedCompatibility = null;
+let scheduledTaskRows = [];
+
+function selectedScheduledTaskPath() {
+  const value = fScheduledTaskPath.value.trim();
+  return value || null;
+}
+
+function scheduledTaskMode() {
+  return currentPlatform() === 'windows' && !!selectedScheduledTaskPath();
+}
+
+function scheduledTaskCommand(path) {
+  return 'schtasks.exe /Run /TN "' + path + '"';
+}
+
+function renderScheduledTaskOptions(selectedPath) {
+  const selected = selectedPath || '';
+  fScheduledTaskPath.replaceChildren();
+  const local = document.createElement('option');
+  local.value = '';
+  local.textContent = '不关联计划任务（使用本地命令）';
+  fScheduledTaskPath.appendChild(local);
+  for (const task of scheduledTaskRows) {
+    const option = document.createElement('option');
+    option.value = task.path || '';
+    const state = task.state === 'running' ? '运行中'
+      : task.state === 'ready' ? '就绪'
+        : task.state === 'disabled' ? '已禁用'
+          : task.state === 'queued' ? '已排队' : '未知';
+    option.textContent = (task.path || task.name || '未命名任务') + ' · ' + state;
+    fScheduledTaskPath.appendChild(option);
+  }
+  if (selected && !scheduledTaskRows.some(task => task.path === selected)) {
+    const missing = document.createElement('option');
+    missing.value = selected;
+    missing.textContent = selected + ' · 当前未找到';
+    fScheduledTaskPath.appendChild(missing);
+  }
+  fScheduledTaskPath.value = selected;
+}
+
+function syncScheduledTaskMode({ inferKind = false } = {}) {
+  const path = selectedScheduledTaskPath();
+  const scheduled = scheduledTaskMode();
+  const wasScheduled = fCmd.readOnly;
+  cwdField.hidden = scheduled;
+  detectPanel.hidden = scheduled || detectPanel.hidden;
+  btnPickScript.hidden = scheduled;
+  btnDetectProject.hidden = scheduled;
+  fCmd.readOnly = scheduled;
+  if (scheduled) {
+    fCwd.value = '';
+    fPort.value = '';
+    fCmd.value = scheduledTaskCommand(path);
+    setStructuredCommand(null, { status: 'ready', reasons: [] });
+    const row = scheduledTaskRows.find(task => task.path === path);
+    if (!fName.value.trim() && row) fName.value = row.name || row.path || '';
+    if (inferKind && row && row.state === 'running') setModalKind('service');
+  } else if (wasScheduled) {
+    fCmd.value = '';
+    setStructuredCommand(null, null);
+  }
+  setText(fCmdLabel, scheduled ? '计划任务入口'
+    : modalKind === 'task' ? '执行命令' : '启动命令');
+  portField.hidden = scheduled || modalKind === 'task';
+  fPort.disabled = scheduled || modalKind === 'task';
+  refreshEditSaveMode();
+}
+
+async function loadScheduledTasks(selectedPath = selectedScheduledTaskPath()) {
+  if (!hasCapability('monitor_scheduled_tasks') || currentPlatform() !== 'windows') return;
+  btnRefreshScheduledTasks.disabled = true;
+  try {
+    const response = await fetch('/api/windows/scheduled-tasks', {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    });
+    const result = await response.json();
+    if (!response.ok || !result || result.ok === false) {
+      throw new Error((result && result.error) || '计划任务列表读取失败');
+    }
+    scheduledTaskRows = Array.isArray(result.tasks) ? result.tasks : [];
+    renderScheduledTaskOptions(selectedPath);
+    syncScheduledTaskMode();
+  } catch (error) {
+    renderScheduledTaskOptions(selectedPath);
+    toast('Windows 计划任务读取失败：' + error.message);
+  } finally {
+    btnRefreshScheduledTasks.disabled = false;
+  }
+}
 
 function compatibilityStatus(value) {
   if (value && ['ready', 'needs_review', 'blocked'].includes(value.status)) {
@@ -300,25 +395,31 @@ function resetDetection(clearAutoPort = false) {
 
 function modalLifecycleChanged() {
   if (!editingAppOriginal) return false;
-  const currentPort = modalKind === 'task' ? null
+  const currentPort = modalKind === 'task' || scheduledTaskMode() ? null
     : readPortValue();
   return fCmd.value.trim() !== (editingAppOriginal.command || '') ||
     (fCwd.value.trim() || null) !== (editingAppOriginal.cwd || null) ||
     currentPort !== (editingAppOriginal.port == null ? null : editingAppOriginal.port) ||
-    modalKind !== (editingAppOriginal.kind || 'service');
+    modalKind !== (editingAppOriginal.kind || 'service') ||
+    selectedScheduledTaskPath() !== (editingAppOriginal.scheduledTaskPath || null);
 }
 
 function refreshEditSaveMode() {
   const lifecycle = editingAppOriginal && editingAppOriginal.lifecycle;
-  const running = !!(lifecycle && lifecycle.status === 'running');
-  const lifecycleUnavailable = !!(lifecycle && !lifecycle.canStart && !lifecycle.canManage);
+  const externalMonitor = !!(editingAppOriginal && editingAppOriginal.scheduledTaskPath);
+  const observedRunning = !!(lifecycle && lifecycle.status === 'running');
+  const running = observedRunning && !externalMonitor;
+  const lifecycleUnavailable = !externalMonitor
+    && !!(lifecycle && !lifecycle.canStart && !lifecycle.canManage);
   const needsStop = running && modalLifecycleChanged();
   const isTask = modalKind === 'task';
   const stopVerb = isTask ? '中止任务' : '停止服务';
   const canStop = hasCapability('stop_managed');
   const commandBlocked = compatibilityStatus(selectedCompatibility) === 'blocked';
-  editRunningNotice.hidden = !running && !lifecycleUnavailable;
-  if (lifecycleUnavailable) {
+  editRunningNotice.hidden = !running && !lifecycleUnavailable && !observedRunning;
+  if (externalMonitor && observedRunning) {
+    setText(editRunningNotice, '该 Guard 正由 Windows 任务计划程序运行；这里只修改监控卡片，不会停止外部任务。');
+  } else if (lifecycleUnavailable) {
     setText(editRunningNotice, '运行身份暂时无法验证；生命周期配置和进程控制已安全禁用。');
   } else if (running) {
     setText(editRunningNotice, !canStop ? platformPresentation().lifecycleNotice
@@ -327,10 +428,11 @@ function refreshEditSaveMode() {
           '，编辑面板不会关闭，当前填写内容也不会丢失。');
   }
   setText(appStopEdit, stopVerb);
-  appStopEdit.hidden = !running || !canStop || !lifecycle.canManage;
+  appStopEdit.hidden = externalMonitor || !running || !canStop || !lifecycle.canManage;
   appStopEdit.disabled = appSaving || !canStop || !lifecycle || !lifecycle.canManage;
   appSave.hidden = false;
   const willAttach = !editingAppId && pendingAttach && modalKind === 'service'
+    && !scheduledTaskMode()
     && readPortValue() === pendingAttach.port;
   setText(appSave, willAttach ? '保存并认领' : '保存');
   appSave.disabled = appSaving || needsStop || commandBlocked
@@ -351,9 +453,10 @@ function setModalKind(kind) {
     b.classList.toggle('active', active);
     b.setAttribute('aria-pressed', String(active));
   });
-  portField.hidden = modalKind === 'task';
-  fPort.disabled = modalKind === 'task';
-  setText(fCmdLabel, modalKind === 'task' ? '执行命令' : '启动命令');
+  portField.hidden = modalKind === 'task' || scheduledTaskMode();
+  fPort.disabled = modalKind === 'task' || scheduledTaskMode();
+  setText(fCmdLabel, scheduledTaskMode() ? '计划任务入口'
+    : modalKind === 'task' ? '执行命令' : '启动命令');
   fName.placeholder = modalKind === 'task' ? '如：每日备份' : '如：本地博客';
   fCmd.placeholder = modalKind === 'task'
     ? '选择脚本后自动生成执行命令，也可以手动填写'
@@ -381,6 +484,7 @@ export function openAppModal(app, presetKind, focusAction = '') {
     command: app.command || '', cwd: app.cwd || null,
     port: app.port == null ? null : app.port,
     kind: app.kind || 'service', running: !!app.running,
+    scheduledTaskPath: app.scheduledTaskPath || null,
     lifecycle: lifecycleSnapshot(app, currentPlatform()),
   } : null;
   resetDetection();
@@ -392,8 +496,12 @@ export function openAppModal(app, presetKind, focusAction = '') {
   fCmd.value = (app && app.command) || '';
   fCwd.value = (app && app.cwd) || '';
   fPort.value = app && app.port != null ? app.port : '';
+  scheduledTaskField.hidden = currentPlatform() !== 'windows'
+    || !hasCapability('monitor_scheduled_tasks');
+  renderScheduledTaskOptions((app && app.scheduledTaskPath) || '');
   [fName, fCmd, fCwd, fPort].forEach(clearFieldError);
   setModalKind(presetKind || (app && app.kind) || 'service');
+  syncScheduledTaskMode();
   appearanceDetails.open = !!(app && (app.icon || app.glyph));
   syncGlyphGrid();
   renderIconPreview();
@@ -402,6 +510,7 @@ export function openAppModal(app, presetKind, focusAction = '') {
       : focusAction === 'edit-command' ? fCmd
         : app ? fName : (modalKind === 'task' ? btnPickScript : btnPickCwd);
   openLayer(appModalMask, focusTarget);
+  if (!scheduledTaskField.hidden) loadScheduledTasks((app && app.scheduledTaskPath) || '');
   /* 监听进程的 argv 往往只是框架子进程（如 next-server），不一定适合作为
      下次启动命令。打开认领表单时同时读取项目配置，让用户选择可靠命令。 */
   if (pendingAttach && fCwd.value.trim()) detectProject();
@@ -415,6 +524,10 @@ export function closeAppModal() {
   selectedGlyph = null;
   removeStoredIcon = false;
   pendingAttach = null;
+  fCmd.readOnly = false;
+  cwdField.hidden = false;
+  btnPickScript.hidden = false;
+  btnDetectProject.hidden = false;
   setStructuredCommand(null, null);
 }
 
@@ -609,6 +722,7 @@ function rememberSavedApp(app, id, body) {
     cwd: body.cwd,
     port: body.port,
     kind: body.kind,
+    scheduledTaskPath: body.scheduledTaskPath || null,
     running: !!app.running,
     lifecycle: lifecycleSnapshot(app, currentPlatform()),
   };
@@ -622,7 +736,7 @@ async function saveApp() {
   if (!name) return fieldError(fName, '请填写名称');
   if (!command) return fieldError(
     fCmd, modalKind === 'task' ? '请填写执行命令' : '请填写启动命令');
-  const port = modalKind === 'task' ? null : readPortValue();
+  const port = modalKind === 'task' || scheduledTaskMode() ? null : readPortValue();
   if (Number.isNaN(port)) return fieldError(fPort, '端口必须是 1–65535 之间的整数');
   const body = {
     name,
@@ -631,8 +745,10 @@ async function saveApp() {
     port,
     glyph: selectedGlyph || null,
     kind: modalKind,
+    scheduledTaskPath: selectedScheduledTaskPath(),
   };
   if (selectedCommandSpec) body.commandSpec = selectedCommandSpec;
+  if (scheduledTaskMode()) delete body.commandSpec;
   if (editingAppOriginal && editingAppOriginal.lifecycle) {
     body.expectedGeneration = editingAppOriginal.lifecycle.expectedGeneration;
   }
@@ -720,6 +836,13 @@ export function initAppModal({ onAddService, onAddTask }) {
   appCancel.addEventListener('click', closeAppModal);
   appSave.addEventListener('click', saveApp);
   appStopEdit.addEventListener('click', stopEditingApp);
+  fScheduledTaskPath.addEventListener('change', () => {
+    syncScheduledTaskMode({ inferKind: !editingAppId });
+    renderIconPreview();
+  });
+  btnRefreshScheduledTasks.addEventListener('click', () => {
+    loadScheduledTasks(selectedScheduledTaskPath());
+  });
   appModalMask.addEventListener('mousedown', e => { if (e.target === appModalMask) closeAppModal(); });
 
   /* 选择批处理脚本：自动填命令 / 工作目录 / 名称 */

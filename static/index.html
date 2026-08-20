@@ -440,7 +440,17 @@
       <label for="fName">名称 <span class="req">*</span></label>
       <input id="fName" placeholder="如：我的博客" autocomplete="off" required aria-required="true">
     </div>
-    <div class="field">
+    <div class="field" id="scheduledTaskField" hidden>
+      <div class="field-head">
+        <label for="fScheduledTaskPath">Windows 计划任务</label>
+        <button class="link-btn" id="btnRefreshScheduledTasks" type="button">刷新列表</button>
+      </div>
+      <select id="fScheduledTaskPath">
+        <option value="">不关联计划任务（使用本地命令）</option>
+      </select>
+      <p class="hint">关联后读取任务计划程序的真实状态；运行中的 Guard 请保留“长期服务”，执行后退出的任务请选择“批处理任务”。</p>
+    </div>
+    <div class="field" id="cwdField">
       <div class="field-head">
         <label for="fCwd">工作区文件夹</label>
         <button class="link-btn" id="btnDetectProject" type="button">重新识别</button>
@@ -457,7 +467,7 @@
       </div>
       <div class="detect-list" id="detectList"></div>
     </div>
-    <div class="field">
+    <div class="field" id="commandField">
       <div class="field-head">
         <label for="fCmd"><span id="fCmdLabel">启动命令</span> <span class="req">*</span></label>
         <button class="link-btn" id="btnPickScript" type="button">选择脚本…</button>

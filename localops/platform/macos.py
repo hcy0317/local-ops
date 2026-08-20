@@ -32,6 +32,8 @@ from .contracts import (
     RuntimeIdentity,
     RuntimePaths,
     ScanStatus,
+    ScheduledTaskRunResult,
+    ScheduledTaskSnapshot,
     StopResult,
 )
 
@@ -280,6 +282,9 @@ class MacOSPlatform:
         status = ScanStatus.PARTIAL if issues else ScanStatus.OK
         return ProcessSnapshot(status, processes, issues)
 
+    def processes_matching_keywords(self, keywords: Sequence[str]) -> ProcessSnapshot:
+        return self.process_snapshot(None, with_owner=True)
+
     def process_cwds(self, pids: set[int]) -> CwdSnapshot:
         normalized = sorted(int(pid) for pid in pids)
         if not normalized:
@@ -471,6 +476,19 @@ class MacOSPlatform:
             return True
         except (OSError, ValueError, TypeError):
             return False
+
+    def scheduled_tasks(self, paths: set[str] | None = None) -> ScheduledTaskSnapshot:
+        issue = _issue(
+            "scheduled_tasks", "unsupported_platform",
+            "Windows Task Scheduler is unavailable on macOS",
+        )
+        return ScheduledTaskSnapshot(ScanStatus.FAILED, issues=(issue,))
+
+    def run_scheduled_task(self, path: str) -> ScheduledTaskRunResult:
+        return ScheduledTaskRunResult(
+            False, path, "Windows Task Scheduler is unavailable on macOS",
+            "UNSUPPORTED_PLATFORM",
+        )
 
     def pick_path(self, kind: Literal["dir", "script"]) -> PickResult:
         script = (

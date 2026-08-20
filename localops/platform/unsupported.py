@@ -20,6 +20,8 @@ from .contracts import (
     RuntimeIdentity,
     RuntimePaths,
     ScanStatus,
+    ScheduledTaskRunResult,
+    ScheduledTaskSnapshot,
     StopResult,
 )
 
@@ -82,6 +84,9 @@ class UnsupportedPlatform:
     ) -> ProcessSnapshot:
         return ProcessSnapshot(ScanStatus.FAILED, issues=(self._issue,))
 
+    def processes_matching_keywords(self, keywords: list[str]) -> ProcessSnapshot:
+        return ProcessSnapshot(ScanStatus.FAILED, issues=(self._issue,))
+
     def process_cwds(self, pids: set[int]) -> CwdSnapshot:
         return CwdSnapshot(ScanStatus.FAILED, issues=(self._issue,))
 
@@ -111,6 +116,14 @@ class UnsupportedPlatform:
 
     def pid_alive(self, pid: int) -> bool:
         raise PlatformUnavailable(self._issue.message)
+
+    def scheduled_tasks(self, paths: set[str] | None = None) -> ScheduledTaskSnapshot:
+        return ScheduledTaskSnapshot(ScanStatus.FAILED, issues=(self._issue,))
+
+    def run_scheduled_task(self, path: str) -> ScheduledTaskRunResult:
+        return ScheduledTaskRunResult(
+            False, path, self._issue.message, self._issue.code
+        )
 
     def pick_path(self, kind: Literal["dir", "script"]) -> PickResult:
         return PickResult(issue=self._issue)

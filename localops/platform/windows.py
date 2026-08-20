@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import os
 import socket
@@ -14,6 +15,7 @@ from dataclasses import asdict, dataclass
 from typing import Literal, Mapping
 
 import ntsecuritycon
+import pythoncom
 import psutil
 import pywintypes
 import win32api
@@ -24,6 +26,7 @@ import win32pipe
 import win32process
 import win32security
 import winerror
+import win32com.client
 from win32com.shell import shell
 
 from localops.command_spec import (
@@ -70,6 +73,8 @@ from .contracts import (
     RuntimeIdentity,
     RuntimePaths,
     ScanStatus,
+    ScheduledTaskRunResult,
+    ScheduledTaskSnapshot,
     StopResult,
     windows_runtime_identity_public,
 )
@@ -93,8 +98,10 @@ class _WindowsRuntimeContext:
     state: str
 
 
-def _issue(component: str, code: str, message: str) -> PlatformIssue:
-    return PlatformIssue(component, code, message)
+def _issue(
+    component: str, code: str, message: str, *, degrades: bool = True,
+) -> PlatformIssue:
+    return PlatformIssue(component, code, message, degrades=degrades)
 
 
 def _runner_process_settings() -> tuple[str, dict[str, str] | None]:
@@ -148,6 +155,8 @@ class WindowsPlatform:
         attach_external=False,
         pick_path=True,
         restart_console=False,
+        monitor_scheduled_tasks=True,
+        run_scheduled_tasks=True,
     )
 
     def __init__(self, base_dir: str, entrypoint: str):
@@ -488,12 +497,128 @@ class WindowsPlatform:
                 "processes",
                 "access_denied",
                 "one or more protected Windows processes were not readable",
+                degrades=False,
             ))
         deduplicated = tuple(dict.fromkeys(issues))
         return ProcessSnapshot(
             ScanStatus.PARTIAL if deduplicated else ScanStatus.OK,
             processes,
             deduplicated,
+        )
+
+    @staticmethod
+    def _wql_like_literal(value: str) -> str:
+        """Escape one substring for a WQL LIKE expression.
+
+        WMI performs the indexed/native filtering; Python still rechecks the
+        exact substring before returning a row.
+        """
+        return (value.replace("[", "[[]")
+                .replace("%", "[%]")
+                .replace("_", "[_]")
+                .replace("'", "''"))
+
+    def _query_process_keyword_rows(
+        self, keywords: tuple[str, ...],
+    ) -> list[dict[str, object]]:
+        clauses = []
+        for keyword in keywords:
+            escaped = self._wql_like_literal(keyword)
+            clauses.append("CommandLine LIKE '%%%s%%'" % escaped)
+            clauses.append("Name LIKE '%%%s%%'" % escaped)
+        if not clauses:
+            return []
+        query = (
+            "SELECT ProcessId, Name, CommandLine FROM Win32_Process WHERE "
+            + " OR ".join(clauses)
+        )
+        pythoncom.CoInitialize()
+        locator = services = rows = item = None
+        try:
+            locator = win32com.client.Dispatch("WbemScripting.SWbemLocator")
+            services = locator.ConnectServer(".", r"root\cimv2")
+            rows = services.ExecQuery(query)
+            result = []
+            for item in rows:
+                try:
+                    result.append({
+                        "pid": int(item.ProcessId),
+                        "name": str(item.Name or ""),
+                        "command_line": str(item.CommandLine or ""),
+                    })
+                except (AttributeError, TypeError, ValueError, pywintypes.error):
+                    continue
+            return result
+        finally:
+            item = rows = services = locator = None
+            gc.collect()
+            pythoncom.CoUninitialize()
+
+    def processes_matching_keywords(self, keywords: list[str]) -> ProcessSnapshot:
+        normalized = tuple(dict.fromkeys(
+            value.strip() for value in keywords
+            if isinstance(value, str) and value.strip()
+        ))
+        if not normalized:
+            return ProcessSnapshot(ScanStatus.OK)
+        try:
+            candidates = self._query_process_keyword_rows(normalized)
+        except (OSError, pywintypes.error, pythoncom.com_error) as exc:
+            return ProcessSnapshot(ScanStatus.FAILED, issues=(
+                _issue("processes", "wmi_query_failed", str(exc)),
+            ))
+
+        lowered = tuple(value.casefold() for value in normalized)
+        processes: dict[int, dict[str, object]] = {}
+        access_denied = False
+        now = time.time()
+        for row in candidates:
+            try:
+                pid = int(row.get("pid") or 0)
+                command_line = str(row.get("command_line") or "")
+                name = str(row.get("name") or "")
+                haystack = (name + "\0" + command_line).casefold()
+                if pid <= 0 or not any(value in haystack for value in lowered):
+                    continue
+                owner = self._process_owner_sid(pid)
+                if owner != self._sid:
+                    continue
+                process = psutil.Process(pid)
+                info = process.as_dict(
+                    attrs=("name", "exe", "cpu_percent", "memory_percent",
+                           "create_time", "ppid"),
+                    ad_value=None,
+                )
+                processes[pid] = {
+                    "owner": owner,
+                    "uid": None,
+                    "etime": max(0, int(now - (info.get("create_time") or now))),
+                    "cpu": float(info.get("cpu_percent") or 0.0),
+                    "mem": float(info.get("memory_percent") or 0.0),
+                    "comm": info.get("exe") or info.get("name") or name,
+                    "args": command_line,
+                    "ppid": int(info.get("ppid") or 0),
+                }
+            except psutil.NoSuchProcess:
+                continue
+            except (psutil.AccessDenied, pywintypes.error, OSError):
+                access_denied = True
+                continue
+            except (TypeError, ValueError) as exc:
+                return ProcessSnapshot(ScanStatus.FAILED, issues=(
+                    _issue("processes", "snapshot_error", str(exc)),
+                ))
+        issues = (() if not access_denied else (
+            _issue(
+                "processes", "access_denied",
+                "one or more matching Windows processes were not readable",
+                degrades=False,
+            ),
+        ))
+        return ProcessSnapshot(
+            ScanStatus.PARTIAL if issues else ScanStatus.OK,
+            processes,
+            issues,
         )
 
     def process_cwds(self, pids: set[int]) -> CwdSnapshot:
@@ -512,6 +637,7 @@ class WindowsPlatform:
                 "process_cwds",
                 "access_denied",
                 "one or more Windows process directories were not readable",
+                degrades=False,
             ),
         ))
         return CwdSnapshot(
@@ -569,6 +695,179 @@ class WindowsPlatform:
             parents,
             issues,
         )
+
+    @staticmethod
+    def _scheduled_task_parts(path: str) -> tuple[str, str, str]:
+        normalized = "\\" + str(path).strip().replace("/", "\\").lstrip("\\")
+        folder, _, name = normalized.rpartition("\\")
+        return normalized, folder or "\\", name
+
+    @staticmethod
+    def _task_timestamp(value: object) -> int | None:
+        if value is None:
+            return None
+        try:
+            timestamp = int(value.timestamp())
+            return timestamp if timestamp > 0 else None
+        except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _com_collection(collection: object) -> list[object]:
+        try:
+            return [collection.Item(index)
+                    for index in range(1, int(collection.Count) + 1)]
+        except (AttributeError, TypeError, ValueError, pywintypes.error):
+            try:
+                return list(collection)
+            except (TypeError, pywintypes.error):
+                return []
+
+    def _scheduled_task_row(self, task: object) -> dict[str, object]:
+        state_value = int(getattr(task, "State", 0) or 0)
+        state = {
+            0: "unknown",
+            1: "disabled",
+            2: "queued",
+            3: "ready",
+            4: "running",
+        }.get(state_value, "unknown")
+        actions: list[str] = []
+        run_level = "limited"
+        multiple_instances = "parallel"
+        try:
+            definition = task.Definition
+            run_level = (
+                "highest" if int(definition.Principal.RunLevel or 0) == 1
+                else "limited"
+            )
+            multiple_instances = {
+                0: "parallel",
+                1: "queue",
+                2: "ignoreNew",
+                3: "stopExisting",
+            }.get(int(definition.Settings.MultipleInstances or 0), "unknown")
+            for action in self._com_collection(definition.Actions):
+                if int(getattr(action, "Type", -1)) != 0:
+                    continue
+                executable = str(getattr(action, "Path", "") or "")
+                arguments = str(getattr(action, "Arguments", "") or "")
+                display = (executable + (" " + arguments if arguments else "")).strip()
+                if display:
+                    actions.append(display)
+        except (AttributeError, TypeError, ValueError, pywintypes.error):
+            pass
+        engine_pids = []
+        try:
+            for instance in self._com_collection(task.GetInstances(0)):
+                pid = int(getattr(instance, "EnginePID", 0) or 0)
+                if pid > 0:
+                    engine_pids.append(pid)
+        except (AttributeError, TypeError, ValueError, pywintypes.error):
+            pass
+        path = str(getattr(task, "Path", "") or "")
+        return {
+            "path": path,
+            "name": str(getattr(task, "Name", "") or ""),
+            "state": state,
+            "enabled": bool(getattr(task, "Enabled", False)),
+            "lastRunAt": self._task_timestamp(getattr(task, "LastRunTime", None)),
+            "nextRunAt": self._task_timestamp(getattr(task, "NextRunTime", None)),
+            "lastResult": int(getattr(task, "LastTaskResult", 0) or 0),
+            "runLevel": run_level,
+            "multipleInstances": multiple_instances,
+            "actions": actions,
+            "enginePids": sorted(set(engine_pids)),
+        }
+
+    def scheduled_tasks(self, paths: set[str] | None = None) -> ScheduledTaskSnapshot:
+        pythoncom.CoInitialize()
+        service = task = folder = registered = children = None
+        pending: list[object] = []
+        try:
+            service = win32com.client.Dispatch("Schedule.Service")
+            service.Connect()
+            tasks: dict[str, dict[str, object]] = {}
+            issues: list[PlatformIssue] = []
+            if paths is not None:
+                for requested in sorted(paths, key=str.casefold):
+                    normalized, folder_path, name = self._scheduled_task_parts(requested)
+                    try:
+                        task = service.GetFolder(folder_path).GetTask(name)
+                        row = self._scheduled_task_row(task)
+                    except (AttributeError, TypeError, ValueError, pywintypes.error) as exc:
+                        row = {
+                            "path": normalized,
+                            "name": name,
+                            "state": "missing",
+                            "enabled": False,
+                            "lastRunAt": None,
+                            "nextRunAt": None,
+                            "lastResult": None,
+                            "runLevel": "unknown",
+                            "multipleInstances": "unknown",
+                            "actions": [],
+                            "enginePids": [],
+                            "error": str(exc),
+                        }
+                    tasks[normalized.casefold()] = row
+            else:
+                pending = [service.GetFolder("\\")]
+                while pending:
+                    folder = pending.pop()
+                    try:
+                        registered = folder.GetTasks(1)
+                        children = folder.GetFolders(0)
+                    except (AttributeError, pywintypes.error) as exc:
+                        issues.append(_issue(
+                            "scheduled_tasks", "folder_access_denied", str(exc),
+                            degrades=False,
+                        ))
+                        continue
+                    for task in self._com_collection(registered):
+                        row = self._scheduled_task_row(task)
+                        if row["path"]:
+                            tasks[str(row["path"]).casefold()] = row
+                    pending.extend(self._com_collection(children))
+            deduplicated = tuple(dict.fromkeys(issues))
+            return ScheduledTaskSnapshot(
+                ScanStatus.PARTIAL if deduplicated else ScanStatus.OK,
+                tasks,
+                deduplicated,
+            )
+        except (OSError, AttributeError, pywintypes.error, pythoncom.com_error) as exc:
+            return ScheduledTaskSnapshot(ScanStatus.FAILED, issues=(
+                _issue("scheduled_tasks", "query_failed", str(exc)),
+            ))
+        finally:
+            pending.clear()
+            task = folder = registered = children = service = None
+            gc.collect()
+            pythoncom.CoUninitialize()
+
+    def run_scheduled_task(self, path: str) -> ScheduledTaskRunResult:
+        normalized, folder_path, name = self._scheduled_task_parts(path)
+        pythoncom.CoInitialize()
+        service = task = None
+        try:
+            service = win32com.client.Dispatch("Schedule.Service")
+            service.Connect()
+            task = service.GetFolder(folder_path).GetTask(name)
+            if not bool(task.Enabled):
+                return ScheduledTaskRunResult(
+                    False, normalized, "Windows scheduled task is disabled",
+                    "SCHEDULED_TASK_DISABLED",
+                )
+            task.Run("")
+            return ScheduledTaskRunResult(True, normalized)
+        except (OSError, AttributeError, pywintypes.error, pythoncom.com_error) as exc:
+            return ScheduledTaskRunResult(
+                False, normalized, str(exc), "SCHEDULED_TASK_RUN_FAILED"
+            )
+        finally:
+            task = service = None
+            gc.collect()
+            pythoncom.CoUninitialize()
 
     @staticmethod
     def process_groups() -> ProcessSnapshot:

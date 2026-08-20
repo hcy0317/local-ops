@@ -18,6 +18,7 @@ class PlatformIssue:
     component: str
     code: str
     message: str
+    degrades: bool = True
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,21 @@ class CwdSnapshot:
     status: ScanStatus
     cwds: dict[int, str | None] = field(default_factory=dict)
     issues: tuple[PlatformIssue, ...] = ()
+
+
+@dataclass(frozen=True)
+class ScheduledTaskSnapshot:
+    status: ScanStatus
+    tasks: dict[str, dict[str, object]] = field(default_factory=dict)
+    issues: tuple[PlatformIssue, ...] = ()
+
+
+@dataclass(frozen=True)
+class ScheduledTaskRunResult:
+    ok: bool
+    task_path: str
+    error: str | None = None
+    code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -198,6 +214,8 @@ class PlatformCapabilities:
     attach_external: bool = False
     pick_path: bool = False
     restart_console: bool = False
+    monitor_scheduled_tasks: bool = False
+    run_scheduled_tasks: bool = False
 
 
 class PlatformUnavailable(RuntimeError):
@@ -227,6 +245,7 @@ class PlatformBackend(Protocol):
     def process_snapshot(
         self, pids: set[int] | None = None, *, with_owner: bool = True,
     ) -> ProcessSnapshot: ...
+    def processes_matching_keywords(self, keywords: Sequence[str]) -> ProcessSnapshot: ...
     def process_cwds(self, pids: set[int]) -> CwdSnapshot: ...
     def process_parents(self, pids: set[int] | None = None) -> ProcessSnapshot: ...
     def process_groups(self) -> ProcessSnapshot: ...
@@ -243,6 +262,8 @@ class PlatformBackend(Protocol):
     def process_group_id(self, pid: int) -> int | None: ...
     def current_process_group_id(self) -> int | None: ...
     def pid_alive(self, pid: int) -> bool: ...
+    def scheduled_tasks(self, paths: set[str] | None = None) -> ScheduledTaskSnapshot: ...
+    def run_scheduled_task(self, path: str) -> ScheduledTaskRunResult: ...
     def pick_path(self, kind: Literal["dir", "script"]) -> PickResult: ...
     def open_browser(self, url: str) -> None: ...
     def restart_console(self, preferred_port: int) -> RestartResult: ...

@@ -611,6 +611,7 @@ def inspect_windows_runtime(app):
             "status": "stopped",
             "running": False,
             "controlAvailable": True,
+            "deleteAvailable": True,
             "issue": None,
             "members": (),
             "verified": True,
@@ -623,6 +624,7 @@ def inspect_windows_runtime(app):
             "status": "orphaned",
             "running": False,
             "controlAvailable": False,
+            "deleteAvailable": False,
             "issue": lifecycle_error("RUNTIME_IDENTITY_INVALID"),
             "members": (),
             "verified": False,
@@ -633,6 +635,7 @@ def inspect_windows_runtime(app):
             "status": "unknown",
             "running": False,
             "controlAvailable": False,
+            "deleteAvailable": False,
             "issue": lifecycle_error("RUNTIME_IDENTITY_UNVERIFIED"),
             "members": (),
             "verified": False,
@@ -659,6 +662,7 @@ def inspect_windows_runtime(app):
             "status": "orphaned" if insecure else "unknown",
             "running": False,
             "controlAvailable": False,
+            "deleteAvailable": False,
             "issue": lifecycle_error(code),
             "members": (),
             "verified": False,
@@ -668,6 +672,7 @@ def inspect_windows_runtime(app):
             "status": "unknown",
             "running": False,
             "controlAvailable": False,
+            "deleteAvailable": False,
             "issue": lifecycle_error("RUNTIME_IDENTITY_UNVERIFIED"),
             "members": (),
             "verified": False,
@@ -680,15 +685,22 @@ def inspect_windows_runtime(app):
             "status": "unknown",
             "running": False,
             "controlAvailable": False,
+            "deleteAvailable": False,
             "issue": lifecycle_error("RUNTIME_IDENTITY_UNVERIFIED"),
             "members": (),
             "verified": False,
         }
     if status is None:
+        terminal = (
+            raw_status in ("exited", "failed")
+            and not inspection_running
+            and not members
+        )
         return {
             "status": "unknown",
             "running": False,
             "controlAvailable": False,
+            "deleteAvailable": terminal,
             "issue": lifecycle_error(
                 getattr(inspection, "code", None),
                 "RUNTIME_CONTROL_FAILED",
@@ -704,6 +716,7 @@ def inspect_windows_runtime(app):
             and bool(members)
         ),
         "controlAvailable": status == "running",
+        "deleteAvailable": status == "running",
         "issue": None,
         "members": members,
         "verified": True,
@@ -1653,6 +1666,10 @@ def scheduled_task_app_row(app, task):
         state == "ready" and bool(task.get("enabled"))
         and bool(getattr(PLATFORM.capabilities, "run_scheduled_tasks", False))
     )
+    can_stop = (
+        state == "running"
+        and bool(getattr(PLATFORM.capabilities, "stop_scheduled_tasks", False))
+    )
     issue = None
     if health["blocking"]:
         first = health["issues"][0]
@@ -1670,7 +1687,8 @@ def scheduled_task_app_row(app, task):
         "scheduledTask": task,
         "scheduledTaskPath": scheduled_task_path(app),
         "lifecycleStatus": lifecycle_status,
-        "controlAvailable": can_run,
+        "controlAvailable": can_run or can_stop,
+        "deleteAvailable": True,
         "runtimeIssue": issue,
         "importStatus": "ready",
         "platformCompatibility": {"status": "ready", "reasons": []},
@@ -1844,6 +1862,10 @@ def build_apps(cfg, listeners, groups=None, scheduled_tasks=None):
             ),
             "controlAvailable": (
                 runtime_state["controlAvailable"]
+                if runtime_state is not None else True
+            ),
+            "deleteAvailable": (
+                runtime_state["deleteAvailable"]
                 if runtime_state is not None else True
             ),
             "runtimeIssue": (
@@ -2589,7 +2611,33 @@ def start_scheduled_task_app(platform, app):
     return payload
 
 
-def stop_windows_app(cfg, app, *, force=False, timeout=APP_STOP_TIMEOUT_SEC):
+def stop_scheduled_task_app(platform, app):
+    path = scheduled_task_path(app)
+    if not path:
+        return {
+            "ok": False,
+            "error": "应用没有关联 Windows 计划任务",
+            "code": "SCHEDULED_TASK_NOT_CONFIGURED",
+        }
+    result = platform.stop_scheduled_task(path)
+    payload = {
+        "ok": bool(getattr(result, "ok", False)),
+        "taskPath": getattr(result, "task_path", path) or path,
+        "runtimeSource": "windowsTaskScheduler",
+    }
+    if not payload["ok"]:
+        payload["error"] = (
+            getattr(result, "error", None) or "Windows 计划任务停止失败"
+        )
+        payload["code"] = (
+            getattr(result, "code", None) or "SCHEDULED_TASK_STOP_FAILED"
+        )
+    return payload
+
+
+def stop_windows_app(
+        cfg, app, *, force=False, timeout=APP_STOP_TIMEOUT_SEC,
+        initial_inspection=None):
     """Stop only the authenticated Job and clear only the same generation."""
     try:
         identity = native_runtime_identity(app)
@@ -2597,10 +2645,12 @@ def stop_windows_app(cfg, app, *, force=False, timeout=APP_STOP_TIMEOUT_SEC):
         return _windows_lifecycle_result(False, code="RUNTIME_IDENTITY_INVALID")
     if identity is None:
         return _windows_lifecycle_result(False, code="GENERATION_MISMATCH")
-    try:
-        before = PLATFORM.inspect_managed(identity)
-    except Exception:
-        before = None
+    before = initial_inspection
+    if before is None:
+        try:
+            before = PLATFORM.inspect_managed(identity)
+        except Exception:
+            before = None
     if before is not None and _windows_inspection_matches(identity, before):
         before_members = tuple(getattr(before, "members", ()) or ())
         before_status = getattr(before, "status", None)
@@ -5120,12 +5170,6 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(force, bool):
             self.send_err(400, "force 必须是布尔值", "INVALID_REQUEST")
             return
-        if not self._require_capability(
-                "stop_managed", "当前平台或阶段未启用应用停止"):
-            return
-        if force and not self._require_capability(
-                "force_stop_managed", "当前平台或阶段未启用强制停止"):
-            return
         valid, expected_generation = self._expected_generation(data)
         if not valid:
             return
@@ -5133,11 +5177,31 @@ class Handler(BaseHTTPRequestHandler):
         if app is None:
             return
         if scheduled_task_path(app):
-            self.send_err(
-                409,
-                "Windows 计划任务由系统调度器管理；总控台只监控，不会强制停止",
-                "SCHEDULED_TASK_MONITOR_ONLY",
-            )
+            if not self._require_capability(
+                    "stop_scheduled_tasks", "当前平台未启用 Windows 计划任务停止"):
+                return
+            if expected_generation is not None:
+                self.send_err(
+                    409, "计划任务监控不使用受管运行代次",
+                    "GENERATION_MISMATCH",
+                )
+                return
+            if force:
+                self.send_err(
+                    409, "Windows 计划任务停止不支持强制模式",
+                    "SCHEDULED_TASK_FORCE_UNSUPPORTED",
+                )
+                return
+            result = stop_scheduled_task_app(PLATFORM, app)
+            if result.get("ok"):
+                invalidate_state_cache()
+            self.send_json(result, 200 if result.get("ok") else 409)
+            return
+        if not self._require_capability(
+                "stop_managed", "当前平台或阶段未启用应用停止"):
+            return
+        if force and not self._require_capability(
+                "force_stop_managed", "当前平台或阶段未启用强制停止"):
             return
         if not self._generation_matches(app, expected_generation):
             return
@@ -5543,21 +5607,46 @@ class Handler(BaseHTTPRequestHandler):
         if not self._generation_matches(app, expected_generation):
             return
         stopped_for_delete = False
+        terminal_identity = None
         if (PLATFORM.name == "windows"
                 and app.get("runtimeIdentity") is not None):
-            if not self._require_capability(
-                    "stop_managed", "当前平台或阶段禁止删除运行中的应用"):
-                return
-            stopped = stop_windows_app(
-                self.server.cfg,
-                app,
-                force=False,
-                timeout=APP_STOP_TIMEOUT_SEC,
-            )
-            if not stopped.get("ok"):
-                self._send_windows_lifecycle_result(stopped)
-                return
-            stopped_for_delete = True
+            try:
+                identity = native_runtime_identity(app)
+            except (ConfigSchemaError, TypeError, ValueError):
+                identity = None
+            inspection = None
+            if identity is not None:
+                try:
+                    inspection = PLATFORM.inspect_managed(identity)
+                except Exception:
+                    inspection = None
+            terminal = None
+            if (inspection is not None
+                    and _windows_inspection_matches(identity, inspection)
+                    and not bool(getattr(inspection, "running", False))
+                    and not tuple(getattr(inspection, "members", ()) or ())
+                    and getattr(inspection, "status", None) in ("exited", "failed")):
+                terminal = inspection
+            if terminal is not None:
+                # The signed receipt proves that no workload remains. Card
+                # deletion does not wait for or terminate a stale runner; the
+                # background exact-generation release owns record cleanup.
+                terminal_identity = identity
+            else:
+                if not self._require_capability(
+                        "stop_managed", "当前平台或阶段禁止删除运行中的应用"):
+                    return
+                stopped = stop_windows_app(
+                    self.server.cfg,
+                    app,
+                    force=False,
+                    timeout=APP_STOP_TIMEOUT_SEC,
+                    initial_inspection=inspection,
+                )
+                if not stopped.get("ok"):
+                    self._send_windows_lifecycle_result(stopped)
+                    return
+                stopped_for_delete = True
         elif PLATFORM.name != "windows" and app_running(app):
             if not self._require_capability(
                     "stop_managed", "当前平台或阶段禁止删除运行中的应用"):
@@ -5591,6 +5680,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_err(404, "应用不存在")
                 return
         self.server.forget_app_lock(app_id)
+        if terminal_identity is not None:
+            _defer_windows_release(terminal_identity)
 
         for ext in ICON_EXTS:
             for fname in (app_id + ext, "fav-" + app_id + ext):
@@ -5606,7 +5697,10 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
-        self.send_json({"ok": True})
+        self.send_json({
+            "ok": True,
+            "cleanupPending": terminal_identity is not None,
+        })
 
     @serialized_app_operation
     def handle_icon_delete(self, app_id):

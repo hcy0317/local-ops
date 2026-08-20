@@ -440,7 +440,9 @@ function updateAppCard(card, app) {
   const canLaunch = hasCapability(
     isScheduled ? 'run_scheduled_tasks' : 'launch_managed'
   );
-  const canStop = hasCapability('stop_managed');
+  const canStop = hasCapability(
+    isScheduled ? 'stop_scheduled_tasks' : 'stop_managed'
+  );
   const canToggle = lifecycle.canManage ? canStop
     : lifecycle.canStart ? canLaunch : false;
   r.restart.hidden = isScheduled || !lifecycle.canManage
@@ -481,8 +483,9 @@ async function toggleApp(id, button, capturedIntent) {
   const intent = capturedIntent || lifecycleSnapshot(app, currentPlatform());
   const starting = intent.status === 'stopped';
   const capability = starting ? 'launch_managed' : 'stop_managed';
-  const effectiveCapability = starting && isScheduled
-    ? 'run_scheduled_tasks' : capability;
+  const effectiveCapability = isScheduled
+    ? (starting ? 'run_scheduled_tasks' : 'stop_scheduled_tasks')
+    : capability;
   if ((!starting && !intent.canManage) || (starting && !intent.canStart)
       || !hasCapability(effectiveCapability)) {
     toast(platformPresentation().lifecycleNotice);
@@ -533,8 +536,9 @@ async function toggleApp(id, button, capturedIntent) {
       const latestLifecycle = lifecycleSnapshot(latest, currentPlatform());
       const latestScheduled = latest
         && latest.runtimeSource === 'windowsTaskScheduler';
-      const latestCapability = latestLifecycle.canManage ? 'stop_managed'
-        : latestScheduled ? 'run_scheduled_tasks' : 'launch_managed';
+      const latestCapability = latestScheduled
+        ? (latestLifecycle.canManage ? 'stop_scheduled_tasks' : 'run_scheduled_tasks')
+        : latestLifecycle.canManage ? 'stop_managed' : 'launch_managed';
       const latestCompatibility = latest && latest.platformCompatibility;
       const incompatible = currentPlatform() === 'windows' && latestCompatibility &&
         (latestCompatibility.status === 'needs_review' || latestCompatibility.status === 'blocked');

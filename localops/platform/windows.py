@@ -157,6 +157,7 @@ class WindowsPlatform:
         restart_console=False,
         monitor_scheduled_tasks=True,
         run_scheduled_tasks=True,
+        stop_scheduled_tasks=True,
     )
 
     def __init__(self, base_dir: str, entrypoint: str):
@@ -866,6 +867,33 @@ class WindowsPlatform:
             )
         finally:
             task = service = None
+            gc.collect()
+            pythoncom.CoUninitialize()
+
+    def stop_scheduled_task(self, path: str) -> ScheduledTaskRunResult:
+        """Stop all running instances of one exact registered task.
+
+        This leaves the registration, enabled state, triggers, principal, and
+        multiple-instance policy unchanged.
+        """
+        normalized, folder_path, name = self._scheduled_task_parts(path)
+        pythoncom.CoInitialize()
+        service = task = instances = None
+        try:
+            service = win32com.client.Dispatch("Schedule.Service")
+            service.Connect()
+            task = service.GetFolder(folder_path).GetTask(name)
+            instances = self._com_collection(task.GetInstances(0))
+            if not instances:
+                return ScheduledTaskRunResult(True, normalized)
+            task.Stop(0)
+            return ScheduledTaskRunResult(True, normalized)
+        except (OSError, AttributeError, pywintypes.error, pythoncom.com_error) as exc:
+            return ScheduledTaskRunResult(
+                False, normalized, str(exc), "SCHEDULED_TASK_STOP_FAILED"
+            )
+        finally:
+            instances = task = service = None
             gc.collect()
             pythoncom.CoUninitialize()
 

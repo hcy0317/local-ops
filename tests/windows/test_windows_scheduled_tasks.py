@@ -14,6 +14,7 @@ from localops.platform.contracts import (
     ScheduledTaskSnapshot,
 )
 from localops.platform.fake import FakePlatform
+from tests.windows.test_windows_server import HttpHarness
 
 
 TASK_PATH = r"\Memos-Guard"
@@ -61,11 +62,13 @@ class ScheduledTaskStateTests(unittest.TestCase):
                 monitor_processes=True,
                 monitor_scheduled_tasks=True,
                 run_scheduled_tasks=True,
+                stop_scheduled_tasks=True,
             ),
             scheduled=ScheduledTaskSnapshot(
                 ScanStatus.OK, {TASK_PATH.casefold(): task_row(state)}
             ),
             scheduled_run_result=ScheduledTaskRunResult(True, TASK_PATH),
+            scheduled_stop_result=ScheduledTaskRunResult(True, TASK_PATH),
         )
 
     def test_guard_uses_scheduler_running_state_and_stays_in_service_kind(self):
@@ -83,7 +86,7 @@ class ScheduledTaskStateTests(unittest.TestCase):
         self.assertTrue(app["running"])
         self.assertEqual(app["runtimeSource"], "windowsTaskScheduler")
         self.assertEqual(app["scheduledTask"]["state"], "running")
-        self.assertFalse(app["controlAvailable"])
+        self.assertTrue(app["controlAvailable"])
         self.assertEqual(
             fake.calls.count(("scheduled_tasks", frozenset({TASK_PATH}))), 1
         )
@@ -96,6 +99,16 @@ class ScheduledTaskStateTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["taskPath"], TASK_PATH)
         self.assertEqual(fake.calls[-1], ("run_scheduled_task", TASK_PATH))
+
+    def test_running_guard_can_be_stopped_through_task_scheduler(self):
+        fake = self.fake_platform("running")
+        app = scheduled_app("service")
+
+        result = server.stop_scheduled_task_app(fake, app)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["taskPath"], TASK_PATH)
+        self.assertEqual(fake.calls[-1], ("stop_scheduled_task", TASK_PATH))
 
     def test_scheduled_task_field_round_trips_through_validation(self):
         fields, error = server.validate_app_fields({
@@ -118,6 +131,78 @@ class ScheduledTaskStateTests(unittest.TestCase):
 
         self.assertIsNone(fields)
         self.assertIn("scheduledTaskPath", error)
+
+    @unittest.skipUnless(os.name == "nt", "Windows Task Scheduler COM only")
+    def test_windows_adapter_stops_exact_registered_task_instances(self):
+        from localops.platform import windows as windows_platform
+
+        platform = object.__new__(windows_platform.WindowsPlatform)
+        instances = SimpleNamespace(Count=1, Item=lambda _index: object())
+        task = mock.Mock()
+        task.GetInstances.return_value = instances
+        folder = mock.Mock()
+        folder.GetTask.return_value = task
+        service = mock.Mock()
+        service.GetFolder.return_value = folder
+
+        with mock.patch.object(
+                windows_platform.win32com.client, "Dispatch", return_value=service), \
+                mock.patch.object(windows_platform.pythoncom, "CoInitialize"), \
+                mock.patch.object(windows_platform.pythoncom, "CoUninitialize"):
+            result = platform.stop_scheduled_task(TASK_PATH)
+
+        self.assertTrue(result.ok)
+        service.GetFolder.assert_called_once_with("\\")
+        folder.GetTask.assert_called_once_with("Memos-Guard")
+        task.Stop.assert_called_once_with(0)
+
+
+class ScheduledTaskHttpTests(unittest.TestCase):
+    def setUp(self):
+        self.platform = FakePlatform(
+            name="windows",
+            capabilities=PlatformCapabilities(
+                monitor_processes=True,
+                monitor_scheduled_tasks=True,
+                run_scheduled_tasks=True,
+                stop_scheduled_tasks=True,
+            ),
+            scheduled=ScheduledTaskSnapshot(
+                ScanStatus.OK, {TASK_PATH.casefold(): task_row("running")}
+            ),
+            scheduled_stop_result=ScheduledTaskRunResult(True, TASK_PATH),
+        )
+        self.platform_patch = mock.patch.object(server, "PLATFORM", self.platform)
+        self.principal_patch = mock.patch.object(
+            server, "SELF_PRINCIPAL", self.platform.principal
+        )
+        self.platform_patch.start()
+        self.principal_patch.start()
+        self.harness = HttpHarness()
+        self.headers = self.harness.session_headers()
+        self.harness.cfg.update(
+            lambda data: data["apps"].append(scheduled_app("service"))
+        )
+
+    def tearDown(self):
+        self.harness.close()
+        self.principal_patch.stop()
+        self.platform_patch.stop()
+
+    def test_stop_uses_scheduler_capability_without_managed_job_control(self):
+        status, body, _ = self.harness.request(
+            "POST",
+            "/api/apps/deadbeef/stop",
+            {"expectedGeneration": None, "force": False},
+            self.headers,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(
+            self.platform.calls[-1], ("stop_scheduled_task", TASK_PATH)
+        )
+        self.assertEqual(len(self.harness.cfg.snapshot()["apps"]), 1)
 
 
 class WindowsHealthTests(unittest.TestCase):

@@ -66,7 +66,7 @@ Windows 仍不支持外部进程认领、外部进程结束和总控台重启。
 - 持续运行的 Guard、守护器和常驻服务应选择“长期服务”；运行中的卡片显示 Task Scheduler 的真实运行态和引擎 PID。
 - 同步、导入、备份等执行后退出的入口应选择“批处理任务”；卡片显示最近运行时间与 Task Scheduler 的结果码。
 - “运行”调用 Task Scheduler COM API，由原任务自身的账号、提权级别和 `MultipleInstances` 策略决定行为。总控台不会复制任务动作，也不会绕开 `IgnoreNew`。
-- 外部任务不是 Local Ops Job。总控台不提供停止或重启；删除卡片只移除监控配置，不停止、禁用或删除 Windows 计划任务。
+- 外部任务不是 Local Ops Job。“停止”只调用 Task Scheduler COM `Stop(0)` 停止该注册项的运行实例，不按 PID 结束进程，也不禁用或删除任务；强制停止和重启仍不提供。删除卡片只移除监控配置，不停止、禁用或删除 Windows 计划任务。
 - 受保护系统进程或工作目录不可读取属于预期的 Windows 可见性限制，只显示提示，不再把健康状态错误标记为“降级”。任务库读取失败、配置损坏或关键组件扫描失败仍会进入降级状态。
 
 接口和状态字段见 [`docs/windows-task-scheduler.md`](docs/windows-task-scheduler.md)。

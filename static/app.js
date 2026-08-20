@@ -457,11 +457,14 @@ function paletteActions() {
     const running = !!a.running;
     const intent = lifecycleSnapshot(a, currentPlatform());
     const isTask = (a.kind || 'service') === 'task';
+    const isScheduled = a.runtimeSource === 'windowsTaskScheduler';
     const port = openableAppPort(a);
     const name = a.name || '未命名';
     const canToggle = intent.canManage
-      ? hasCapability('stop_managed')
-      : intent.canStart && hasCapability('launch_managed');
+      ? hasCapability(isScheduled ? 'stop_scheduled_tasks' : 'stop_managed')
+      : intent.canStart && hasCapability(
+        isScheduled ? 'run_scheduled_tasks' : 'launch_managed'
+      );
     if (canToggle) {
       items.push({
         icon: running ? 'square' : 'play',
@@ -472,7 +475,7 @@ function paletteActions() {
         run: () => toggleApp(a.id, null, intent),
       });
     }
-    if (intent.canManage && !isTask && hasCapability('stop_managed') &&
+    if (intent.canManage && !isTask && !isScheduled && hasCapability('stop_managed') &&
         hasCapability('launch_managed')) {
       items.push({
         icon: 'refresh-cw', title: '重启 ' + name, hint: '重新启动', on: true,

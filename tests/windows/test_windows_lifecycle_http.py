@@ -262,6 +262,35 @@ class LifecycleStateTests(unittest.TestCase):
         self.assertTrue(row["controlAvailable"])
         self.assertEqual(row["runtimeIdentity"], identity)
 
+    def test_verified_terminal_runtime_is_deletable_without_process_control(self):
+        identity = runtime_identity()
+        app = {
+            **server.Config.APP_DEFAULT,
+            "id": "deadbeef",
+            "name": "Completed task",
+            "command": "echo safe",
+            "runtimeIdentity": identity,
+        }
+        inspection = ManagedInspection(
+            running=False,
+            verified=True,
+            members=(),
+            status="exited",
+            identity=native_identity("deadbeef", identity["generationId"]),
+        )
+        with mock.patch.object(server.PLATFORM, "name", "windows"), \
+                mock.patch.object(
+                    server, "SELF_PRINCIPAL", SimplePrincipal(identity["ownerSid"])
+                ), \
+                mock.patch.object(
+                    server.PLATFORM, "inspect_managed", return_value=inspection
+                ):
+            row = server.build_apps({"apps": [app]}, set())[0]
+
+        self.assertEqual(row["lifecycleStatus"], "unknown")
+        self.assertFalse(row["controlAvailable"])
+        self.assertTrue(row["deleteAvailable"])
+
     def test_prepared_runtime_is_starting_but_not_legacy_running(self):
         identity = runtime_identity()
         app = {
@@ -1483,6 +1512,36 @@ class WindowsLifecycleHttpTransactionTests(unittest.TestCase):
             value for name, value in self.platform.calls if name == "stop_managed"
         )
         self.assertFalse(stop_call[1])
+
+    def test_terminal_delete_does_not_wait_for_stuck_runner_cleanup(self):
+        self._persist_old_identity()
+        self.platform.inspection = self._terminal(self.identity)
+        self.platform.stop_result = StopResult(
+            ok=False,
+            still_running=False,
+            status="unknown",
+            code="RUNTIME_CONTROL_FAILED",
+        )
+
+        with mock.patch.object(server, "_defer_windows_release") as defer:
+            status, body, _ = self.harness.request(
+                "DELETE",
+                "/api/apps/deadbeef",
+                {"expectedGeneration": self.old_generation},
+                self.headers,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["cleanupPending"])
+        self.assertEqual(self.harness.cfg.snapshot()["apps"], [])
+        self.assertNotIn(
+            "stop_managed", [name for name, _ in self.platform.calls]
+        )
+        self.assertNotIn(
+            "release_managed", [name for name, _ in self.platform.calls]
+        )
+        defer.assert_called_once_with(self.identity)
 
     def test_prepared_identity_delete_fails_closed_without_control(self):
         self._persist_old_identity()

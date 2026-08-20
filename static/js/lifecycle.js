@@ -34,7 +34,7 @@ export function lifecycleSnapshot(app, platform = 'unknown') {
     : macos && app && typeof app.controlAvailable === 'boolean'
       ? app.controlAvailable
       : macos && (status === 'stopped' || status === 'running');
-  const generationReady = macos || status === 'stopped'
+  const generationReady = externalScheduled || macos || status === 'stopped'
     || (status === 'running' && UUID_RE.test(generation || ''));
   const canStart = controlAvailable && status === 'stopped';
   const canManage = controlAvailable && status === 'running' && generationReady;
@@ -44,7 +44,8 @@ export function lifecycleSnapshot(app, platform = 'unknown') {
     expectedGeneration: status === 'stopped' ? null : generation,
     canStart,
     canManage,
-    canDelete: externalScheduled || canStart || canManage,
+    canDelete: externalScheduled || (!!app && app.deleteAvailable === true)
+      || canStart || canManage,
     busy: status === 'starting' || status === 'stopping',
     uncertain: status === 'orphaned' || status === 'unknown',
   });

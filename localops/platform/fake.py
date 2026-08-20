@@ -49,6 +49,7 @@ class FakePlatform:
             restart_console=True,
             monitor_scheduled_tasks=False,
             run_scheduled_tasks=False,
+            stop_scheduled_tasks=False,
         )
     )
     paths: RuntimePaths = field(
@@ -74,6 +75,9 @@ class FakePlatform:
         default_factory=lambda: ScheduledTaskSnapshot(status=ScanStatus.OK)
     )
     scheduled_run_result: ScheduledTaskRunResult = field(
+        default_factory=lambda: ScheduledTaskRunResult(False, "", "unsupported")
+    )
+    scheduled_stop_result: ScheduledTaskRunResult = field(
         default_factory=lambda: ScheduledTaskRunResult(False, "", "unsupported")
     )
     launch_result: ManagedRuntime = field(default_factory=lambda: ManagedRuntime(ok=True))
@@ -193,6 +197,13 @@ class FakePlatform:
     def run_scheduled_task(self, path: str) -> ScheduledTaskRunResult:
         self.calls.append(("run_scheduled_task", path))
         result = self.scheduled_run_result
+        if result.task_path:
+            return result
+        return ScheduledTaskRunResult(result.ok, path, result.error, result.code)
+
+    def stop_scheduled_task(self, path: str) -> ScheduledTaskRunResult:
+        self.calls.append(("stop_scheduled_task", path))
+        result = self.scheduled_stop_result
         if result.task_path:
             return result
         return ScheduledTaskRunResult(result.ok, path, result.error, result.code)

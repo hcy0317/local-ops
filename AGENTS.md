@@ -85,7 +85,7 @@
 - `POST /api/project/detect` `{cwd}` → `{ok, cwd, name, files, candidates:[{command,label,source,port,kind,detail}]}`（只读分析项目根目录，不执行项目代码；识别 package.json scripts 与包管理器锁文件、Hexo/Hugo/Jekyll、Django/FastAPI/Flask/Streamlit、Docker Compose、Go、Rust、常用启动脚本及纯静态站点。Hexo 无 scripts 时仍返回 `hexo s` 服务与 `hexo cl` 任务）
 - `POST /api/apps/reorder` `{ids: [...]}` → `{ok}`（按 ids 重排 apps 数组；Python sort 稳定，未涉及的 id 相对顺序不变，服务/任务两区可独立拖拽排序互不干扰）
 - `PUT /api/apps/{id}`（部分更新同字段，可带 `stopBeforeUpdate:true`）→ app 对象；运行中修改 command/cwd/port/kind 时，缺少该标记返回 `{ok:false, requiresStop:true}`，带标记则安全停止后原子保存
-- `DELETE /api/apps/{id}` → `{ok}`（Windows body 必须携带观察到的 `expectedGeneration`；先安全停止再删，连同图标/日志）
+- `DELETE /api/apps/{id}` → `{ok, cleanupPending?}`（Windows body 必须携带观察到的 `expectedGeneration`；运行中先安全停止再删；已验证终态但 runner 清理滞留时只删卡片并后台继续释放，绝不因此获取进程控制权限；连同图标/日志）
 - `POST /api/apps/{id}/start` `{expectedGeneration:null}` → `{ok, pid, generationId?, lifecycleStatus?}` / `{ok:false, error, code?, health?}`（Windows 必须从停止状态 CAS；启动前复查配置健康，明确失效返回 422）
 - `POST /api/apps/{id}/stop` `{expectedGeneration, force?}` → `{ok}` / `{ok:false, error, code?}`（Windows 普通停止超时保留身份，`force:true` 是单独确认后的显式操作）
 - `POST /api/apps/{id}/restart` `{expectedGeneration}` → `{ok, pid, generationId?}` / `{ok:false, error, code?}`（仅重启完整身份校验通过的受管进程；等待旧进程退出后再启动，不自动 Force）
@@ -115,6 +115,7 @@
 - **应用状态**：每次启动生成随机 `runToken`，常驻外层 shell 在 argv 中持有标记并等待内层命令及其后台作业。新版进程只有同时命中 `lastPgid` / 当前 UID / token 的进程组才算 running；升级前缺少 token 的旧进程，只有配置 `lastPid`、监听端口、当前 UID 与真实 cwd 全部一致时才兼容认领。用户明确从服务监控认领的 `attached` 卡片允许监听子进程换 PID，但必须在配置端口上按当前 UID + 真实 cwd 唯一命中；任一条件不符仍按外部端口占用处理。`ports` 来自受控进程组成员实际监听的端口。
 - **应用启停**：多张卡片可保存相同端口（例如多个默认使用 3000 的项目）；启动前只拒绝失效配置和当时真实被占用的端口。重启先做健康预检，失败时不会先停掉仍工作的旧服务。停止时先校验 token，然后只对该受控进程组发 `SIGTERM`，**绝不按端口杀其他监听者**。服务手动 stop 不记录退出历史；任务自然结束记录四态结果，总控台中止记录 `stopped`。批处理不做“长期服务存活探测”，避免把快速成功误判成失败
 - **Windows 受管生命周期**：只控制 Local Ops 以 `CREATE_SUSPENDED` 创建并加入专属 Named Job Object 的进程树。公开身份恰好 11 个字段；所有变更使用 generation CAS。普通停止超时保留身份，显式 Force 才能在重验完整证据后调用该 Job 的 `TerminateJobObject`。外部 attach/kill 与 console restart 保持禁用。
+- **Windows 计划任务控制**：关联卡片的启动/停止分别调用 Task Scheduler COM `Run` / `Stop(0)`；停止只面向该注册项的当前实例，不按 PID 结束进程，不改变任务的启用状态、触发器、主体、`MultipleInstances` 或注册。强制停止和重启保持禁用。
 - **Windows TokenOwner 边界**：Windows 新对象 owner 来自 access token 的 `TokenOwner`。平台只接受 `TokenOwner` 为当前用户或 Builtin Administrators；仅在 creation-time apply 路径观察到 Admin 默认 owner 时，才通过一次安全描述符更新把 owner 归一为当前用户并同时写入原 protected DACL。verify-only 的既有记录必须已经由当前用户拥有，Admin-owned 记录同样拒绝，不能先修复再信任。
 - **Windows runtime 原子性与清理**：request/receipt 临时文件必须先应用并验证私有 DACL，再 `os.replace`；重连与清理只做 verify-only，不得自动修复已放宽 ACL。释放 active generation 前必须同时证明目录恰好包含三个私有 runtime records、terminal receipt 签名有效、Job 已空且 runner 不再存在；将目录原子 rename 为严格派生的 cleanup tombstone 是 release commit。commit 后的恢复只删除 private、nonlink tombstone 中三个 runtime record 的 allowlisted subset，且不得观察或控制任何进程；未知项、宽 ACL 或 link 一律 fail closed。
 - **Windows 生命周期测试**：只有隔离夹具作用域或 hosted runner 可以设置 `LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS=1`，且测试只能结束自身创建的 fixture 进程；禁止针对现有用户进程运行。

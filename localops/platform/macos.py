@@ -490,6 +490,12 @@ class MacOSPlatform:
             "UNSUPPORTED_PLATFORM",
         )
 
+    def stop_scheduled_task(self, path: str) -> ScheduledTaskRunResult:
+        return ScheduledTaskRunResult(
+            False, path, "Windows Task Scheduler is unavailable on macOS",
+            "UNSUPPORTED_PLATFORM",
+        )
+
     def pick_path(self, kind: Literal["dir", "script"]) -> PickResult:
         script = (
             'POSIX path of (choose folder with prompt "选择工作目录")'

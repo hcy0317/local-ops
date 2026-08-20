@@ -54,6 +54,20 @@ test('running Windows app captures the exact verified generation', () => {
   );
 });
 
+test('running Windows scheduled task is controllable without a managed generation', () => {
+  const snapshot = lifecycleSnapshot({
+    lifecycleStatus: 'running',
+    controlAvailable: true,
+    running: true,
+    runtimeIdentity: null,
+    runtimeSource: 'windowsTaskScheduler',
+  }, 'windows');
+
+  assert.equal(snapshot.expectedGeneration, null);
+  assert.equal(snapshot.canManage, true);
+  assert.equal(snapshot.canDelete, true);
+});
+
 test('captured intent never substitutes a newer generation', () => {
   const app = runningApp();
   const snapshot = lifecycleSnapshot(app, 'windows');
@@ -78,6 +92,20 @@ test('orphaned, unknown, busy, and malformed Windows identities fail closed', ()
   const malformed = lifecycleSnapshot(runningApp('not-a-generation'), 'windows');
   assert.equal(malformed.canManage, false);
   assert.equal(malformed.canDelete, false);
+});
+
+test('verified terminal Windows card can be removed without gaining process control', () => {
+  const snapshot = lifecycleSnapshot({
+    lifecycleStatus: 'unknown',
+    controlAvailable: false,
+    deleteAvailable: true,
+    running: false,
+    runtimeIdentity: { generationId: GENERATION_A },
+  }, 'windows');
+
+  assert.equal(snapshot.canManage, false);
+  assert.equal(snapshot.canDelete, true);
+  assert.equal(snapshot.expectedGeneration, GENERATION_A);
 });
 
 test('Windows state missing lifecycle authority fields fails closed', () => {

@@ -236,6 +236,16 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("scheduledTaskPath", overlays)
         self.assertIn("app.runtimeSource === 'windowsTaskScheduler'", launchpad)
         self.assertIn("app.scheduledTask", launchpad)
+        self.assertIn("'stop_scheduled_tasks'", launchpad)
+        self.assertIn("'stop_scheduled_tasks'", (ROOT / "static/app.js").read_text(encoding="utf-8"))
+
+    def test_watched_process_row_can_remove_its_keywords_without_killing_process(self):
+        services = (ROOT / "static/js/services.js").read_text(encoding="utf-8")
+
+        self.assertIn("const bUnwatch = iconBtn('eye-off', '取消关注')", services)
+        self.assertIn("Array.isArray(w.keywords)", services)
+        self.assertIn("action: 'remove'", services)
+        self.assertIn("不会结束进程", services)
 
     def test_health_notice_does_not_report_connection_loss(self):
         app = (ROOT / "static/app.js").read_text(encoding="utf-8")

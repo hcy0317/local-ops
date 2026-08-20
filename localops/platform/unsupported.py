@@ -125,6 +125,11 @@ class UnsupportedPlatform:
             False, path, self._issue.message, self._issue.code
         )
 
+    def stop_scheduled_task(self, path: str) -> ScheduledTaskRunResult:
+        return ScheduledTaskRunResult(
+            False, path, self._issue.message, self._issue.code
+        )
+
     def pick_path(self, kind: Literal["dir", "script"]) -> PickResult:
         return PickResult(issue=self._issue)
 

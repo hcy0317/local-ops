@@ -43,6 +43,8 @@ The state is one of `unknown`, `missing`, `disabled`, `queued`, `ready`, or `run
 
 `POST /api/apps/{id}/start` with `{"expectedGeneration": null}` calls the Task Scheduler COM `Run` method. The registered task's security principal, run level, triggers, conditions, and multiple-instance policy remain authoritative.
 
-Scheduled-task cards do not support Local Ops stop, force-stop, restart, attach, or PID-based kill. Their processes are external to the Local Ops Job Object. Deleting a card removes only Local Ops configuration and never stops, disables, or unregisters the Windows task.
+`POST /api/apps/{id}/stop` with `{"expectedGeneration": null, "force": false}` calls the Task Scheduler COM `Stop(0)` method for that exact registration. It stops the task's current running instances without disabling, changing, or unregistering the task. Force-stop, restart, attach, and PID-based kill remain unsupported because these processes are external to the Local Ops Job Object.
 
-Capabilities are advertised independently as `monitor_scheduled_tasks` and `run_scheduled_tasks`.
+Deleting a card removes only Local Ops configuration and never stops, disables, or unregisters the Windows task. A completed Local Ops task whose authenticated runtime receipt is terminal may also be removed while protected runner-record cleanup continues in the background; this path never gains process-control authority.
+
+Capabilities are advertised independently as `monitor_scheduled_tasks`, `run_scheduled_tasks`, and `stop_scheduled_tasks`.

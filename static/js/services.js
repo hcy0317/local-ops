@@ -494,6 +494,31 @@ function createWatchRow() {
   const cAct = el('span', 'c-act');
   cAct.setAttribute('role', 'cell');
   cAct.setAttribute('aria-label', '操作');
+  const bUnwatch = iconBtn('eye-off', '取消关注');
+  bUnwatch.addEventListener('click', async () => {
+    if (bUnwatch.dataset.busy === 'true') return;
+    const w = findWatch(row.dataset.key);
+    if (!w) return;
+    const keywords = (Array.isArray(w.keywords)
+      ? w.keywords
+      : String(w.keyword || '').split('、'))
+      .map(keyword => String(keyword).trim()).filter(Boolean);
+    if (!keywords.length) return;
+    bUnwatch.dataset.busy = 'true';
+    bUnwatch.disabled = true;
+    let removed = 0;
+    try {
+      for (const keyword of keywords) {
+        const result = await act(post('/api/watch', { keyword, action: 'remove' }));
+        if (result && result.ok !== false) removed += 1;
+      }
+      if (removed) toast('已取消关注；不会结束进程');
+      window.__poll();
+    } finally {
+      delete bUnwatch.dataset.busy;
+      bUnwatch.disabled = false;
+    }
+  });
   const bKill = iconBtn('power', '结束进程', 'danger');
   bKill.hidden = !hasCapability('kill_external');
   bKill.addEventListener('click', () => {
@@ -501,9 +526,12 @@ function createWatchRow() {
     const w = findWatch(row.dataset.key);
     if (w) confirmKill({ pid: w.pid, name: w.name, port: null });
   });
-  cAct.append(bKill);
+  cAct.append(bUnwatch, bKill);
   row.append(cTitle, cPid, load.wrap, cUp, cAct);
-  row._r = { name, kw, pid: cPid, ldCpu: load.cpu, ldMem: load.mem, up: cUp, kill: bKill };
+  row._r = {
+    name, kw, pid: cPid, ldCpu: load.cpu, ldMem: load.mem, up: cUp,
+    unwatch: bUnwatch, kill: bKill,
+  };
   return row;
 }
 
@@ -517,6 +545,8 @@ function updateWatchRow(row, w) {
   setText(r.ldMem, fmtPct(w.mem));
   setText(r.up, fmtUptime(w.uptimeSec));
   const target = w.name || ('PID ' + w.pid);
+  r.unwatch.title = '取消关注：' + target + '（不会结束进程）';
+  r.unwatch.setAttribute('aria-label', '取消关注：' + target + '，不会结束进程');
   r.kill.hidden = !hasCapability('kill_external');
   r.kill.title = '结束进程：' + target;
   r.kill.setAttribute('aria-label', '结束进程：' + target);

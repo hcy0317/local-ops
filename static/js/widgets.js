@@ -771,7 +771,8 @@ function batchStopApps() {
   }
   const running = ((state.data && state.data.apps) || [])
     .map(app => ({ app, intent: lifecycleSnapshot(app, currentPlatform()) }))
-    .filter(item => item.intent.canManage);
+    .filter(item => item.app.runtimeSource !== 'windowsTaskScheduler'
+      && item.intent.canManage);
   if (!running.length) {
     toast('当前没有运行中的应用');
     return;

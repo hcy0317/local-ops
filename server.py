@@ -171,7 +171,7 @@ def process_owned_by_current(info):
     owner = info.get("owner")
     if owner is not None:
         return owner == SELF_PRINCIPAL.identifier
-    return info.get("uid") == SELF_UID
+    return SELF_UID is not None and info.get("uid") == SELF_UID
 
 
 def process_owner_value(info):
@@ -256,7 +256,8 @@ code{background:#f5f5f7;border:1px solid rgba(0,0,0,.05);border-radius:6px;paddi
 </div></body></html>"""
 
 APP_ROUTE_RE = re.compile(
-    r"^/api/apps/([0-9a-fA-F]{8})(?:/(start|stop|restart|icon|logs|favicon|diagnose|attach|scheduled-enabled))?$")
+    r"^/api/apps/([0-9a-fA-F]{8})(?:/(start|stop|restart|icon|logs|favicon|"
+    r"diagnose|attach|scheduled-enabled|scheduled-history))?$")
 
 
 # ---------------------------------------------------------------- 运行目录
@@ -1641,6 +1642,71 @@ def elevated_favorite(app):
     return bool(isinstance(app, dict) and app.get("elevated") is True)
 
 
+def _program_args_match(expected_args, command_line):
+    args = expected_args if isinstance(expected_args, list) else []
+    if not args:
+        return True
+    if not isinstance(command_line, str) or not command_line.strip():
+        return False
+    expected_tail = subprocess.list2cmdline(args).casefold()
+    actual = command_line.strip().casefold()
+    return actual.endswith(" " + expected_tail)
+
+
+def _program_executable_matches(
+        configured, candidate, expected_args=None, command_line=None):
+    if not isinstance(configured, str) or not isinstance(candidate, str):
+        return False
+    configured = ntpath.normcase(ntpath.normpath(configured))
+    candidate = ntpath.normcase(ntpath.normpath(candidate))
+    if not ntpath.isabs(configured) or not ntpath.isabs(candidate):
+        return False
+    if ntpath.basename(candidate) != ntpath.basename(configured):
+        return False
+    parent = ntpath.dirname(configured).rstrip("\\")
+    if candidate != configured and not candidate.startswith(parent + "\\"):
+        return False
+    return _program_args_match(expected_args, command_line)
+
+
+def _restricted_program_process_matches(executable, expected_args, info):
+    if info.get("restricted") is not True or not isinstance(
+            info.get("comm"), str):
+        return False
+    candidate = info["comm"]
+    if ntpath.isabs(candidate):
+        return _program_executable_matches(
+            executable, candidate, expected_args, info.get("args")
+        )
+    return bool(
+        ntpath.basename(candidate).casefold()
+        == ntpath.basename(executable).casefold()
+        and _program_args_match(expected_args, info.get("args"))
+    )
+
+
+def build_program_process_snapshot(cfg):
+    executables = []
+    for app in cfg.get("apps") or []:
+        if not elevated_favorite(app):
+            continue
+        try:
+            spec = normalize_command_spec(app.get("commandSpec"))
+        except CommandSpecError:
+            continue
+        executable = spec.get("executable")
+        if (spec.get("mode") == "direct" and isinstance(executable, str)
+                and ntpath.isabs(executable)
+                and executable.casefold().endswith(".exe")):
+            executables.append(ntpath.basename(executable))
+    names = sorted(set(executables), key=str.casefold)
+    if PLATFORM.name != "windows" or not names:
+        return {}
+    snapshot = PLATFORM.processes_matching_keywords(names)
+    _record_platform_issues(snapshot.status, snapshot.issues)
+    return snapshot.processes
+
+
 def build_scheduled_task_index(cfg):
     paths = {
         value for value in (
@@ -1802,8 +1868,9 @@ def elevation_broker_public(status):
     }
 
 
-def elevated_program_app_row(app, broker_status):
+def elevated_program_app_row(app, broker_status, program_processes=None):
     broker = elevation_broker_public(broker_status)
+    executable = None
     try:
         command_spec = normalize_command_spec(app.get("commandSpec"))
         executable = command_spec.get("executable")
@@ -1815,6 +1882,28 @@ def elevated_program_app_row(app, broker_status):
         )
     except CommandSpecError:
         spec_valid = False
+    observed = []
+    restricted = []
+    if spec_valid:
+        for pid, info in (program_processes or {}).items():
+            if (process_owned_by_current(info)
+                    and _program_executable_matches(
+                        executable, info.get("comm"), command_spec.get("args"),
+                        info.get("args"),
+                    )):
+                observed.append((int(pid), info))
+            elif _restricted_program_process_matches(
+                    executable, command_spec.get("args"), info):
+                restricted.append((int(pid), info))
+    if not observed and len(restricted) == 1:
+        observed = restricted
+    observed.sort(key=lambda item: item[0])
+    representative = max(
+        observed,
+        key=lambda item: (int(item[1].get("etime") or 0), -item[0]),
+        default=None,
+    )
+    running = bool(observed)
     unlocked = (
         spec_valid and broker["installed"]
         and broker["verified"] and broker["unlocked"]
@@ -1863,8 +1952,20 @@ def elevated_program_app_row(app, broker_status):
         "cwd": app.get("cwd"), "port": None,
         "emoji": app.get("emoji"), "glyph": app.get("glyph"),
         "icon": app.get("icon"), "favicon": app.get("favicon"),
-        "running": False, "pid": None,
-        "uptimeSec": None, "kind": "program", "attached": False,
+        "running": running,
+        "pid": representative[0] if representative else None,
+        "uptimeSec": (
+            int(representative[1]["etime"])
+            if representative and isinstance(
+                representative[1].get("etime"), (int, float)
+            ) else None
+        ),
+        "observedPids": [pid for pid, _ in observed],
+        "observedOnly": True,
+        "observedRestricted": any(
+            info.get("restricted") is True for _, info in observed
+        ),
+        "kind": "program", "attached": False,
         "lastExit": app.get("lastExit"),
         "health": {
             "status": "ok" if unlocked else "error",
@@ -1982,7 +2083,7 @@ def docker_app_row(app, snapshot):
 
 def build_apps(
         cfg, listeners, groups=None, scheduled_tasks=None, docker_snapshot=None,
-        broker_status=None):
+        broker_status=None, program_processes=None):
     """token 校验通过或严格命中旧版身份的进程才算 running。
 
     多张卡片可共享配置端口；只有当前真实监听者不属于本卡片时才返回
@@ -2032,7 +2133,9 @@ def build_apps(
     apps = []
     for app in apps_cfg:
         if elevated_favorite(app):
-            apps.append(elevated_program_app_row(app, broker_status))
+            apps.append(elevated_program_app_row(
+                app, broker_status, program_processes
+            ))
             continue
         if docker_resource(app):
             apps.append(docker_app_row(app, docker_snapshot))
@@ -2241,9 +2344,18 @@ def build_state(cfg, console_port, config_health=None):
                 "component": "elevation_broker", "error": str(exc),
             })
     try:
+        program_processes = build_program_process_snapshot(cfg)
+    except Exception as exc:
+        LOG.exception("构建程序运行观察状态失败")
+        program_processes = {}
+        if any(elevated_favorite(app) for app in (cfg.get("apps") or [])):
+            degraded_reasons.append({
+                "component": "program_processes", "error": str(exc),
+            })
+    try:
         apps = build_apps(
             cfg, listeners, groups, scheduled_tasks, docker_snapshot,
-            broker_status,
+            broker_status, program_processes,
         )
     except Exception:
         LOG.exception("构建启动台状态失败")
@@ -2975,6 +3087,27 @@ def set_scheduled_task_enabled_app(platform, app, enabled):
         )
     record_app_action(
         app, "Windows 计划任务%s" % ("启用" if enabled else "禁用"), payload
+    )
+    return payload
+
+
+def set_scheduled_task_history_app(platform, app, enabled):
+    result = platform.set_scheduled_task_history_enabled(enabled)
+    payload = {
+        "ok": bool(getattr(result, "ok", False)),
+        "enabled": bool(getattr(result, "enabled", False)),
+        "runtimeSource": "windowsTaskScheduler",
+    }
+    if not payload["ok"]:
+        payload["error"] = (
+            getattr(result, "error", None) or "计划任务历史记录修改失败"
+        )
+        payload["code"] = (
+            getattr(result, "code", None)
+            or "SCHEDULED_TASK_HISTORY_UPDATE_FAILED"
+        )
+    record_app_action(
+        app, "计划任务历史记录%s" % ("启用" if enabled else "禁用"), payload
     )
     return payload
 
@@ -4160,25 +4293,128 @@ def read_log_tail(app_id, count):
     return "\n".join(collected[-count:])
 
 
-def scheduled_task_log_lines(app):
+SCHEDULED_TASK_EVENT_LABELS = {
+    100: "任务已启动",
+    101: "任务启动失败",
+    102: "任务已完成",
+    107: "触发器已触发",
+    108: "事件触发器已触发",
+    110: "用户请求运行",
+    111: "任务已终止",
+    118: "系统启动触发器已触发",
+    119: "登录触发器已触发",
+    129: "已创建任务进程",
+    140: "任务定义已更新",
+    141: "任务已删除",
+    142: "任务已禁用",
+    200: "操作已启动",
+    201: "操作已完成",
+    202: "操作失败",
+    203: "操作启动失败",
+    204: "操作完成失败",
+}
+
+
+def _scheduled_task_event_line(event):
+    event_id = int(event.get("eventId") or 0)
+    label = SCHEDULED_TASK_EVENT_LABELS.get(event_id, "计划任务事件")
+    timestamp = event.get("timestamp")
+    when = (
+        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+        if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool)
+        else "时间未知"
+    )
+    details = []
+    action = event.get("actionName")
+    if action:
+        details.append("操作 %s" % action)
+    process_id = event.get("processId")
+    if isinstance(process_id, int) and not isinstance(process_id, bool):
+        details.append("PID %d" % process_id)
+    result = event.get("resultCode")
+    if isinstance(result, int) and not isinstance(result, bool):
+        unsigned = result & 0xFFFFFFFF
+        details.append(
+            "结果 0x%08X（%s）" % (
+                unsigned, "成功" if unsigned == 0 else "失败",
+            )
+        )
+    suffix = " · " + " · ".join(details) if details else ""
+    return "[%s] %s (Event %d)%s" % (when, label, event_id, suffix)
+
+
+def scheduled_task_log_data(app, count):
     path = scheduled_task_path(app)
     if not path:
-        return []
+        return [], {"applicable": False}
     try:
         snapshot = PLATFORM.scheduled_tasks({path})
         task = snapshot.tasks.get(path.casefold())
     except Exception as exc:
-        return ["[Local Ops] Windows 计划任务状态读取失败：%s" % exc]
+        task = None
+        state_error = "[Local Ops] Windows 计划任务状态读取失败：%s" % exc
+    else:
+        state_error = None
+
+    try:
+        event_snapshot = PLATFORM.scheduled_task_events(path, count)
+    except Exception as exc:
+        event_snapshot = None
+        event_error = {
+            "code": "query_failed", "message": str(exc),
+        }
+    else:
+        event_error = None
+
+    events = list(getattr(event_snapshot, "events", ()) or ())
+    events.sort(key=lambda event: (
+        int(event.get("timestamp") or 0), int(event.get("recordId") or 0)
+    ))
+    event_issues = [
+        {"code": issue.code, "message": issue.message}
+        for issue in (getattr(event_snapshot, "issues", ()) or ())
+    ]
+    if event_error:
+        event_issues.append(event_error)
+    history_enabled = getattr(event_snapshot, "history_enabled", None)
+    history_status = getattr(event_snapshot, "status", ScanStatus.FAILED)
+    meta = {
+        "applicable": True,
+        "enabled": history_enabled,
+        "available": history_status is not ScanStatus.FAILED,
+        "partial": history_status is ScanStatus.PARTIAL,
+        "eventCount": len(events),
+        "issues": event_issues,
+    }
+    lines = ["=== Windows 计划任务运行时间线 ==="]
+    if history_enabled is False:
+        lines.append(
+            "[Local Ops] Windows 计划任务历史记录未启用；"
+            "启用后会记录后续每次触发、启动、操作和完成事件。"
+        )
+    if events:
+        lines.extend(_scheduled_task_event_line(event) for event in events)
+    elif event_error or history_status is ScanStatus.FAILED:
+        detail = event_issues[0]["message"] if event_issues else "事件查询失败"
+        lines.append("[Local Ops] 计划任务事件读取失败：%s" % detail)
+    else:
+        lines.append("[Local Ops] 尚无该计划任务的历史事件。")
+
+    lines.append("=== Windows 计划任务当前状态 ===")
+    if state_error:
+        lines.append(state_error)
+        return lines, meta
     if not isinstance(task, dict) or task.get("state") == "missing":
-        return ["[Local Ops] Windows 计划任务不存在：%s" % path]
+        lines.append("[Local Ops] Windows 计划任务不存在：%s" % path)
+        return lines, meta
     state_label = {
         "ready": "就绪", "running": "运行中", "queued": "排队中",
         "disabled": "已禁用", "missing": "不存在", "unknown": "未知",
     }.get(str(task.get("state") or "unknown"), "未知")
-    lines = [
-        "[Local Ops] Windows 计划任务：%s" % path,
+    lines.extend([
+        "Windows 计划任务：%s" % path,
         "状态：%s" % state_label,
-    ]
+    ])
     last_run = task.get("lastRunAt")
     if isinstance(last_run, (int, float)) and not isinstance(last_run, bool):
         lines.append("上次运行：%s" % time.strftime(
@@ -4194,12 +4430,21 @@ def scheduled_task_log_lines(app):
         else:
             result_label = "失败"
         lines.append("最近结果：%s (0x%08X)" % (result_label, unsigned))
-    return lines
+    return lines, meta
 
 
-def read_app_log(app, count):
+def scheduled_task_log_lines(app, count=300):
+    return scheduled_task_log_data(app, count)[0]
+
+
+def read_app_log_payload(app, count):
     """Combine controller events with logs owned by an external runtime."""
-    lines = read_log_tail(app.get("id"), count).splitlines()
+    controller_lines = read_log_tail(app.get("id"), count).splitlines()
+    lines = []
+    if controller_lines:
+        lines.append("=== Local Ops 控制记录 ===")
+        lines.extend(controller_lines)
+    task_history = {"applicable": False}
     resource = docker_resource(app)
     if resource:
         result = DOCKER.logs(resource, count)
@@ -4210,8 +4455,16 @@ def read_app_log(app, count):
             error = getattr(result, "error", None) or "Docker 日志读取失败"
             lines.append("[Local Ops] Docker 日志读取失败 [%s]：%s" % (code, error))
     elif scheduled_task_path(app):
-        lines.extend(scheduled_task_log_lines(app))
-    return "\n".join(lines[-count:])
+        scheduled_lines, task_history = scheduled_task_log_data(app, count)
+        lines.extend(scheduled_lines)
+    return {
+        "text": "\n".join(lines[-count:]),
+        "taskHistory": task_history,
+    }
+
+
+def read_app_log(app, count):
+    return read_app_log_payload(app, count)["text"]
 
 
 def start_log_maintenance():
@@ -4236,6 +4489,33 @@ def sniff_image(data):
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "webp"
     return None
+
+
+def extract_program_icon(app_id, app):
+    if (app.get("kind") != "program" or app.get("glyph") or app.get("icon")):
+        return None
+    command_spec = app.get("commandSpec")
+    if not isinstance(command_spec, dict) or command_spec.get("mode") != "direct":
+        return None
+    executable = command_spec.get("executable")
+    if not isinstance(executable, str) or not executable.casefold().endswith(".exe"):
+        return None
+    try:
+        payload = PLATFORM.extract_executable_icon(executable)
+    except (OSError, TypeError, ValueError):
+        LOG.exception("program icon extraction failed for app %s", app_id)
+        return None
+    if not payload or sniff_image(payload) != "png" or len(payload) > MAX_ICON_BYTES:
+        return None
+    _ensure_private_dir(ICONS_DIR)
+    path = os.path.join(ICONS_DIR, app_id + ".png")
+    try:
+        write_private_bytes(path, payload)
+    except OSError:
+        LOG.exception("program icon storage failed for app %s", app_id)
+        return None
+    app["icon"] = "/icons/" + app_id + ".png"
+    return path
 
 
 # ---------------------------------------------------------------- 站点图标抓取
@@ -5125,7 +5405,7 @@ class Handler(BaseHTTPRequestHandler):
         if app is None:
             return
         tail = self._parse_log_tail(query)
-        self.send_json({"text": read_app_log(app, tail)})
+        self.send_json(read_app_log_payload(app, tail))
 
     def handle_console_log(self, query):
         """总控台自身日志（data/logs/console.log），与维护线程共用轮转。"""
@@ -5222,6 +5502,9 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if action == "scheduled-enabled":
                     self.handle_scheduled_task_enabled(app_id)
+                    return
+                if action == "scheduled-history":
+                    self.handle_scheduled_task_history(app_id)
                     return
                 if action == "icon":
                     self.handle_icon_upload(app_id)
@@ -5543,6 +5826,7 @@ class Handler(BaseHTTPRequestHandler):
                "lastPgid": None, "runToken": None,
                "attached": False, "lastExit": None,
                "createdAt": int(time.time())}
+        automatic_icon = extract_program_icon(new_id, app)
         cwd_updated = False
         if attach_pid is not None:
             ok, error, identity = inspect_attach_process(
@@ -5581,6 +5865,11 @@ class Handler(BaseHTTPRequestHandler):
 
         created = self.server.cfg.update(op)
         if created is None:
+            if automatic_icon:
+                try:
+                    os.remove(automatic_icon)
+                except OSError:
+                    pass
             if attach_conflict[0]:
                 self.send_json(
                     {"ok": False, "error": "该进程已由其他卡片管理"}, 409)
@@ -5793,7 +6082,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if elevated_favorite(app):
             self.send_err(
-                409, "管理员程序收藏只提供启动入口",
+                409, "管理员程序只提供启动入口",
                 "ELEVATED_STOP_UNSUPPORTED",
             )
             return
@@ -5892,6 +6181,31 @@ class Handler(BaseHTTPRequestHandler):
         result = set_scheduled_task_enabled_app(PLATFORM, app, enabled)
         if result.get("ok"):
             invalidate_state_cache()
+        self.send_json(result, 200 if result.get("ok") else 409)
+
+    @serialized_app_operation
+    def handle_scheduled_task_history(self, app_id):
+        data = self._read_json_request()
+        if data is None:
+            return
+        enabled = data.get("enabled")
+        if not isinstance(enabled, bool):
+            self.send_err(400, "enabled 必须是布尔值", "INVALID_REQUEST")
+            return
+        _, app = self._get_app_or_404(app_id)
+        if app is None:
+            return
+        if not scheduled_task_path(app):
+            self.send_err(
+                409, "应用没有关联 Windows 计划任务",
+                "SCHEDULED_TASK_NOT_CONFIGURED",
+            )
+            return
+        if not self._require_capability(
+                "manage_scheduled_task_history",
+                "当前平台未启用 Windows 计划任务历史记录管理"):
+            return
+        result = set_scheduled_task_history_app(PLATFORM, app, enabled)
         self.send_json(result, 200 if result.get("ok") else 409)
 
     def handle_elevation_broker_install(self):

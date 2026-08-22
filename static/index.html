@@ -120,7 +120,7 @@
               <div class="quick-actions" id="quickActions">
                 <button class="qa-chip" type="button" data-qa="add-svc"><span class="qa-ic" data-qa-icon="plus" aria-hidden="true"></span>添加服务</button>
                 <button class="qa-chip" type="button" data-qa="add-task"><span class="qa-ic" data-qa-icon="terminal" aria-hidden="true"></span>添加任务</button>
-                <button class="qa-chip" type="button" data-qa="add-program"><span class="qa-ic" data-qa-icon="rocket" aria-hidden="true"></span>收藏程序</button>
+                <button class="qa-chip" type="button" data-qa="add-program"><span class="qa-ic" data-qa-icon="rocket" aria-hidden="true"></span>添加程序</button>
                 <button class="qa-chip" type="button" data-qa="refresh"><span class="qa-ic" data-qa-icon="refresh-cw" aria-hidden="true"></span>刷新状态</button>
               </div>
             </div>
@@ -192,13 +192,13 @@
               </div>
             </section>
 
-            <!-- 程序收藏 -->
+            <!-- 程序 -->
             <section class="panel">
-              <div class="sec-label"><span>Programs · 程序收藏</span><span class="sec-count" id="programSecCount"></span><i></i></div>
+              <div class="sec-label"><span>Programs · 程序</span><span class="sec-count" id="programSecCount"></span><i></i></div>
               <div class="app-grid" id="programGrid">
                 <button class="app-card add-card" id="addProgramCard" type="button">
                   <span class="add-plus" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14" /><path d="M12 5v14" /></svg></span>
-                  <span class="add-text">收藏程序</span>
+                  <span class="add-text">添加程序</span>
                 </button>
               </div>
             </section>
@@ -447,7 +447,7 @@
     <div class="kind-row" id="kindRow" role="group" aria-label="应用类型">
       <button class="kind-btn active" type="button" data-kind="service">长期服务</button>
       <button class="kind-btn" type="button" data-kind="task">批处理任务</button>
-      <button class="kind-btn" type="button" data-kind="program">程序收藏</button>
+      <button class="kind-btn" type="button" data-kind="program">程序</button>
     </div>
     <div class="field">
       <label for="fName">名称 <span class="req">*</span></label>
@@ -722,6 +722,10 @@
   <div class="drawer-head">
     <span id="drawerTitle">日志</span>
     <button class="drawer-close" id="drawerClose" type="button" title="关闭" aria-label="关闭日志"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg></button>
+  </div>
+  <div class="log-source" id="logSourceStatus" hidden>
+    <span id="logSourceText"></span>
+    <button class="btn" id="logTaskHistoryEnable" type="button" hidden>启用任务历史</button>
   </div>
   <div class="drawer-body" id="logBody">
     <pre id="logPre"></pre>

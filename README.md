@@ -91,11 +91,11 @@ Windows 仍不支持外部进程认领、外部进程结束和总控台重启。
 
 接口与持久化字段见 [`docs/docker-resources.md`](docs/docker-resources.md)。
 
-### Windows 管理员程序收藏
+### Windows 管理员程序
 
 管理员启动使用一个固定、无触发器的 Task Scheduler broker，而不是为每个 EXE 新建提权任务。首次安装代理时会出现一次 UAC，并设置至少 8 个字符的自定义密码；此后每次 Local Ops 进程启动只需输入一次密码，解锁状态只保存在该进程内存中。Local Ops 退出、进程身份变化、代理重启或会话令牌失效后都必须重新输入。
 
-代理只接受绝对 `.exe` 路径、字符串参数数组和绝对工作目录，并以 `shell=False` 启动。收藏记录不授予权限；删除收藏不会卸载代理。打包版可直接安装代理；源码模式会让用户选择一个完整解压、通过元数据与运行时检查的 Windows onedir `LocalOps.exe`，再由该打包程序完成 UAC 安装。计划任务始终固定到复制进 `%ProgramFiles%\LocalOps\Broker\<hash>` 的受保护 EXE，不会指向用户可写的 Python 源码。新代理与首次 UAC 路径仍属于本分支的工程实现，尚未完成签名包、干净 VM、Defender/SmartScreen 和真实 UAC 材料门禁，因此不改变 `phaseStatus=IMPLEMENTED_UNVERIFIED` 或 `windowsBetaReady=false`。
+代理只接受绝对 `.exe` 路径、字符串参数数组和绝对工作目录，并以 `shell=False` 启动。添加 EXE 时会通过固定的系统图标 API 读取关联图标，不执行目标程序；用户选择的 glyph 或后续上传图片仍会覆盖自动图标。程序记录不授予权限；删除程序不会卸载代理。可读进程按当前用户、同名 EXE、受限安装目录和参数进行只读观察；Windows 完全隐藏身份和路径时，只接受当前会话内唯一、同名且无参数的候选。观察结果不会生成停止权限。打包版可直接安装代理；源码模式会自动发现数据目录 `packages/` 下最近部署且通过元数据与运行时检查的 Windows onedir `LocalOps.exe`，只有未发现有效包时才打开人工选择兜底，再由该打包程序完成 UAC 安装。计划任务始终固定到复制进 `%ProgramFiles%\LocalOps\Broker\<hash>` 的受保护 EXE，不会指向用户可写的 Python 源码。新代理与首次 UAC 路径仍属于本分支的工程实现，尚未完成签名包、干净 VM、Defender/SmartScreen 和真实 UAC 材料门禁，因此不改变 `phaseStatus=IMPLEMENTED_UNVERIFIED` 或 `windowsBetaReady=false`。
 
 安装、解锁、会话与安全边界见 [`docs/windows-elevation-broker.md`](docs/windows-elevation-broker.md)。
 

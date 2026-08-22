@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import socket
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from localops.command_spec import shell_command_spec
+from localops.elevation_broker import broker_task_sddl
 from localops.platform.contracts import LaunchRequest, ScanStatus, StopResult
 
 if sys.platform == "win32":
@@ -35,6 +37,26 @@ if sys.platform == "win32":
 class WindowsPlatformTests(unittest.TestCase):
     def setUp(self):
         self.platform = WindowsPlatform(os.getcwd(), "server.py")
+
+    @staticmethod
+    def _write_broker_package(bundle: Path) -> Path:
+        internal = bundle / "_internal"
+        internal.mkdir(parents=True)
+        executable = bundle / "LocalOps.exe"
+        executable.write_bytes(b"packaged-local-ops")
+        (internal / "python312.dll").write_bytes(b"runtime")
+        (internal / "VERSION").write_text("1.0.0\n", encoding="utf-8")
+        (bundle / "BUILD-INFO.json").write_text(json.dumps({
+            "architecture": "x64",
+            "elevationBrokerDispatch": "-m localops.windows.elevation_broker",
+            "entrypoint": "localops.windows.packaged_entry",
+            "packaging": "PyInstaller onedir windowed",
+            "product": "Local Ops Console",
+            "pythonVersion": "3.12.13",
+            "schemaVersion": 1,
+            "version": "1.0.0",
+        }), encoding="utf-8")
+        return executable
 
     def test_source_venv_runner_uses_base_process_with_venv_context(self):
         venv_python = r"C:\fixture\.venv\Scripts\python.exe"
@@ -429,10 +451,12 @@ class WindowsPlatformTests(unittest.TestCase):
             "pid": os.getpid(),
             "name": "pwsh.exe",
             "command_line": "pwsh -File memos-guard.ps1",
+            "session_id": 1,
         }]
         with mock.patch.object(
                 self.platform, "_query_process_keyword_rows", return_value=rows
-        ) as query:
+        ) as query, mock.patch.object(
+                windows_adapter.win32ts, "ProcessIdToSessionId", return_value=1):
             snapshot = self.platform.processes_matching_keywords(
                 ["memos-guard.ps1"]
             )
@@ -504,22 +528,7 @@ class WindowsPlatformTests(unittest.TestCase):
     def test_source_broker_install_uses_selected_packaged_companion(self):
         with tempfile.TemporaryDirectory() as root:
             bundle = Path(root) / "LocalOps-1.0.0-windows-x64"
-            internal = bundle / "_internal"
-            internal.mkdir(parents=True)
-            executable = bundle / "LocalOps.exe"
-            executable.write_bytes(b"packaged-local-ops")
-            (internal / "python312.dll").write_bytes(b"runtime")
-            (internal / "VERSION").write_text("1.0.0\n", encoding="utf-8")
-            (bundle / "BUILD-INFO.json").write_text(json.dumps({
-                "architecture": "x64",
-                "elevationBrokerDispatch": "-m localops.windows.elevation_broker",
-                "entrypoint": "localops.windows.packaged_entry",
-                "packaging": "PyInstaller onedir windowed",
-                "product": "Local Ops Console",
-                "pythonVersion": "3.12.13",
-                "schemaVersion": 1,
-                "version": "1.0.0",
-            }), encoding="utf-8")
+            executable = self._write_broker_package(bundle)
             runtime_dir = Path(root) / "runtime"
 
             def approve_install(**kwargs):
@@ -552,6 +561,43 @@ class WindowsPlatformTests(unittest.TestCase):
             parameters = shell_execute.call_args.kwargs["lpParameters"]
             self.assertIn("localops.windows.elevation_broker", parameters)
 
+    def test_source_broker_install_auto_discovers_deployed_package(self):
+        with tempfile.TemporaryDirectory() as root:
+            bundle = (
+                Path(root) / "packages" / "1.0.0-audited"
+                / "LocalOps-1.0.0-windows-x64"
+            )
+            executable = self._write_broker_package(bundle)
+            runtime_dir = Path(root) / "runtime"
+
+            def approve_install(**kwargs):
+                request_path = next(
+                    (runtime_dir / "elevation-install").glob("*/request.json")
+                )
+                (request_path.parent / "response.json").write_text(
+                    '{"ok": true}', encoding="utf-8"
+                )
+                return {}
+
+            with mock.patch.object(
+                    self.platform, "runtime_paths",
+                    return_value=SimpleNamespace(runtime_dir=str(runtime_dir))), \
+                    mock.patch.object(
+                        self.platform, "ensure_private_directory"), \
+                    mock.patch.object(self.platform, "ensure_private_file"), \
+                    mock.patch.object(self.platform, "verify_private_file"), \
+                    mock.patch.object(
+                        windows_adapter.shell, "ShellExecuteEx",
+                        side_effect=approve_install) as shell_execute:
+                result = self.platform.install_elevation_broker(
+                    {"verifier": "opaque"}
+                )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(
+                shell_execute.call_args.kwargs["lpFile"], str(executable)
+            )
+
     def test_source_broker_install_rejects_incomplete_package_before_uac(self):
         with tempfile.TemporaryDirectory() as root:
             executable = Path(root) / "LocalOps.exe"
@@ -565,6 +611,50 @@ class WindowsPlatformTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.code, "BROKER_PACKAGE_INVALID")
         shell_execute.assert_not_called()
+
+    def test_broker_task_security_accepts_scheduler_canonical_acl_only(self):
+        owner_sid = self.platform._sid
+        expected = broker_task_sddl(owner_sid)
+        canonical = (
+            "D:(A;;FA;;;SY)(A;;FA;;;BA)"
+            f"(A;;FRFX;;;{owner_sid})(A;;FR;;;{owner_sid})"
+        )
+        task = SimpleNamespace(
+            GetSecurityDescriptor=mock.Mock(return_value=canonical),
+            Definition=SimpleNamespace(RegistrationInfo=SimpleNamespace(
+                SecurityDescriptor=expected,
+            )),
+        )
+
+        self.assertTrue(self.platform._broker_task_security_locked(task))
+
+        task.GetSecurityDescriptor.return_value = canonical + "(A;;FR;;;WD)"
+        self.assertFalse(self.platform._broker_task_security_locked(task))
+
+    def test_executable_icon_uses_fixed_script_and_returns_png(self):
+        png = b"\x89PNG\r\n\x1a\nfixture"
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout=base64.b64encode(png),
+            stderr=b"",
+        )
+        with tempfile.TemporaryDirectory() as root:
+            executable = os.path.join(root, "工具.exe")
+            Path(executable).write_bytes(b"fixture")
+            with mock.patch.object(
+                    self.platform, "_windows_powershell",
+                    return_value=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"), \
+                    mock.patch.object(
+                        windows_adapter.subprocess, "run",
+                        return_value=completed) as run:
+                result = self.platform.extract_executable_icon(executable)
+
+        self.assertEqual(result, png)
+        command = run.call_args.args[0]
+        self.assertNotIn(executable, " ".join(command))
+        self.assertEqual(
+            run.call_args.kwargs["env"]["LOCALOPS_ICON_SOURCE"], executable
+        )
 
     def test_real_loopback_listener_is_observable(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

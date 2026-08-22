@@ -70,12 +70,13 @@ def verify_broker_task(
     if not isinstance(task, Mapping) or task.get("state") == "missing":
         return False, "BROKER_TASK_MISSING"
     actions = task.get("actionDetails")
+    principal_sid = task.get("principalSid") or task.get("principalUserId")
     valid = (
         str(task.get("path") or "").casefold()
         == str(spec["taskPath"]).casefold()
         and task.get("enabled") is True
         and task.get("runLevel") == "highest"
-        and str(task.get("principalUserId") or "").casefold()
+        and str(principal_sid or "").casefold()
         == str(spec["ownerSid"]).casefold()
         and task.get("multipleInstances") == "ignoreNew"
         and task.get("triggerCount") == 0

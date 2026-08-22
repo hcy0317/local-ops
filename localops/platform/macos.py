@@ -34,6 +34,8 @@ from .contracts import (
     RuntimeIdentity,
     RuntimePaths,
     ScanStatus,
+    ScheduledTaskEventSnapshot,
+    ScheduledTaskHistoryResult,
     ScheduledTaskRunResult,
     ScheduledTaskSnapshot,
     StopResult,
@@ -488,6 +490,14 @@ class MacOSPlatform:
         )
         return ScheduledTaskSnapshot(ScanStatus.FAILED, issues=(issue,))
 
+    def scheduled_task_events(
+            self, path: str, limit: int = 300) -> ScheduledTaskEventSnapshot:
+        issue = _issue(
+            "scheduled_task_events", "unsupported_platform",
+            "Windows Task Scheduler history is unavailable on macOS",
+        )
+        return ScheduledTaskEventSnapshot(ScanStatus.FAILED, issues=(issue,))
+
     def run_scheduled_task(self, path: str) -> ScheduledTaskRunResult:
         return ScheduledTaskRunResult(
             False, path, "Windows Task Scheduler is unavailable on macOS",
@@ -504,6 +514,13 @@ class MacOSPlatform:
             self, path: str, enabled: bool) -> ScheduledTaskRunResult:
         return ScheduledTaskRunResult(
             False, path, "Windows Task Scheduler is unavailable on macOS",
+            "UNSUPPORTED_PLATFORM",
+        )
+
+    def set_scheduled_task_history_enabled(
+            self, enabled: bool) -> ScheduledTaskHistoryResult:
+        return ScheduledTaskHistoryResult(
+            False, False, "Windows Task Scheduler is unavailable on macOS",
             "UNSUPPORTED_PLATFORM",
         )
 
@@ -539,6 +556,10 @@ class MacOSPlatform:
             False, "Windows elevation broker is unavailable on macOS",
             "UNSUPPORTED_PLATFORM",
         )
+
+    @staticmethod
+    def extract_executable_icon(executable: str) -> bytes | None:
+        return None
 
     def pick_path(self, kind: Literal["dir", "script", "exe"]) -> PickResult:
         script = (

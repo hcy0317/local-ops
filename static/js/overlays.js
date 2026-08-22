@@ -44,6 +44,8 @@ const confirmCancel = $('#confirmCancel'), confirmOk = $('#confirmOk');
 const drawerMask = $('#drawerMask'), logDrawer = $('#logDrawer');
 const drawerTitle = $('#drawerTitle'), drawerClose = $('#drawerClose');
 const logBody = $('#logBody'), logPre = $('#logPre');
+const logSourceStatus = $('#logSourceStatus'), logSourceText = $('#logSourceText');
+const logTaskHistoryEnable = $('#logTaskHistoryEnable');
 
 const brokerPasswordMask = $('#brokerPasswordMask');
 const brokerPasswordTitle = $('#brokerPasswordTitle');
@@ -100,7 +102,7 @@ export function openBrokerPassword() {
   const installing = brokerPasswordMode === 'install';
   setText(brokerPasswordTitle, installing ? '安装管理员启动代理' : '解锁管理员启动');
   setText(brokerPasswordNote, installing
-    ? '首次安装会显示一次 Windows UAC；源码模式会先选择完整的 Windows 版 LocalOps.exe。密码仅保存为不可逆 verifier。'
+    ? '首次安装会显示一次 Windows UAC；系统会自动使用已部署的 Windows 伴随包，未找到时才需手动选择。密码仅保存为不可逆 verifier。'
     : '密码只解锁当前 Local Ops 进程；退出后需要重新输入。');
   brokerPasswordConfirmField.hidden = !installing;
   brokerPassword.value = '';
@@ -690,7 +692,7 @@ function setModalKind(kind) {
     : '选择项目后自动识别启动命令，也可以手动填写';
   appModalTitle.textContent = (editingAppId ? '编辑' : '添加') +
     (modalKind === 'task' ? '批处理任务'
-      : modalKind === 'program' ? '程序收藏' : '服务');
+      : modalKind === 'program' ? '程序' : '服务');
   refreshEditSaveMode();
 }
 kindRow.querySelectorAll('.kind-btn').forEach(b =>
@@ -1127,7 +1129,7 @@ export function initAppModal({ onAddService, onAddTask, onAddProgram }) {
         return;
       }
       if (modalKind === 'program' && !r.path.toLowerCase().endsWith('.exe')) {
-        toast('程序收藏只接受 EXE 文件');
+        toast('程序只接受 EXE 文件');
         return;
       }
       fCmd.value = modalKind === 'program' ? r.path : r.command;
@@ -1263,6 +1265,8 @@ function openLogDrawer(appId, title) {
   const requestSeq = ++logRequestSeq;
   drawerTitle.textContent = title;
   logPre.textContent = '加载中…';
+  logSourceStatus.hidden = true;
+  logTaskHistoryEnable.hidden = true;
   logBody.setAttribute('aria-busy', 'true');
   openLayer(logDrawer, drawerClose);
   drawerMask.classList.add('open');
@@ -1285,6 +1289,7 @@ async function fetchLogs(appId, requestSeq) {
     const nearBottom = firstLoad ||
       logBody.scrollHeight - logBody.scrollTop - logBody.clientHeight < 48;
     const text = j.text || '暂无日志';
+    renderTaskHistorySource(j.taskHistory);
     /* 增量追加新行：全量重写会打断用户选区并让滚动位置漂移。 */
     const previous = firstLoad ? '' : logPre.textContent;
     if (previous && text.startsWith(previous)) {
@@ -1310,11 +1315,48 @@ async function fetchLogs(appId, requestSeq) {
     }
   }
 }
+
+function renderTaskHistorySource(taskHistory) {
+  const applicable = !!(taskHistory && taskHistory.applicable);
+  logSourceStatus.hidden = !applicable;
+  if (!applicable) {
+    logTaskHistoryEnable.hidden = true;
+    return;
+  }
+  const count = Number(taskHistory.eventCount) || 0;
+  if (taskHistory.enabled === true) {
+    logSourceText.textContent = 'Windows 任务历史已启用 · ' + count + ' 条事件';
+  } else if (taskHistory.enabled === false) {
+    logSourceText.textContent = 'Windows 任务历史未启用 · 当前显示已有记录';
+  } else {
+    logSourceText.textContent = 'Windows 任务历史状态不可用';
+  }
+  logTaskHistoryEnable.hidden = taskHistory.enabled !== false
+    || !hasCapability('manage_scheduled_task_history');
+}
+
+logTaskHistoryEnable.addEventListener('click', async () => {
+  if (!logAppId || logIsConsole || logTaskHistoryEnable.disabled) return;
+  logTaskHistoryEnable.disabled = true;
+  try {
+    const result = await act(post(
+      '/api/apps/' + logAppId + '/scheduled-history', { enabled: true }
+    ));
+    if (result && result.ok) {
+      toast('已启用 Windows 任务历史');
+      fetchLogs(logAppId, ++logRequestSeq);
+    }
+  } finally {
+    logTaskHistoryEnable.disabled = false;
+  }
+});
 export function closeLogs() {
   logRequestSeq += 1;
   if (logTimer) { clearTimeout(logTimer); logTimer = null; }
   if (logController) { logController.abort(); logController = null; }
   logAppId = null;
+  logSourceStatus.hidden = true;
+  logTaskHistoryEnable.hidden = true;
   logBody.setAttribute('aria-busy', 'false');
   closeLayer(logDrawer);
   drawerMask.classList.remove('open');

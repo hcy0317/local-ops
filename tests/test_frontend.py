@@ -272,6 +272,7 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("'/api/windows/elevation-broker/unlock'", overlays)
         self.assertIn("'BROKER_PACKAGE_REQUIRED'", overlays)
         self.assertIn("packageExecutable", overlays)
+        self.assertIn("系统会自动使用已部署的 Windows 伴随包", overlays)
         self.assertRegex(
             overlays,
             r"post\('/api/pick', \{\s*what: modalKind === 'program'"
@@ -281,10 +282,37 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("elevated", overlays)
         self.assertIn("app.runtimeSource === 'windowsElevationBroker'", launchpad)
         self.assertIn("'launch_elevated'", launchpad)
+        self.assertIn("const launchOnlyObserved = isElevated && !!app.running", launchpad)
+        self.assertIn("'再次启动'", launchpad)
+        self.assertIn("app.observedRestricted", launchpad)
         self.assertIn("promptForElevationSession", app)
         self.assertIn("brokerPromptedConsolePid", app)
         self.assertIn("closeBrokerPassword", app)
         self.assertIn("$('#brokerPasswordMask').classList.contains('open')", app)
+
+    def test_program_ui_uses_direct_program_wording(self):
+        sources = [
+            (ROOT / "static/index.html").read_text(encoding="utf-8"),
+            (ROOT / "static/app.js").read_text(encoding="utf-8"),
+            (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8"),
+            (ROOT / "static/js/overlays.js").read_text(encoding="utf-8"),
+        ]
+
+        for source in sources:
+            self.assertNotIn("程序收藏", source)
+            self.assertNotIn("收藏程序", source)
+        self.assertIn("Programs · 程序", sources[0])
+        self.assertIn("添加程序", sources[0])
+
+    def test_scheduled_task_log_drawer_can_enable_history(self):
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="logSourceStatus"', html)
+        self.assertIn('id="logTaskHistoryEnable"', html)
+        self.assertIn("j.taskHistory", overlays)
+        self.assertIn("'/scheduled-history'", overlays)
+        self.assertIn("已启用 Windows 任务历史", overlays)
 
     def test_watched_process_row_can_remove_its_keywords_without_killing_process(self):
         services = (ROOT / "static/js/services.js").read_text(encoding="utf-8")

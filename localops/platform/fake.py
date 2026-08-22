@@ -21,6 +21,8 @@ from .contracts import (
     RuntimeIdentity,
     RuntimePaths,
     ScanStatus,
+    ScheduledTaskEventSnapshot,
+    ScheduledTaskHistoryResult,
     ScheduledTaskRunResult,
     ScheduledTaskSnapshot,
     StopResult,
@@ -53,6 +55,7 @@ class FakePlatform:
             run_scheduled_tasks=False,
             stop_scheduled_tasks=False,
             toggle_scheduled_tasks=False,
+            manage_scheduled_task_history=False,
             monitor_docker=False,
             control_docker=False,
             manage_elevation_broker=False,
@@ -81,6 +84,9 @@ class FakePlatform:
     scheduled: ScheduledTaskSnapshot = field(
         default_factory=lambda: ScheduledTaskSnapshot(status=ScanStatus.OK)
     )
+    scheduled_events: ScheduledTaskEventSnapshot = field(
+        default_factory=lambda: ScheduledTaskEventSnapshot(status=ScanStatus.OK)
+    )
     scheduled_run_result: ScheduledTaskRunResult = field(
         default_factory=lambda: ScheduledTaskRunResult(False, "", "unsupported")
     )
@@ -89,6 +95,9 @@ class FakePlatform:
     )
     scheduled_toggle_result: ScheduledTaskRunResult = field(
         default_factory=lambda: ScheduledTaskRunResult(True, "")
+    )
+    scheduled_history_result: ScheduledTaskHistoryResult = field(
+        default_factory=lambda: ScheduledTaskHistoryResult(True, True)
     )
     elevation_status: ElevationBrokerStatus = field(
         default_factory=ElevationBrokerStatus
@@ -105,6 +114,7 @@ class FakePlatform:
     elevation_launch_result: ElevationBrokerResult = field(
         default_factory=lambda: ElevationBrokerResult(False, "unsupported")
     )
+    executable_icon: bytes | None = None
     launch_result: ManagedRuntime = field(default_factory=lambda: ManagedRuntime(ok=True))
     activation_result: ManagedActivation = field(
         default_factory=lambda: ManagedActivation(ok=True)
@@ -219,6 +229,11 @@ class FakePlatform:
         self.calls.append(("scheduled_tasks", normalized))
         return self.scheduled
 
+    def scheduled_task_events(
+            self, path: str, limit: int = 300) -> ScheduledTaskEventSnapshot:
+        self.calls.append(("scheduled_task_events", (path, limit)))
+        return self.scheduled_events
+
     def run_scheduled_task(self, path: str) -> ScheduledTaskRunResult:
         self.calls.append(("run_scheduled_task", path))
         result = self.scheduled_run_result
@@ -240,6 +255,15 @@ class FakePlatform:
         if result.task_path:
             return result
         return ScheduledTaskRunResult(result.ok, path, result.error, result.code)
+
+    def set_scheduled_task_history_enabled(
+            self, enabled: bool) -> ScheduledTaskHistoryResult:
+        self.calls.append(("set_scheduled_task_history_enabled", enabled))
+        result = self.scheduled_history_result
+        return ScheduledTaskHistoryResult(
+            result.ok, enabled if result.ok else result.enabled,
+            result.error, result.code,
+        )
 
     def elevation_broker_status(self) -> ElevationBrokerStatus:
         self.calls.append(("elevation_broker_status", None))
@@ -266,6 +290,10 @@ class FakePlatform:
             cwd: str | None) -> ElevationBrokerResult:
         self.calls.append(("launch_elevated", (command_spec, cwd)))
         return self.elevation_launch_result
+
+    def extract_executable_icon(self, executable: str) -> bytes | None:
+        self.calls.append(("extract_executable_icon", executable))
+        return self.executable_icon
 
     def pick_path(self, kind: Literal["dir", "script", "exe"]) -> PickResult:
         self.calls.append(("pick_path", kind))

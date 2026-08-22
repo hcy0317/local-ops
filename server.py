@@ -2775,8 +2775,13 @@ def _inspect_windows_terminal(identity):
 
 def start_windows_app(cfg, app):
     """Prepare, persist, activate, and verify one new Windows Job generation."""
+    def launch_result(ok, **values):
+        payload = _windows_lifecycle_result(ok, **values)
+        record_app_action(app, "Windows 受管应用启动", payload)
+        return payload
+
     if not bool(cfg.health_info().get("writable")):
-        return _windows_lifecycle_result(False, code="LAUNCH_COMMIT_FAILED")
+        return launch_result(False, code="LAUNCH_COMMIT_FAILED")
     generation_id = str(uuid.uuid4())
     _ensure_private_dir(LOGS_DIR)
     log_path = os.path.join(LOGS_DIR, "%s.log" % app["id"])
@@ -2796,14 +2801,14 @@ def start_windows_app(cfg, app):
         ))
     except Exception:
         LOG.exception("Windows managed launch preparation failed: %s", app["id"])
-        return _windows_lifecycle_result(
+        return launch_result(
             False, code="LAUNCH_PREPARE_FAILED"
         )
     identity = getattr(prepared, "runtime_identity", None)
     if not getattr(prepared, "ok", False) or identity is None:
         if identity is not None:
             _abort_or_retain_windows_runtime(cfg, app["id"], identity)
-        return _windows_lifecycle_result(False, code=(
+        return launch_result(False, code=(
             prepared.code
             if getattr(prepared, "code", None) in _LIFECYCLE_ERROR_MESSAGES
             else "LAUNCH_PREPARE_FAILED"
@@ -2815,7 +2820,7 @@ def start_windows_app(cfg, app):
             raise ConfigSchemaError("runner did not prepare the requested generation")
     except (ConfigSchemaError, TypeError, ValueError):
         _abort_or_retain_windows_runtime(cfg, app["id"], identity)
-        return _windows_lifecycle_result(False, code="LAUNCH_PREPARE_FAILED")
+        return launch_result(False, code="LAUNCH_PREPARE_FAILED")
 
     def persist(_data, target):
         target["runtimeIdentity"] = public
@@ -2847,7 +2852,7 @@ def start_windows_app(cfg, app):
                 LOG.exception("Windows launch rollback failed: %s", app["id"])
         else:
             _abort_or_retain_windows_runtime(cfg, app["id"], identity)
-        return _windows_lifecycle_result(False, code="LAUNCH_COMMIT_FAILED")
+        return launch_result(False, code="LAUNCH_COMMIT_FAILED")
 
     try:
         activation = PLATFORM.activate_managed(identity)
@@ -2863,7 +2868,7 @@ def start_windows_app(cfg, app):
         inspection_status = getattr(inspection, "status", None)
         if (bool(getattr(inspection, "running", False))
                 and members and inspection_status == "running"):
-            return _windows_lifecycle_result(
+            return launch_result(
                 True,
                 pid=(getattr(activation, "process_id", None)
                      or identity.root_pid),
@@ -2881,19 +2886,19 @@ def start_windows_app(cfg, app):
                 )
             if ((app.get("kind") or "service") == "task"
                     and inspection_status == "exited" and cleared):
-                return _windows_lifecycle_result(
+                return launch_result(
                     True,
                     pid=identity.root_pid,
                     generation_id=generation_id,
                     status="stopped",
                 )
             if clear_status == "mismatch":
-                return _windows_lifecycle_result(
+                return launch_result(
                     False, code="GENERATION_MISMATCH"
                 )
     # Resume may have reached the runner even when its response was lost. Keep
     # the persisted identity so a later authenticated inspect can reconcile it.
-    return _windows_lifecycle_result(False, code="LAUNCH_ACTIVATE_FAILED")
+    return launch_result(False, code="LAUNCH_ACTIVATE_FAILED")
 
 
 def start_scheduled_task_app(platform, app):
@@ -2917,6 +2922,7 @@ def start_scheduled_task_app(platform, app):
         payload["code"] = (
             getattr(result, "code", None) or "SCHEDULED_TASK_RUN_FAILED"
         )
+    record_app_action(app, "Windows 计划任务启动", payload)
     return payload
 
 
@@ -2941,6 +2947,7 @@ def stop_scheduled_task_app(platform, app):
         payload["code"] = (
             getattr(result, "code", None) or "SCHEDULED_TASK_STOP_FAILED"
         )
+    record_app_action(app, "Windows 计划任务停止", payload)
     return payload
 
 
@@ -2966,6 +2973,9 @@ def set_scheduled_task_enabled_app(platform, app, enabled):
         payload["code"] = (
             getattr(result, "code", None) or "SCHEDULED_TASK_TOGGLE_FAILED"
         )
+    record_app_action(
+        app, "Windows 计划任务%s" % ("启用" if enabled else "禁用"), payload
+    )
     return payload
 
 
@@ -2987,6 +2997,7 @@ def control_docker_app(controller, app, start):
     if not payload["ok"]:
         payload["error"] = getattr(result, "error", None) or "Docker 操作失败"
         payload["code"] = getattr(result, "code", None) or "DOCKER_CONTROL_FAILED"
+    record_app_action(app, "Docker %s" % ("启动" if start else "停止"), payload)
     return payload
 
 
@@ -3002,6 +3013,7 @@ def launch_elevated_program_app(platform, app):
     if not payload["ok"]:
         payload["error"] = getattr(result, "error", None) or "管理员程序启动失败"
         payload["code"] = getattr(result, "code", None) or "ELEVATED_LAUNCH_FAILED"
+    record_app_action(app, "管理员程序启动", payload)
     return payload
 
 
@@ -3243,7 +3255,7 @@ def picker_payload(path, what):
         "dir": parent,
         "stem": stem,
     }
-    if what == "script":
+    if what in ("script", "exe"):
         python_executable = (
             select_python_executable(
                 PLATFORM.name,
@@ -3251,8 +3263,14 @@ def picker_payload(path, what):
                 current_version=sys.version_info[:2],
                 frozen=bool(getattr(sys, "frozen", False)),
             ) if PLATFORM.name == "windows" else None)
-        spec = command_spec_for_script(
-            normalized, PLATFORM.name, python_executable)
+        spec = (
+            command_spec_for_executable(
+                normalized, platform_name=PLATFORM.name, cwd=parent
+            )
+            if what == "exe" else
+            command_spec_for_script(
+                normalized, PLATFORM.name, python_executable)
+        )
         payload["command"] = (display_command(spec)
                               if PLATFORM.name == "windows"
                               else command_for_script(normalized))
@@ -4023,6 +4041,46 @@ def attach_app_process(cfg, app_id, app, pid):
 
 # ---------------------------------------------------------------- 日志
 
+def append_app_log(app_id, message):
+    """Append one UTF-8 controller event to an ACL-protected app log."""
+    if not isinstance(app_id, str) or not re.fullmatch(r"[0-9a-fA-F]{8}", app_id):
+        return False
+    _ensure_private_dir(LOGS_DIR)
+    path = os.path.join(LOGS_DIR, "%s.log" % app_id)
+    rotate_log_file(path)
+    text = str(message).replace("\r", " ").replace("\n", " ").strip()
+    line = ("[%s] [Local Ops] %s\n" %
+            (time.strftime("%Y-%m-%d %H:%M:%S"), text[:2000])).encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    with LOG_LOCK:
+        if os.path.lexists(path) and (
+                os.path.islink(path) or not os.path.isfile(path)):
+            raise OSError("应用日志路径不是普通文件")
+        fd = os.open(path, flags, 0o600)
+        try:
+            PLATFORM.ensure_private_file(path)
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+        PLATFORM.ensure_private_file(path)
+    return True
+
+
+def record_app_action(app, action, result):
+    """Persist the observable outcome of an external controller operation."""
+    ok = bool(result.get("ok"))
+    message = "%s%s" % (action, "成功" if ok else "失败")
+    code = result.get("code")
+    error = result.get("error")
+    if code:
+        message += " [%s]" % code
+    if error:
+        message += "：%s" % error
+    try:
+        append_app_log(app.get("id"), message)
+    except OSError:
+        LOG.exception("写入应用控制日志失败: %s", app.get("id"))
+
 def rotate_log_file(path, max_bytes=MAX_LOG_BYTES, backups=LOG_BACKUPS):
     """超限后 copy-truncate，保持子进程已打开的文件描述符继续可写。"""
     with LOG_LOCK:
@@ -4048,6 +4106,22 @@ def rotate_log_file(path, max_bytes=MAX_LOG_BYTES, backups=LOG_BACKUPS):
             return False
 
 
+def _decode_log_bytes(data):
+    """Decode UTF logs first, then legacy Simplified-Chinese Windows output."""
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", errors="replace")
+    decoded = []
+    for line in data.splitlines():
+        try:
+            decoded.append(line.decode("utf-8-sig"))
+        except UnicodeDecodeError:
+            try:
+                decoded.append(line.decode("gb18030"))
+            except UnicodeDecodeError:
+                decoded.append(line.decode("utf-8", errors="replace"))
+    return "\n".join(decoded)
+
+
 def _tail_file_lines(path, count, block_size=65536):
     try:
         with open(path, "rb") as f:
@@ -4065,7 +4139,7 @@ def _tail_file_lines(path, count, block_size=65536):
                 chunks.append(chunk)
                 newlines += chunk.count(b"\n")
         data = b"".join(reversed(chunks))
-        return data.decode("utf-8", errors="replace").splitlines()[-count:]
+        return _decode_log_bytes(data).splitlines()[-count:]
     except OSError:
         return []
 
@@ -4084,6 +4158,60 @@ def read_log_tail(app_id, count):
             lines = _tail_file_lines(candidate, remaining)
             collected = lines + collected
     return "\n".join(collected[-count:])
+
+
+def scheduled_task_log_lines(app):
+    path = scheduled_task_path(app)
+    if not path:
+        return []
+    try:
+        snapshot = PLATFORM.scheduled_tasks({path})
+        task = snapshot.tasks.get(path.casefold())
+    except Exception as exc:
+        return ["[Local Ops] Windows 计划任务状态读取失败：%s" % exc]
+    if not isinstance(task, dict) or task.get("state") == "missing":
+        return ["[Local Ops] Windows 计划任务不存在：%s" % path]
+    state_label = {
+        "ready": "就绪", "running": "运行中", "queued": "排队中",
+        "disabled": "已禁用", "missing": "不存在", "unknown": "未知",
+    }.get(str(task.get("state") or "unknown"), "未知")
+    lines = [
+        "[Local Ops] Windows 计划任务：%s" % path,
+        "状态：%s" % state_label,
+    ]
+    last_run = task.get("lastRunAt")
+    if isinstance(last_run, (int, float)) and not isinstance(last_run, bool):
+        lines.append("上次运行：%s" % time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(last_run)
+        ))
+    result = task.get("lastResult")
+    if isinstance(result, int) and not isinstance(result, bool):
+        unsigned = result & 0xFFFFFFFF
+        if unsigned == 0:
+            result_label = "成功"
+        elif unsigned == 0x00041301:
+            result_label = "运行中"
+        else:
+            result_label = "失败"
+        lines.append("最近结果：%s (0x%08X)" % (result_label, unsigned))
+    return lines
+
+
+def read_app_log(app, count):
+    """Combine controller events with logs owned by an external runtime."""
+    lines = read_log_tail(app.get("id"), count).splitlines()
+    resource = docker_resource(app)
+    if resource:
+        result = DOCKER.logs(resource, count)
+        if getattr(result, "ok", False):
+            lines.extend(str(getattr(result, "text", "") or "").splitlines())
+        else:
+            code = getattr(result, "code", None) or "DOCKER_LOG_FAILED"
+            error = getattr(result, "error", None) or "Docker 日志读取失败"
+            lines.append("[Local Ops] Docker 日志读取失败 [%s]：%s" % (code, error))
+    elif scheduled_task_path(app):
+        lines.extend(scheduled_task_log_lines(app))
+    return "\n".join(lines[-count:])
 
 
 def start_log_maintenance():
@@ -4997,7 +5125,7 @@ class Handler(BaseHTTPRequestHandler):
         if app is None:
             return
         tail = self._parse_log_tail(query)
-        self.send_json({"text": read_log_tail(app_id, tail)})
+        self.send_json({"text": read_app_log(app, tail)})
 
     def handle_console_log(self, query):
         """总控台自身日志（data/logs/console.log），与维护线程共用轮转。"""
@@ -5117,8 +5245,8 @@ class Handler(BaseHTTPRequestHandler):
                 "pick_path", "当前平台未启用系统路径选择器"):
             return
         what = data.get("what")
-        if what not in ("dir", "script"):
-            self.send_err(400, "what 必须是 dir/script", "INVALID_REQUEST")
+        if what not in ("dir", "script", "exe"):
+            self.send_err(400, "what 必须是 dir/script/exe", "INVALID_REQUEST")
             return
         result = pick_path(what)
         if result.issue:
@@ -5774,6 +5902,13 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(password, str):
             self.send_err(400, "password 必须是字符串", "INVALID_REQUEST")
             return
+        package_executable = data.get("packageExecutable")
+        if package_executable is not None and not isinstance(
+                package_executable, str):
+            self.send_err(
+                400, "packageExecutable 必须是字符串", "INVALID_REQUEST"
+            )
+            return
         if not self._require_capability(
                 "manage_elevation_broker", "当前平台未启用管理员启动代理"):
             return
@@ -5782,7 +5917,9 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self.send_err(400, str(exc), "BROKER_PASSWORD_INVALID")
             return
-        result = PLATFORM.install_elevation_broker(password_record)
+        result = PLATFORM.install_elevation_broker(
+            password_record, package_executable
+        )
         payload = {
             "ok": bool(getattr(result, "ok", False)),
             "code": getattr(result, "code", None),
@@ -6533,9 +6670,24 @@ def _run_console(preferred_port=None, open_browser=True, storage_issues=None):
 def redirect_console_output():
     """在运行目录迁移完成后，将 .app 输出安全追加到 Library Logs。"""
     path = os.path.join(LOGS_DIR, "console.log")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_APPEND
+             | getattr(os, "O_BINARY", 0))
+    fd = os.open(path, flags, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        PLATFORM.ensure_private_file(path)
+        if os.name == "nt":
+            stream = os.fdopen(
+                fd, "a", encoding="utf-8", errors="backslashreplace",
+                buffering=1,
+            )
+            fd = -1
+            sys.stdout = stream
+            sys.stderr = stream
+            return
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        else:
+            os.chmod(path, 0o600)
         for stream in (sys.stdout, sys.stderr):
             try:
                 stream.flush()
@@ -6544,12 +6696,27 @@ def redirect_console_output():
         os.dup2(fd, 1)
         os.dup2(fd, 2)
     finally:
-        os.close(fd)
+        if fd >= 0:
+            os.close(fd)
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(line_buffering=True)
         except (AttributeError, OSError):
             pass
+
+
+def parse_source_console_options(argv, platform_name=None):
+    preferred = None
+    if "--preferred-port" in argv:
+        index = argv.index("--preferred-port")
+        preferred = int(argv[index + 1])
+    no_browser = "--no-browser" in argv
+    return (
+        preferred,
+        not no_browser,
+        ("--log-to-file" in argv
+         or ((platform_name or PLATFORM.name) == "windows" and no_browser)),
+    )
 
 
 def configure_console_output():
@@ -6609,11 +6776,14 @@ if __name__ == "__main__":
             sys.exit(2)
         sys.exit(restart_helper(old, preferred))
     else:
-        preferred = None
-        if "--preferred-port" in sys.argv:
-            index = sys.argv.index("--preferred-port")
-            try:
-                preferred = int(sys.argv[index + 1])
-            except (ValueError, IndexError):
-                sys.exit(2)
-        main(preferred_port=preferred, open_browser="--no-browser" not in sys.argv)
+        try:
+            preferred, open_browser, log_to_file = parse_source_console_options(
+                sys.argv
+            )
+        except (ValueError, IndexError):
+            sys.exit(2)
+        main(
+            preferred_port=preferred,
+            open_browser=open_browser,
+            log_to_file=log_to_file,
+        )

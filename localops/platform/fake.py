@@ -246,8 +246,11 @@ class FakePlatform:
         return self.elevation_status
 
     def install_elevation_broker(
-            self, password_record: Mapping[str, object]) -> ElevationBrokerResult:
-        self.calls.append(("install_elevation_broker", password_record))
+            self, password_record: Mapping[str, object],
+            package_executable: str | None = None) -> ElevationBrokerResult:
+        self.calls.append((
+            "install_elevation_broker", (password_record, package_executable)
+        ))
         return self.elevation_install_result
 
     def unlock_elevation_broker(self, password: str) -> ElevationBrokerResult:
@@ -264,7 +267,7 @@ class FakePlatform:
         self.calls.append(("launch_elevated", (command_spec, cwd)))
         return self.elevation_launch_result
 
-    def pick_path(self, kind: Literal["dir", "script"]) -> PickResult:
+    def pick_path(self, kind: Literal["dir", "script", "exe"]) -> PickResult:
         self.calls.append(("pick_path", kind))
         return self.pick_result
 

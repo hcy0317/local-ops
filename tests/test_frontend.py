@@ -270,6 +270,13 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn('id="brokerPasswordMask"', html)
         self.assertIn("'/api/windows/elevation-broker/install'", overlays)
         self.assertIn("'/api/windows/elevation-broker/unlock'", overlays)
+        self.assertIn("'BROKER_PACKAGE_REQUIRED'", overlays)
+        self.assertIn("packageExecutable", overlays)
+        self.assertRegex(
+            overlays,
+            r"post\('/api/pick', \{\s*what: modalKind === 'program'"
+            r" \? 'exe' : 'script',\s*\}\)",
+        )
         self.assertIn("act, toast, state, openLayer", overlays)
         self.assertIn("elevated", overlays)
         self.assertIn("app.runtimeSource === 'windowsElevationBroker'", launchpad)
@@ -296,6 +303,13 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("banner.dataset.connection === 'down'", widgets)
         self.assertIn("attributeFilter: ['data-connection']", widgets)
         self.assertNotIn("banner.classList.contains('show')", widgets)
+        self.assertNotIn(
+            "messages.push('配置已从旧版本升级')",
+            app,
+        )
+        self.assertIn("function notifyConfigMigration(data)", app)
+        self.assertIn("migrationNotifiedConsolePid", app)
+        self.assertIn("notifyConfigMigration(data);", app)
         self.assertEqual(app.count("banner.dataset.connection = 'down'"), 2)
         self.assertIn(".banner.show ~ .shell > .rail", ops)
         self.assertIn(".banner.show ~ .shell > .shell-col { padding-top: 38px; }", ops)
@@ -322,7 +336,10 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         )
 
     def test_log_drawer_layers_above_banner_and_below_toast(self):
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
         ops = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
+
+        self.assertIn("const text = j.text || '暂无日志';", overlays)
 
         def z_index(selector):
             match = re.search(r"z-index:\s*(\d+)", theme_block(ops, selector))

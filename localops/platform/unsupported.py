@@ -143,7 +143,8 @@ class UnsupportedPlatform:
         return ElevationBrokerStatus()
 
     def install_elevation_broker(
-            self, password_record: Mapping[str, object]) -> ElevationBrokerResult:
+            self, password_record: Mapping[str, object],
+            package_executable: str | None = None) -> ElevationBrokerResult:
         return ElevationBrokerResult(False, self._issue.message, self._issue.code)
 
     def unlock_elevation_broker(self, password: str) -> ElevationBrokerResult:
@@ -158,7 +159,7 @@ class UnsupportedPlatform:
     ) -> ElevationBrokerResult:
         return ElevationBrokerResult(False, self._issue.message, self._issue.code)
 
-    def pick_path(self, kind: Literal["dir", "script"]) -> PickResult:
+    def pick_path(self, kind: Literal["dir", "script", "exe"]) -> PickResult:
         return PickResult(issue=self._issue)
 
     def open_browser(self, url: str) -> None:

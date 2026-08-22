@@ -513,7 +513,8 @@ class MacOSPlatform:
 
     @staticmethod
     def install_elevation_broker(
-            password_record: Mapping[str, object]) -> ElevationBrokerResult:
+            password_record: Mapping[str, object],
+            package_executable: str | None = None) -> ElevationBrokerResult:
         return ElevationBrokerResult(
             False, "Windows elevation broker is unavailable on macOS",
             "UNSUPPORTED_PLATFORM",
@@ -539,11 +540,13 @@ class MacOSPlatform:
             "UNSUPPORTED_PLATFORM",
         )
 
-    def pick_path(self, kind: Literal["dir", "script"]) -> PickResult:
+    def pick_path(self, kind: Literal["dir", "script", "exe"]) -> PickResult:
         script = (
             'POSIX path of (choose folder with prompt "选择工作目录")'
             if kind == "dir"
-            else 'POSIX path of (choose file with prompt "选择批处理脚本")'
+            else 'POSIX path of (choose file with prompt "%s")' % (
+                "选择 EXE 程序" if kind == "exe" else "选择批处理脚本"
+            )
         )
         try:
             result = subprocess.run(

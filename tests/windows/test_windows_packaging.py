@@ -352,6 +352,7 @@ class WindowsArtifactAuditTests(unittest.TestCase):
             "win32console",
             "win32event",
             "win32file",
+            "win32gui",
             "win32job",
             "win32pipe",
             "win32process",
@@ -359,6 +360,7 @@ class WindowsArtifactAuditTests(unittest.TestCase):
         ):
             self.write(f"_internal/win32/{name}.pyd")
         self.write("_internal/win32com/shell/shell.pyd")
+        self.write("_internal/pythonwin/win32ui.pyd")
         self.write("_internal/pywin32_system32/pywintypes312.dll")
         self.write("THIRD-PARTY-LICENSES/Python-LICENSE.txt")
         self.write("THIRD-PARTY-LICENSES/psutil/LICENSE")

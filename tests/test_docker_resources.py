@@ -140,6 +140,36 @@ class DockerResourceTests(unittest.TestCase):
         self.assertEqual(calls[3][-1], "stop")
         self.assertFalse({"down", "rm", "prune"} & {part for call in calls for part in call})
 
+    def test_logs_use_exact_container_or_compose_identity(self):
+        calls = []
+
+        def run(args, timeout):
+            calls.append((args, timeout))
+            return Completed("标准输出\n", "错误输出\n")
+
+        controller = DockerController(executable="docker", run=run)
+        container = {"kind": "container", "containerId": CONTAINER_A}
+        compose = {
+            "kind": "compose",
+            "projectName": "sample",
+            "workingDir": r"C:\work\sample",
+            "configFiles": [r"C:\work\sample\compose.yml"],
+        }
+
+        container_log = controller.logs(container, 25)
+        compose_log = controller.logs(compose, 50)
+
+        self.assertTrue(container_log.ok)
+        self.assertEqual(container_log.text, "标准输出\n错误输出")
+        self.assertEqual(calls[0][0], [
+            "docker", "container", "logs", "--timestamps", "--tail", "25",
+            CONTAINER_A,
+        ])
+        self.assertTrue(compose_log.ok)
+        self.assertEqual(calls[1][0][-5:], [
+            "logs", "--no-color", "--timestamps", "--tail", "50",
+        ])
+
 
 if __name__ == "__main__":
     unittest.main()

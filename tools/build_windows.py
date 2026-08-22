@@ -692,11 +692,13 @@ def audit_archive(archive: Path) -> dict[str, object]:
         "_internal/win32/win32console.pyd",
         "_internal/win32/win32event.pyd",
         "_internal/win32/win32file.pyd",
+        "_internal/win32/win32gui.pyd",
         "_internal/win32/win32job.pyd",
         "_internal/win32/win32pipe.pyd",
         "_internal/win32/win32process.pyd",
         "_internal/win32/win32security.pyd",
         "_internal/win32com/shell/shell.pyd",
+        "_internal/pythonwin/win32ui.pyd",
     }
     missing_runtime = sorted(required_runtime_files - payload.keys())
     if missing_runtime:

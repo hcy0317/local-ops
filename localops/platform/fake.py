@@ -105,6 +105,7 @@ class FakePlatform:
     elevation_launch_result: ElevationBrokerResult = field(
         default_factory=lambda: ElevationBrokerResult(False, "unsupported")
     )
+    executable_icon: bytes | None = None
     launch_result: ManagedRuntime = field(default_factory=lambda: ManagedRuntime(ok=True))
     activation_result: ManagedActivation = field(
         default_factory=lambda: ManagedActivation(ok=True)
@@ -266,6 +267,10 @@ class FakePlatform:
             cwd: str | None) -> ElevationBrokerResult:
         self.calls.append(("launch_elevated", (command_spec, cwd)))
         return self.elevation_launch_result
+
+    def extract_executable_icon(self, executable: str) -> bytes | None:
+        self.calls.append(("extract_executable_icon", executable))
+        return self.executable_icon
 
     def pick_path(self, kind: Literal["dir", "script", "exe"]) -> PickResult:
         self.calls.append(("pick_path", kind))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import gc
 import hashlib
 import json
@@ -107,6 +108,22 @@ _RUNNER_PREPARE_TIMEOUT = 10.0
 _MAX_CLEANUP_RECOVERY_ENTRIES = 256
 _RUNTIME_RECORD_NAMES = frozenset({"request.json", "token.bin", "receipt.json"})
 _CLEANUP_TOMBSTONE_PREFIX = ".cleanup-"
+_EXE_ICON_SCRIPT = r'''$ErrorActionPreference = "Stop"
+Add-Type -AssemblyName System.Drawing
+$icon = [System.Drawing.Icon]::ExtractAssociatedIcon($env:LOCALOPS_ICON_SOURCE)
+if ($null -eq $icon) { exit 3 }
+$bitmap = $null
+$stream = $null
+try {
+  $bitmap = $icon.ToBitmap()
+  $stream = [System.IO.MemoryStream]::new()
+  $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+  [Console]::Out.Write([Convert]::ToBase64String($stream.ToArray()))
+} finally {
+  if ($null -ne $stream) { $stream.Dispose() }
+  if ($null -ne $bitmap) { $bitmap.Dispose() }
+  $icon.Dispose()
+}'''
 
 
 @dataclass(frozen=True)
@@ -753,20 +770,28 @@ class WindowsPlatform:
     def _broker_task_security_locked(self, task: object) -> bool:
         try:
             actual_sddl = str(task.GetSecurityDescriptor(4) or "")
+            registered_sddl = str(
+                task.Definition.RegistrationInfo.SecurityDescriptor or ""
+            )
             actual = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
                 actual_sddl, win32security.SDDL_REVISION_1
+            )
+            registered = (
+                win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
+                    registered_sddl, win32security.SDDL_REVISION_1
+                )
             )
             expected = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
                 broker_task_sddl(self._sid), win32security.SDDL_REVISION_1
             )
 
-            def aces(descriptor: object) -> list[tuple[int, int, str]]:
+            def aces(descriptor: object) -> list[tuple[int, int, int, str]]:
                 dacl = descriptor.GetSecurityDescriptorDacl()
                 if dacl is None:
                     return []
                 return sorted(
                     (
-                        int(ace[0][0]), int(ace[1]),
+                        int(ace[0][0]), int(ace[0][1]), int(ace[1]),
                         win32security.ConvertSidToStringSid(ace[2]),
                     )
                     for ace in (
@@ -774,10 +799,24 @@ class WindowsPlatform:
                     )
                 )
 
-            control = actual.GetSecurityDescriptorControl()[0]
+            expected_aces = aces(expected)
+            registered_control = registered.GetSecurityDescriptorControl()[0]
+            actual_aces = aces(actual)
+            allowed_masks = {
+                sid: mask for ace_type, flags, mask, sid in expected_aces
+                if ace_type == win32security.ACCESS_ALLOWED_ACE_TYPE and flags == 0
+            }
             return (
-                aces(actual) == aces(expected)
-                and bool(control & win32security.SE_DACL_PROTECTED)
+                aces(registered) == expected_aces
+                and bool(registered_control & win32security.SE_DACL_PROTECTED)
+                and set(expected_aces).issubset(set(actual_aces))
+                and all(
+                    ace_type == win32security.ACCESS_ALLOWED_ACE_TYPE
+                    and flags == 0
+                    and sid in allowed_masks
+                    and mask & ~allowed_masks[sid] == 0
+                    for ace_type, flags, mask, sid in actual_aces
+                )
             )
         except (AttributeError, TypeError, ValueError, pywintypes.error):
             return False
@@ -795,6 +834,7 @@ class WindowsPlatform:
         action_details: list[dict[str, object]] = []
         run_level = "limited"
         principal_user_id = ""
+        principal_sid = ""
         multiple_instances = "parallel"
         trigger_count = 0
         try:
@@ -804,6 +844,16 @@ class WindowsPlatform:
                 else "limited"
             )
             principal_user_id = str(definition.Principal.UserId or "")
+            if principal_user_id:
+                try:
+                    sid = (
+                        win32security.ConvertStringSidToSid(principal_user_id)
+                        if principal_user_id.upper().startswith("S-") else
+                        win32security.LookupAccountName(None, principal_user_id)[0]
+                    )
+                    principal_sid = win32security.ConvertSidToStringSid(sid)
+                except pywintypes.error:
+                    principal_sid = ""
             multiple_instances = {
                 0: "parallel",
                 1: "queue",
@@ -852,6 +902,7 @@ class WindowsPlatform:
             "lastResult": int(getattr(task, "LastTaskResult", 0) or 0),
             "runLevel": run_level,
             "principalUserId": principal_user_id,
+            "principalSid": principal_sid,
             "multipleInstances": multiple_instances,
             "triggerCount": trigger_count,
             "actions": actions,
@@ -1357,6 +1408,52 @@ class WindowsPlatform:
                 str(response.get("code") or "BROKER_LAUNCH_FAILED"),
             )
         return ElevationBrokerResult(True, process_id=int(response["pid"]))
+
+    @staticmethod
+    def _windows_powershell() -> str | None:
+        system_root = os.environ.get("SystemRoot") or r"C:\Windows"
+        executable = os.path.join(
+            system_root, "System32", "WindowsPowerShell", "v1.0",
+            "powershell.exe",
+        )
+        return executable if os.path.isfile(executable) else None
+
+    def extract_executable_icon(self, executable: str) -> bytes | None:
+        if (not isinstance(executable, str) or not os.path.isabs(executable)
+                or not executable.casefold().endswith(".exe")
+                or not os.path.isfile(executable)):
+            return None
+        powershell = self._windows_powershell()
+        if not powershell:
+            return None
+        encoded = base64.b64encode(
+            _EXE_ICON_SCRIPT.encode("utf-16le")
+        ).decode("ascii")
+        environment = dict(os.environ)
+        environment["LOCALOPS_ICON_SOURCE"] = os.path.abspath(executable)
+        try:
+            result = subprocess.run(
+                [
+                    powershell, "-NoLogo", "-NoProfile", "-NonInteractive",
+                    "-EncodedCommand", encoded,
+                ],
+                capture_output=True,
+                timeout=15,
+                creationflags=win32process.CREATE_NO_WINDOW,
+                env=environment,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0 or len(result.stdout) > 2 * 1024 * 1024:
+            return None
+        try:
+            payload = base64.b64decode(result.stdout.strip(), validate=True)
+        except (ValueError, TypeError):
+            return None
+        if (not payload.startswith(b"\x89PNG\r\n\x1a\n")
+                or len(payload) > 1024 * 1024):
+            return None
+        return payload
 
     @staticmethod
     def process_groups() -> ProcessSnapshot:

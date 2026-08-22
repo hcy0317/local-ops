@@ -4238,6 +4238,33 @@ def sniff_image(data):
     return None
 
 
+def extract_program_icon(app_id, app):
+    if (app.get("kind") != "program" or app.get("glyph") or app.get("icon")):
+        return None
+    command_spec = app.get("commandSpec")
+    if not isinstance(command_spec, dict) or command_spec.get("mode") != "direct":
+        return None
+    executable = command_spec.get("executable")
+    if not isinstance(executable, str) or not executable.casefold().endswith(".exe"):
+        return None
+    try:
+        payload = PLATFORM.extract_executable_icon(executable)
+    except (OSError, TypeError, ValueError):
+        LOG.exception("program icon extraction failed for app %s", app_id)
+        return None
+    if not payload or sniff_image(payload) != "png" or len(payload) > MAX_ICON_BYTES:
+        return None
+    _ensure_private_dir(ICONS_DIR)
+    path = os.path.join(ICONS_DIR, app_id + ".png")
+    try:
+        write_private_bytes(path, payload)
+    except OSError:
+        LOG.exception("program icon storage failed for app %s", app_id)
+        return None
+    app["icon"] = "/icons/" + app_id + ".png"
+    return path
+
+
 # ---------------------------------------------------------------- 站点图标抓取
 
 ICON_LINK_RE = re.compile(
@@ -5543,6 +5570,7 @@ class Handler(BaseHTTPRequestHandler):
                "lastPgid": None, "runToken": None,
                "attached": False, "lastExit": None,
                "createdAt": int(time.time())}
+        automatic_icon = extract_program_icon(new_id, app)
         cwd_updated = False
         if attach_pid is not None:
             ok, error, identity = inspect_attach_process(
@@ -5581,6 +5609,11 @@ class Handler(BaseHTTPRequestHandler):
 
         created = self.server.cfg.update(op)
         if created is None:
+            if automatic_icon:
+                try:
+                    os.remove(automatic_icon)
+                except OSError:
+                    pass
             if attach_conflict[0]:
                 self.send_json(
                     {"ok": False, "error": "该进程已由其他卡片管理"}, 409)

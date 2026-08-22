@@ -540,6 +540,10 @@ class MacOSPlatform:
             "UNSUPPORTED_PLATFORM",
         )
 
+    @staticmethod
+    def extract_executable_icon(executable: str) -> bytes | None:
+        return None
+
     def pick_path(self, kind: Literal["dir", "script", "exe"]) -> PickResult:
         script = (
             'POSIX path of (choose folder with prompt "选择工作目录")'

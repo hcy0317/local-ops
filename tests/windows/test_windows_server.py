@@ -108,6 +108,36 @@ class WindowsServerTests(unittest.TestCase):
         self.assertEqual(body["commandSpec"]["mode"], "direct")
         self.assertEqual(body["commandSpec"]["executable"], os.path.abspath(executable))
 
+    def test_program_create_reuses_executable_icon(self):
+        executable = os.path.join(self.harness.temp_dir.name, "工具.exe")
+        with open(executable, "wb") as handle:
+            handle.write(b"fixture")
+        icons_dir = os.path.join(self.harness.temp_dir.name, "icons")
+        png = b"\x89PNG\r\n\x1a\nfixture"
+        payload = {
+            "name": "Fixture Tool",
+            "command": executable,
+            "commandSpec": direct_command_spec(executable),
+            "cwd": self.harness.temp_dir.name,
+            "port": None,
+            "kind": "program",
+            "elevated": True,
+        }
+
+        with mock.patch.object(server, "ICONS_DIR", icons_dir), \
+                mock.patch.object(
+                    server.PLATFORM, "extract_executable_icon",
+                    return_value=png, create=True) as extract_icon:
+            status, created, _ = self.harness.request(
+                "POST", "/api/apps", payload, self.headers
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(created["icon"], "/icons/%s.png" % created["id"])
+        extract_icon.assert_called_once_with(os.path.abspath(executable))
+        with open(os.path.join(icons_dir, created["id"] + ".png"), "rb") as handle:
+            self.assertEqual(handle.read(), png)
+
     def test_create_and_cwd_update_derive_import_status(self):
         runtime = os.path.join(self.harness.temp_dir.name, "runner.exe")
         with open(runtime, "wb") as handle:

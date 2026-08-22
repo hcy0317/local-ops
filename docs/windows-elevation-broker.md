@@ -14,6 +14,8 @@ The frozen Windows package installs itself directly. A source checkout first sea
 
 An elevated favorite uses `kind: "program"`, `elevated: true`, and a direct `commandSpec` containing an absolute `.exe` plus a bounded string argument array. It has no managed runtime identity or stop/restart operation: starting it asks the broker to launch once, and the returned PID is informational only.
 
+When a new program favorite has no explicit glyph or uploaded image, the Windows adapter reads the EXE's associated icon through a fixed system PowerShell/.NET script and stores the resulting PNG as the app icon. The EXE path is passed only through a dedicated environment variable, the target is never executed, and extraction failure falls back to the app initial without blocking creation.
+
 The broker accepts only an absolute `.exe`, at most 128 bounded string arguments, and an absolute working directory. It calls `subprocess.Popen` with `shell=False` and detached process flags. It does not accept scripts, shell text, environment expansion, or a PID-based control request.
 
 Deleting a favorite removes only Local Ops configuration. It does not stop the launched process, unregister the broker task, or remove installed broker bundles.

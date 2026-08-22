@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import socket
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from localops.command_spec import shell_command_spec
+from localops.elevation_broker import broker_task_sddl
 from localops.platform.contracts import LaunchRequest, ScanStatus, StopResult
 
 if sys.platform == "win32":
@@ -607,6 +609,50 @@ class WindowsPlatformTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.code, "BROKER_PACKAGE_INVALID")
         shell_execute.assert_not_called()
+
+    def test_broker_task_security_accepts_scheduler_canonical_acl_only(self):
+        owner_sid = self.platform._sid
+        expected = broker_task_sddl(owner_sid)
+        canonical = (
+            "D:(A;;FA;;;SY)(A;;FA;;;BA)"
+            f"(A;;FRFX;;;{owner_sid})(A;;FR;;;{owner_sid})"
+        )
+        task = SimpleNamespace(
+            GetSecurityDescriptor=mock.Mock(return_value=canonical),
+            Definition=SimpleNamespace(RegistrationInfo=SimpleNamespace(
+                SecurityDescriptor=expected,
+            )),
+        )
+
+        self.assertTrue(self.platform._broker_task_security_locked(task))
+
+        task.GetSecurityDescriptor.return_value = canonical + "(A;;FR;;;WD)"
+        self.assertFalse(self.platform._broker_task_security_locked(task))
+
+    def test_executable_icon_uses_fixed_script_and_returns_png(self):
+        png = b"\x89PNG\r\n\x1a\nfixture"
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout=base64.b64encode(png),
+            stderr=b"",
+        )
+        with tempfile.TemporaryDirectory() as root:
+            executable = os.path.join(root, "工具.exe")
+            Path(executable).write_bytes(b"fixture")
+            with mock.patch.object(
+                    self.platform, "_windows_powershell",
+                    return_value=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"), \
+                    mock.patch.object(
+                        windows_adapter.subprocess, "run",
+                        return_value=completed) as run:
+                result = self.platform.extract_executable_icon(executable)
+
+        self.assertEqual(result, png)
+        command = run.call_args.args[0]
+        self.assertNotIn(executable, " ".join(command))
+        self.assertEqual(
+            run.call_args.kwargs["env"]["LOCALOPS_ICON_SOURCE"], executable
+        )
 
     def test_real_loopback_listener_is_observable(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

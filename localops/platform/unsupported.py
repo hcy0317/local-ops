@@ -159,6 +159,10 @@ class UnsupportedPlatform:
     ) -> ElevationBrokerResult:
         return ElevationBrokerResult(False, self._issue.message, self._issue.code)
 
+    @staticmethod
+    def extract_executable_icon(executable: str) -> bytes | None:
+        return None
+
     def pick_path(self, kind: Literal["dir", "script", "exe"]) -> PickResult:
         return PickResult(issue=self._issue)
 

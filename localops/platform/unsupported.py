@@ -22,6 +22,8 @@ from .contracts import (
     RuntimeIdentity,
     RuntimePaths,
     ScanStatus,
+    ScheduledTaskEventSnapshot,
+    ScheduledTaskHistoryResult,
     ScheduledTaskRunResult,
     ScheduledTaskSnapshot,
     StopResult,
@@ -122,6 +124,10 @@ class UnsupportedPlatform:
     def scheduled_tasks(self, paths: set[str] | None = None) -> ScheduledTaskSnapshot:
         return ScheduledTaskSnapshot(ScanStatus.FAILED, issues=(self._issue,))
 
+    def scheduled_task_events(
+            self, path: str, limit: int = 300) -> ScheduledTaskEventSnapshot:
+        return ScheduledTaskEventSnapshot(ScanStatus.FAILED, issues=(self._issue,))
+
     def run_scheduled_task(self, path: str) -> ScheduledTaskRunResult:
         return ScheduledTaskRunResult(
             False, path, self._issue.message, self._issue.code
@@ -136,6 +142,12 @@ class UnsupportedPlatform:
             self, path: str, enabled: bool) -> ScheduledTaskRunResult:
         return ScheduledTaskRunResult(
             False, path, self._issue.message, self._issue.code
+        )
+
+    def set_scheduled_task_history_enabled(
+            self, enabled: bool) -> ScheduledTaskHistoryResult:
+        return ScheduledTaskHistoryResult(
+            False, False, self._issue.message, self._issue.code
         )
 
     @staticmethod

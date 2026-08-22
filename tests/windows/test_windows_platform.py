@@ -451,10 +451,12 @@ class WindowsPlatformTests(unittest.TestCase):
             "pid": os.getpid(),
             "name": "pwsh.exe",
             "command_line": "pwsh -File memos-guard.ps1",
+            "session_id": 1,
         }]
         with mock.patch.object(
                 self.platform, "_query_process_keyword_rows", return_value=rows
-        ) as query:
+        ) as query, mock.patch.object(
+                windows_adapter.win32ts, "ProcessIdToSessionId", return_value=1):
             snapshot = self.platform.processes_matching_keywords(
                 ["memos-guard.ps1"]
             )

@@ -11,6 +11,8 @@ from localops.platform.contracts import (
     ElevationBrokerStatus,
     PlatformCapabilities,
     Principal,
+    ProcessSnapshot,
+    ScanStatus,
 )
 from localops.platform.fake import FakePlatform
 from tests.windows.test_windows_server import HttpHarness
@@ -84,6 +86,101 @@ class ElevationBrokerStateTests(unittest.TestCase):
         self.assertIsNone(app["runtimeIdentity"])
         self.assertTrue(app["controlAvailable"])
         self.assertTrue(state["elevationBroker"]["unlocked"])
+
+    def test_program_running_is_observed_without_granting_stop_control(self):
+        platform = broker_platform(unlocked=True)
+        platform.processes = ProcessSnapshot(ScanStatus.OK, {
+            1200: {
+                "owner": OWNER_SID, "comm": EXECUTABLE,
+                "etime": 45,
+                "args": r'C:\Tools\AdminTool.exe --profile "alpha beta"',
+            },
+            1201: {
+                "owner": OWNER_SID,
+                "comm": r"C:\Tools\bin\AdminTool.exe",
+                "etime": 30,
+                "args": r'C:\Tools\bin\AdminTool.exe --profile "alpha beta"',
+            },
+            1202: {
+                "owner": OWNER_SID,
+                "comm": r"C:\Other\AdminTool.exe",
+                "etime": 90, "args": "",
+            },
+            1203: {
+                "owner": "S-1-5-21-9-9-9-1001",
+                "comm": EXECUTABLE,
+                "etime": 90, "args": "",
+            },
+            1204: {
+                "owner": OWNER_SID, "comm": EXECUTABLE,
+                "etime": 90, "args": r"C:\Tools\AdminTool.exe --profile other",
+            },
+        })
+        cfg = dict(server.Config.DEFAULT)
+        cfg["apps"] = [program_app()]
+
+        with mock.patch.object(server, "PLATFORM", platform), \
+                mock.patch.object(server, "SELF_PRINCIPAL", platform.principal), \
+                mock.patch.object(server, "build_services", return_value=([], set())), \
+                mock.patch.object(server, "build_watched", return_value=[]):
+            state = server.build_state(cfg, 9600, {})
+
+        app = state["apps"][0]
+        self.assertTrue(app["running"])
+        self.assertEqual(app["pid"], 1200)
+        self.assertEqual(app["uptimeSec"], 45)
+        self.assertEqual(app["observedPids"], [1200, 1201])
+        self.assertTrue(app["observedOnly"])
+        self.assertEqual(app["lifecycleStatus"], "stopped")
+        self.assertIsNone(app["runtimeIdentity"])
+
+    def test_one_restricted_same_session_process_is_observed_without_control(self):
+        platform = broker_platform(unlocked=True)
+        platform.processes = ProcessSnapshot(ScanStatus.PARTIAL, {
+            1300: {
+                "owner": None, "uid": None, "comm": "AdminTool.exe",
+                "args": r'AdminTool.exe --profile "alpha beta"',
+                "etime": None, "restricted": True, "sessionId": 1,
+            },
+        })
+        cfg = dict(server.Config.DEFAULT)
+        cfg["apps"] = [program_app()]
+
+        with mock.patch.object(server, "PLATFORM", platform), \
+                mock.patch.object(server, "SELF_PRINCIPAL", platform.principal), \
+                mock.patch.object(server, "build_services", return_value=([], set())), \
+                mock.patch.object(server, "build_watched", return_value=[]):
+            state = server.build_state(cfg, 9600, {})
+
+        app = state["apps"][0]
+        self.assertTrue(app["running"])
+        self.assertEqual(app["observedPids"], [1300])
+        self.assertTrue(app["observedRestricted"])
+        self.assertIsNone(app["uptimeSec"])
+        self.assertEqual(app["lifecycleStatus"], "stopped")
+        self.assertIsNone(app["runtimeIdentity"])
+
+    def test_ambiguous_restricted_processes_are_not_observed(self):
+        platform = broker_platform(unlocked=True)
+        row = {
+            "owner": None, "uid": None, "comm": "AdminTool.exe",
+            "args": r'AdminTool.exe --profile "alpha beta"',
+            "etime": None, "restricted": True, "sessionId": 1,
+        }
+        platform.processes = ProcessSnapshot(
+            ScanStatus.PARTIAL, {1300: dict(row), 1301: dict(row)}
+        )
+        cfg = dict(server.Config.DEFAULT)
+        cfg["apps"] = [program_app()]
+
+        with mock.patch.object(server, "PLATFORM", platform), \
+                mock.patch.object(server, "SELF_PRINCIPAL", platform.principal), \
+                mock.patch.object(server, "build_services", return_value=([], set())), \
+                mock.patch.object(server, "build_watched", return_value=[]):
+            state = server.build_state(cfg, 9600, {})
+
+        self.assertFalse(state["apps"][0]["running"])
+        self.assertEqual(state["apps"][0]["observedPids"], [])
 
     def test_locked_broker_fails_closed_but_keeps_favorite_deletable(self):
         platform = broker_platform(unlocked=False)

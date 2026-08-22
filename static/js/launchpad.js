@@ -226,11 +226,13 @@ function setPrimary(btn, running, kind, lifecycleState = '') {
   const label = lifecycleState === 'starting' ? '启动中'
     : lifecycleState === 'stopping' ? '停止中'
       : lifecycleState === 'authorize' ? '解锁'
+        : lifecycleState === 'relaunch' ? '再次启动'
         : lifecycleState === 'unavailable' ? '不可用'
         : running ? (kind === 'task' ? '中止' : '停止')
           : (kind === 'task' ? '运行' : '启动');
   const glyph = lifecycleState === 'starting' || lifecycleState === 'stopping'
     ? 'clock' : lifecycleState === 'authorize' ? 'wrench'
+      : lifecycleState === 'relaunch' ? 'play'
       : lifecycleState === 'unavailable' ? 'power'
       : running ? 'square' : 'play';
   setChildren(btn, icon(glyph, 13));
@@ -292,6 +294,7 @@ function updateAppCard(card, app) {
   const isDocker = app.runtimeSource === 'dockerCompose'
     || app.runtimeSource === 'dockerContainer';
   const isElevated = app.runtimeSource === 'windowsElevationBroker';
+  const launchOnlyObserved = isElevated && !!app.running;
   const scheduledState = isScheduled && app.scheduledTask
     ? app.scheduledTask.state : '';
   const lifecycle = lifecycleSnapshot(app, currentPlatform());
@@ -332,6 +335,9 @@ function updateAppCard(card, app) {
   } else if (isDocker && lifecycle.status === 'stopped') {
     stTxt = '已停止 · ' + (app.runtimeSource === 'dockerCompose'
       ? 'Docker Compose' : 'Docker 容器');
+  } else if (launchOnlyObserved) {
+    stTxt = app.observedRestricted
+      ? '运行中 · 受保护进程' : '运行中 · 只读观察';
   } else if (isElevated && !app.controlAvailable) {
     stTxt = app.elevationBroker && app.elevationBroker.installed
       ? '等待本次会话解锁' : '管理员代理未安装';
@@ -442,14 +448,16 @@ function updateAppCard(card, app) {
     setText(r.stUp, '');
   }
   const needsBrokerAccess = isElevated && !lifecycle.canStart;
-  const primaryState = needsBrokerAccess ? 'authorize' : lifecycle.busy ? lifecycle.status
+  const primaryState = needsBrokerAccess ? 'authorize'
+    : launchOnlyObserved ? 'relaunch' : lifecycle.busy ? lifecycle.status
     : lifecycle.uncertain || (!lifecycle.canStart && !lifecycle.canManage)
       ? 'unavailable' : '';
-  setPrimary(r.primary, !!app.running, kind, primaryState);
+  setPrimary(r.primary, launchOnlyObserved ? false : !!app.running, kind, primaryState);
   const appName = app.name || (isTask ? '任务' : '应用');
   const primaryVerb = primaryState === 'starting' ? '启动中'
     : primaryState === 'stopping' ? '停止中'
       : primaryState === 'authorize' ? '解锁管理员启动'
+        : primaryState === 'relaunch' ? '再次启动'
         : primaryState === 'unavailable' ? '控制不可用'
         : app.running ? (isTask ? '中止' : '停止')
           : (isTask ? '运行' : '启动');
@@ -679,7 +687,7 @@ function confirmDeleteApp(app) {
       '<div class="confirm-detail">' + (isScheduled
         ? '只删除监控卡片，不会停止或删除 Windows 计划任务。'
         : isDocker ? '只删除收藏卡片，不会停止或删除 Docker 资源。'
-        : isElevated ? '只删除程序收藏，不会卸载管理员启动代理。'
+        : isElevated ? '只删除程序，不会卸载管理员启动代理。'
         : (app.running ? '将先停止该应用，并' : '将') + '删除其图标与日志。') + '</div>',
     okText: '删除',
     onOk: async () => {

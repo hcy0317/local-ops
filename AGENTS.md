@@ -97,8 +97,9 @@
 - `POST /api/apps/{id}/icon`（body 为 png/jpg/webp 原始字节）→ `{ok, icon}`
 - `POST /api/apps/{id}/favicon` → `{ok, favicon}` / `{ok:false, error}`（按有效端口抓站点图标：解析首页 `<link rel*icon*>`，兜底 `/favicon.ico`，支持 png/jpg/webp/ico/svg，存入 Application Support 的 `icons/fav-{id}.{ext}` 并写入 `app.favicon`；图标优先级：上传 icon > glyph > favicon > 名称首字，前端在无 icon/glyph 且运行中时自动触发一次）
 - `DELETE /api/apps/{id}/icon` → `{ok}`
-- `GET /api/apps/{id}/logs?tail=300` → `{text}`
+- `GET /api/apps/{id}/logs?tail=300` → `{text, taskHistory}`（计划任务卡片同时返回 Local Ops 控制审计、Task Scheduler Operational 结构化事件时间线和当前状态；不依赖本地化消息文本）
 - `POST /api/apps/{id}/scheduled-enabled` `{enabled: bool}` → `{ok, enabled}`（仅修改精确计划任务注册项的 `Enabled`，不运行/停止实例，不改任务定义其他字段）
+- `POST /api/apps/{id}/scheduled-history` `{enabled: bool}` → `{ok, enabled}`（启禁用 Windows Task Scheduler Operational 历史频道，不修改任何任务注册）
 - `POST /api/windows/elevation-broker/install` `{password}` → `{ok}`（仅 Windows 冻结包；派生 verifier 后通过一次 UAC 安装固定无触发器 broker）
 - `POST /api/windows/elevation-broker/unlock` `{password}` → `{ok}`（令牌只驻留当前 Local Ops 进程内存，并绑定 PID/create-time/SID）
 - `POST /api/windows/elevation-broker/lock` `{}` → `{ok}`
@@ -123,7 +124,8 @@
 - **应用启停**：多张卡片可保存相同端口（例如多个默认使用 3000 的项目）；启动前只拒绝失效配置和当时真实被占用的端口。重启先做健康预检，失败时不会先停掉仍工作的旧服务。停止时先校验 token，然后只对该受控进程组发 `SIGTERM`，**绝不按端口杀其他监听者**。服务手动 stop 不记录退出历史；任务自然结束记录四态结果，总控台中止记录 `stopped`。批处理不做“长期服务存活探测”，避免把快速成功误判成失败
 - **Windows 受管生命周期**：只控制 Local Ops 以 `CREATE_SUSPENDED` 创建并加入专属 Named Job Object 的进程树。公开身份恰好 11 个字段；所有变更使用 generation CAS。普通停止超时保留身份，显式 Force 才能在重验完整证据后调用该 Job 的 `TerminateJobObject`。外部 attach/kill 与 console restart 保持禁用。
 - **Docker 控制**：Compose 只调用精确 project/workingDir/configFiles 对应的 `up --detach` / `stop`，单容器只调用完整 ID 的 `container start` / `container stop`；不得 `down`、删除、prune 或按显示名控制。
-- **Windows 计划任务控制**：关联卡片的启动/停止分别调用 Task Scheduler COM `Run` / `Stop(0)`；启禁只设置精确注册项的 `Enabled`。不得按 PID 结束进程，且不得修改触发器、动作、主体、运行级别、`MultipleInstances` 或注册；强制停止和重启保持禁用。
+- **Windows 计划任务控制**：关联卡片的启动/停止分别调用 Task Scheduler COM `Run` / `Stop(0)`；启禁只设置精确注册项的 `Enabled`。不得按 PID 结束进程，且不得修改触发器、动作、主体、运行级别、`MultipleInstances` 或注册；强制停止和重启保持禁用。日志读取 Operational 频道的结构化 XML，并与 Local Ops 操作审计和当前 COM 状态合并；频道关闭时由日志抽屉提供显式启用入口，未修改任务 action 或接管 stdout/stderr。
+- **Windows 程序观察**：程序卡片只读观察同名 EXE；可读进程必须属于当前用户，真实路径等于所选 EXE 或位于其父目录内，带参数时还要匹配完整参数尾部。Windows 完全隐藏 token/path/command line 时，仅接受当前会话内唯一、同名且无参数的候选，并标记 `observedRestricted`。观察结果只返回 `observedOnly/observedPids/pid/uptimeSec`，不创建受管身份、不提供停止权限，前端主按钮为「再次启动」。
 - **Windows 管理员程序代理**：Task Scheduler 只注册固定 `\\LocalOps-ElevationBroker`，无触发器且 action 固定到 Program Files 中经哈希验证的冻结包。首次安装经 `runas` UAC；安装请求路径与摘要必须复验。密码只保存 PBKDF2 verifier，Named Pipe 会话绑定实际客户端 PID/create-time/SID；Local Ops token 只在进程内存中，进程退出后必须重新输入。只接受 absolute `.exe` + args[] + absolute cwd 并以 `shell=False` 启动；程序收藏没有 stop/restart 或 PID 控制权。源码 checkout 不得安装 broker。
 - **Windows TokenOwner 边界**：Windows 新对象 owner 来自 access token 的 `TokenOwner`。平台只接受 `TokenOwner` 为当前用户或 Builtin Administrators；仅在 creation-time apply 路径观察到 Admin 默认 owner 时，才通过一次安全描述符更新把 owner 归一为当前用户并同时写入原 protected DACL。verify-only 的既有记录必须已经由当前用户拥有，Admin-owned 记录同样拒绝，不能先修复再信任。
 - **Windows runtime 原子性与清理**：request/receipt 临时文件必须先应用并验证私有 DACL，再 `os.replace`；重连与清理只做 verify-only，不得自动修复已放宽 ACL。释放 active generation 前必须同时证明目录恰好包含三个私有 runtime records、terminal receipt 签名有效、Job 已空且 runner 不再存在；将目录原子 rename 为严格派生的 cleanup tombstone 是 release commit。commit 后的恢复只删除 private、nonlink tombstone 中三个 runtime record 的 allowlisted subset，且不得观察或控制任何进程；未知项、宽 ACL 或 link 一律 fail closed。

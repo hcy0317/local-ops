@@ -9,7 +9,10 @@ import server
 from localops.command_spec import direct_command_spec
 from localops.platform.contracts import (
     PlatformCapabilities,
+    PlatformIssue,
     ScanStatus,
+    ScheduledTaskEventSnapshot,
+    ScheduledTaskHistoryResult,
     ScheduledTaskRunResult,
     ScheduledTaskSnapshot,
 )
@@ -77,8 +80,35 @@ class ScheduledTaskStateTests(unittest.TestCase):
             scheduled=ScheduledTaskSnapshot(
                 ScanStatus.OK, {TASK_PATH.casefold(): task_row(state)}
             ),
+            scheduled_events=ScheduledTaskEventSnapshot(
+                ScanStatus.PARTIAL,
+                events=(
+                    {
+                        "eventId": 102,
+                        "recordId": 23,
+                        "timestamp": 1_787_210_040,
+                        "taskName": TASK_PATH,
+                        "resultCode": 0,
+                    },
+                    {
+                        "eventId": 100,
+                        "recordId": 22,
+                        "timestamp": 1_787_210_000,
+                        "taskName": TASK_PATH,
+                        "instanceId": "{fixture-run}",
+                    },
+                ),
+                history_enabled=False,
+                issues=(PlatformIssue(
+                    "scheduled_task_events",
+                    "history_disabled",
+                    "Windows 计划任务历史记录未启用",
+                    degrades=False,
+                ),),
+            ),
             scheduled_run_result=ScheduledTaskRunResult(True, TASK_PATH),
             scheduled_stop_result=ScheduledTaskRunResult(True, TASK_PATH),
+            scheduled_history_result=ScheduledTaskHistoryResult(True, True),
         )
 
     def test_guard_uses_scheduler_running_state_and_stays_in_service_kind(self):
@@ -124,6 +154,42 @@ class ScheduledTaskStateTests(unittest.TestCase):
         self.assertIn("Windows 计划任务启动失败", text)
         self.assertIn("SCHEDULED_TASK_RUN_FAILED", text)
         self.assertIn("拒绝访问", text)
+
+    def test_scheduled_task_log_combines_audit_events_and_current_state(self):
+        fake = self.fake_platform("ready")
+        app = scheduled_app("task")
+        server.append_app_log(app["id"], "人工审计记录")
+
+        with mock.patch.object(server, "PLATFORM", fake):
+            payload = server.read_app_log_payload(app, 50)
+
+        text = payload["text"]
+        self.assertIn("Local Ops 控制记录", text)
+        self.assertIn("人工审计记录", text)
+        self.assertIn("Windows 计划任务运行时间线", text)
+        self.assertIn("任务已启动 (Event 100)", text)
+        self.assertIn("任务已完成 (Event 102) · 结果 0x00000000", text)
+        self.assertIn("Windows 计划任务当前状态", text)
+        self.assertIn("状态：就绪", text)
+        self.assertFalse(payload["taskHistory"]["enabled"])
+        self.assertEqual(payload["taskHistory"]["eventCount"], 2)
+        self.assertIn("history_disabled", {
+            issue["code"] for issue in payload["taskHistory"]["issues"]
+        })
+        self.assertIn(
+            ("scheduled_task_events", (TASK_PATH, 50)), fake.calls
+        )
+
+    def test_scheduled_task_history_can_be_enabled_and_is_audited(self):
+        fake = self.fake_platform("ready")
+        app = scheduled_app("task")
+
+        result = server.set_scheduled_task_history_app(fake, app, True)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["enabled"])
+        self.assertIn(("set_scheduled_task_history_enabled", True), fake.calls)
+        self.assertIn("计划任务历史记录启用成功", server.read_log_tail(app["id"], 20))
 
     def test_running_guard_can_be_stopped_through_task_scheduler(self):
         fake = self.fake_platform("running")
@@ -218,6 +284,64 @@ class ScheduledTaskStateTests(unittest.TestCase):
         task.Run.assert_not_called()
         task.Stop.assert_not_called()
 
+    @unittest.skipUnless(os.name == "nt", "Windows Event Log only")
+    def test_windows_adapter_reads_structured_task_history_without_messages(self):
+        from localops.platform import windows as windows_platform
+
+        platform = object.__new__(windows_platform.WindowsPlatform)
+        config_handle = mock.Mock()
+        query_handle = mock.Mock()
+        event_handle = mock.Mock()
+        xml = (
+            "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>"
+            "<System><EventID>102</EventID><Level>4</Level>"
+            "<TimeCreated SystemTime='2026-08-23T01:02:03.1234567Z'/>"
+            "<EventRecordID>77</EventRecordID></System>"
+            "<EventData><Data Name='TaskName'>\\Memos-Guard</Data>"
+            "<Data Name='InstanceId'>{run}</Data>"
+            "<Data Name='ResultCode'>1</Data></EventData></Event>"
+        )
+        with mock.patch.object(
+                windows_platform.win32evtlog, "EvtOpenChannelConfig",
+                return_value=config_handle), mock.patch.object(
+                windows_platform.win32evtlog, "EvtGetChannelConfigProperty",
+                return_value=(False, 13)), mock.patch.object(
+                windows_platform.win32evtlog, "EvtQuery",
+                return_value=query_handle) as query, mock.patch.object(
+                windows_platform.win32evtlog, "EvtNext",
+                side_effect=[(event_handle,), ()]), mock.patch.object(
+                windows_platform.win32evtlog, "EvtRender", return_value=xml):
+            snapshot = platform.scheduled_task_events(TASK_PATH, 10)
+
+        self.assertIs(snapshot.status, ScanStatus.PARTIAL)
+        self.assertFalse(snapshot.history_enabled)
+        self.assertEqual(snapshot.events[0]["eventId"], 102)
+        self.assertEqual(snapshot.events[0]["resultCode"], 1)
+        self.assertEqual(snapshot.events[0]["taskName"], TASK_PATH)
+        self.assertIn(TASK_PATH, query.call_args.args[2])
+        event_handle.Close.assert_called_once_with()
+        query_handle.Close.assert_called_once_with()
+        config_handle.Close.assert_called_once_with()
+
+    @unittest.skipUnless(os.name == "nt", "Windows Event Log only")
+    def test_windows_adapter_enables_history_with_fixed_wevtutil_arguments(self):
+        from localops.platform import windows as windows_platform
+
+        platform = object.__new__(windows_platform.WindowsPlatform)
+        completed = SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        with mock.patch.object(
+                windows_platform.subprocess, "run", return_value=completed) as run:
+            result = platform.set_scheduled_task_history_enabled(True)
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.enabled)
+        args = run.call_args.args[0]
+        self.assertTrue(args[0].casefold().endswith(r"\system32\wevtutil.exe"))
+        self.assertEqual(args[1:], [
+            "sl", "Microsoft-Windows-TaskScheduler/Operational", "/e:true",
+        ])
+        self.assertNotIn("shell", run.call_args.kwargs)
+
 
 class ScheduledTaskHttpTests(unittest.TestCase):
     def setUp(self):
@@ -230,10 +354,23 @@ class ScheduledTaskHttpTests(unittest.TestCase):
                 run_scheduled_tasks=True,
                 stop_scheduled_tasks=True,
                 toggle_scheduled_tasks=True,
+                manage_scheduled_task_history=True,
             ),
             scheduled=ScheduledTaskSnapshot(
                 ScanStatus.OK, {TASK_PATH.casefold(): task_row("running")}
             ),
+            scheduled_events=ScheduledTaskEventSnapshot(
+                ScanStatus.OK,
+                events=({
+                    "eventId": 102,
+                    "recordId": 23,
+                    "timestamp": 1_787_210_040,
+                    "taskName": TASK_PATH,
+                    "resultCode": 1,
+                },),
+                history_enabled=False,
+            ),
+            scheduled_history_result=ScheduledTaskHistoryResult(True, True),
             scheduled_stop_result=ScheduledTaskRunResult(True, TASK_PATH),
         )
         self.platform_patch = mock.patch.object(server, "PLATFORM", self.platform)
@@ -312,6 +449,23 @@ class ScheduledTaskHttpTests(unittest.TestCase):
         self.assertIn("Windows 计划任务：\\Memos-Guard", body["text"])
         self.assertIn("状态：就绪", body["text"])
         self.assertIn("最近结果：失败 (0x00000001)", body["text"])
+        self.assertIn("任务已完成 (Event 102) · 结果 0x00000001", body["text"])
+        self.assertFalse(body["taskHistory"]["enabled"])
+
+    def test_history_endpoint_enables_windows_operational_log(self):
+        status, body, _ = self.harness.request(
+            "POST",
+            "/api/apps/deadbeef/scheduled-history",
+            {"enabled": True},
+            self.headers,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["enabled"])
+        self.assertIn(
+            ("set_scheduled_task_history_enabled", True), self.platform.calls
+        )
 
 
 class WindowsHealthTests(unittest.TestCase):

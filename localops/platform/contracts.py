@@ -71,9 +71,25 @@ class ScheduledTaskSnapshot:
 
 
 @dataclass(frozen=True)
+class ScheduledTaskEventSnapshot:
+    status: ScanStatus
+    events: tuple[dict[str, object], ...] = ()
+    history_enabled: bool | None = None
+    issues: tuple[PlatformIssue, ...] = ()
+
+
+@dataclass(frozen=True)
 class ScheduledTaskRunResult:
     ok: bool
     task_path: str
+    error: str | None = None
+    code: str | None = None
+
+
+@dataclass(frozen=True)
+class ScheduledTaskHistoryResult:
+    ok: bool
+    enabled: bool
     error: str | None = None
     code: str | None = None
 
@@ -235,6 +251,7 @@ class PlatformCapabilities:
     run_scheduled_tasks: bool = False
     stop_scheduled_tasks: bool = False
     toggle_scheduled_tasks: bool = False
+    manage_scheduled_task_history: bool = False
     monitor_docker: bool = False
     control_docker: bool = False
     manage_elevation_broker: bool = False
@@ -286,11 +303,17 @@ class PlatformBackend(Protocol):
     def current_process_group_id(self) -> int | None: ...
     def pid_alive(self, pid: int) -> bool: ...
     def scheduled_tasks(self, paths: set[str] | None = None) -> ScheduledTaskSnapshot: ...
+    def scheduled_task_events(
+        self, path: str, limit: int = 300,
+    ) -> ScheduledTaskEventSnapshot: ...
     def run_scheduled_task(self, path: str) -> ScheduledTaskRunResult: ...
     def stop_scheduled_task(self, path: str) -> ScheduledTaskRunResult: ...
     def set_scheduled_task_enabled(
         self, path: str, enabled: bool,
     ) -> ScheduledTaskRunResult: ...
+    def set_scheduled_task_history_enabled(
+        self, enabled: bool,
+    ) -> ScheduledTaskHistoryResult: ...
     def elevation_broker_status(self) -> ElevationBrokerStatus: ...
     def install_elevation_broker(
         self, password_record: Mapping[str, object],

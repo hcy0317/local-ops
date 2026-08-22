@@ -39,6 +39,32 @@ Use `kind: "service"` for a continuously running Guard. Use `kind: "task"` for a
 
 The state is one of `unknown`, `missing`, `disabled`, `queued`, `ready`, or `running`.
 
+## Logs and run history
+
+`GET /api/apps/{id}/logs?tail=300` combines three sources for a scheduled-task
+card:
+
+- Local Ops controller audit records for run, stop, enable, disable, and errors.
+- Structured events from `Microsoft-Windows-TaskScheduler/Operational`, including
+  trigger, task start, process creation, action start/completion, task completion,
+  PID, timestamp, and result code when present.
+- The current COM state, last run time, and last result.
+
+Local Ops parses event XML directly and supplies its own stable labels. It does
+not depend on localized rendered Event Log messages, so non-UTF console encodings
+cannot corrupt the log drawer. The target task definition and action command are
+never changed or wrapped, which means stdout/stderr still belong to the task's
+own script or program when it writes them.
+
+The response includes `taskHistory` metadata with `enabled`, `available`,
+`partial`, `eventCount`, and structured issues. When the Operational channel is
+disabled, the log drawer shows the retained historical records and an explicit
+`启用任务历史` action. `POST /api/apps/{id}/scheduled-history` with
+`{"enabled": true}` enables that Windows event channel using fixed `wevtutil`
+arguments; it does not modify any task registration. Events that occurred while
+history was disabled cannot be reconstructed, but future runs are recorded by
+Windows even when Local Ops is closed.
+
 ## Lifecycle boundary
 
 `POST /api/apps/{id}/start` with `{"expectedGeneration": null}` calls the Task Scheduler COM `Run` method. The registered task's security principal, run level, triggers, conditions, and multiple-instance policy remain authoritative.
@@ -49,4 +75,6 @@ The state is one of `unknown`, `missing`, `disabled`, `queued`, `ready`, or `run
 
 Deleting a card removes only Local Ops configuration and never stops, disables, or unregisters the Windows task. A completed Local Ops task whose authenticated runtime receipt is terminal may also be removed while protected runner-record cleanup continues in the background; this path never gains process-control authority.
 
-Capabilities are advertised independently as `monitor_scheduled_tasks`, `run_scheduled_tasks`, `stop_scheduled_tasks`, and `toggle_scheduled_tasks`.
+Capabilities are advertised independently as `monitor_scheduled_tasks`,
+`run_scheduled_tasks`, `stop_scheduled_tasks`, `toggle_scheduled_tasks`, and
+`manage_scheduled_task_history`.

@@ -7,6 +7,7 @@ import gc
 import hashlib
 import json
 import os
+import re
 import socket
 import stat
 import subprocess
@@ -15,7 +16,9 @@ import time
 import uuid
 import webbrowser
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import Literal, Mapping
+from xml.etree import ElementTree
 
 import ntsecuritycon
 import pythoncom
@@ -24,11 +27,13 @@ import pywintypes
 import win32api
 import win32con
 import win32event
+import win32evtlog
 import win32file
 import win32gui
 import win32pipe
 import win32process
 import win32security
+import win32ts
 import win32ui
 import winerror
 import win32com.client
@@ -94,6 +99,8 @@ from .contracts import (
     RuntimeIdentity,
     RuntimePaths,
     ScanStatus,
+    ScheduledTaskEventSnapshot,
+    ScheduledTaskHistoryResult,
     ScheduledTaskRunResult,
     ScheduledTaskSnapshot,
     StopResult,
@@ -108,6 +115,9 @@ _RUNNER_PREPARE_TIMEOUT = 10.0
 _MAX_CLEANUP_RECOVERY_ENTRIES = 256
 _RUNTIME_RECORD_NAMES = frozenset({"request.json", "token.bin", "receipt.json"})
 _CLEANUP_TOMBSTONE_PREFIX = ".cleanup-"
+_TASK_SCHEDULER_EVENT_CHANNEL = (
+    "Microsoft-Windows-TaskScheduler/Operational"
+)
 _EXE_ICON_SCRIPT = r'''$ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
 $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($env:LOCALOPS_ICON_SOURCE)
@@ -196,6 +206,7 @@ class WindowsPlatform:
         run_scheduled_tasks=True,
         stop_scheduled_tasks=True,
         toggle_scheduled_tasks=True,
+        manage_scheduled_task_history=True,
         monitor_docker=True,
         control_docker=True,
         manage_elevation_broker=True,
@@ -573,7 +584,8 @@ class WindowsPlatform:
         if not clauses:
             return []
         query = (
-            "SELECT ProcessId, Name, CommandLine FROM Win32_Process WHERE "
+            "SELECT ProcessId, Name, CommandLine, SessionId "
+            "FROM Win32_Process WHERE "
             + " OR ".join(clauses)
         )
         pythoncom.CoInitialize()
@@ -589,6 +601,7 @@ class WindowsPlatform:
                         "pid": int(item.ProcessId),
                         "name": str(item.Name or ""),
                         "command_line": str(item.CommandLine or ""),
+                        "session_id": int(item.SessionId),
                     })
                 except (AttributeError, TypeError, ValueError, pywintypes.error):
                     continue
@@ -616,16 +629,23 @@ class WindowsPlatform:
         processes: dict[int, dict[str, object]] = {}
         access_denied = False
         now = time.time()
+        current_session_id = win32ts.ProcessIdToSessionId(self.self_pid)
         for row in candidates:
+            pid = 0
+            command_line = ""
+            name = ""
+            session_id = -1
+            owner = None
             try:
                 pid = int(row.get("pid") or 0)
                 command_line = str(row.get("command_line") or "")
                 name = str(row.get("name") or "")
+                session_id = int(row.get("session_id") or 0)
                 haystack = (name + "\0" + command_line).casefold()
                 if pid <= 0 or not any(value in haystack for value in lowered):
                     continue
                 owner = self._process_owner_sid(pid)
-                if owner != self._sid:
+                if owner != self._sid and session_id != current_session_id:
                     continue
                 process = psutil.Process(pid)
                 info = process.as_dict(
@@ -642,11 +662,26 @@ class WindowsPlatform:
                     "comm": info.get("exe") or info.get("name") or name,
                     "args": command_line,
                     "ppid": int(info.get("ppid") or 0),
+                    "sessionId": session_id,
+                    "restricted": owner != self._sid,
                 }
             except psutil.NoSuchProcess:
                 continue
             except (psutil.AccessDenied, pywintypes.error, OSError):
                 access_denied = True
+                if pid > 0 and session_id == current_session_id and name:
+                    processes[pid] = {
+                        "owner": owner,
+                        "uid": None,
+                        "etime": None,
+                        "cpu": 0.0,
+                        "mem": 0.0,
+                        "comm": name,
+                        "args": command_line,
+                        "ppid": 0,
+                        "sessionId": session_id,
+                        "restricted": True,
+                    }
                 continue
             except (TypeError, ValueError) as exc:
                 return ProcessSnapshot(ScanStatus.FAILED, issues=(
@@ -975,6 +1010,199 @@ class WindowsPlatform:
             task = folder = registered = children = service = None
             gc.collect()
             pythoncom.CoUninitialize()
+
+    @staticmethod
+    def _scheduled_task_event_row(xml_text: str) -> dict[str, object]:
+        namespace = {"event": "http://schemas.microsoft.com/win/2004/08/events/event"}
+        root = ElementTree.fromstring(xml_text)
+        system = root.find("event:System", namespace)
+        if system is None:
+            raise ValueError("event has no System element")
+
+        def system_text(name: str) -> str:
+            node = system.find("event:%s" % name, namespace)
+            return str(node.text or "") if node is not None else ""
+
+        values = {}
+        event_data = root.find("event:EventData", namespace)
+        if event_data is not None:
+            for node in event_data.findall("event:Data", namespace):
+                name = str(node.attrib.get("Name") or "")
+                if name:
+                    values[name] = str(node.text or "")
+
+        time_node = system.find("event:TimeCreated", namespace)
+        system_time = str(
+            time_node.attrib.get("SystemTime") or ""
+        ) if time_node is not None else ""
+        timestamp = None
+        if system_time:
+            system_time = re.sub(
+                r"(\.\d{6})\d+(?=Z|[+-]\d{2}:\d{2}$)", r"\1", system_time
+            )
+            timestamp = int(datetime.fromisoformat(
+                system_time.replace("Z", "+00:00")
+            ).timestamp())
+
+        def integer_value(*names: str) -> int | None:
+            for name in names:
+                value = values.get(name)
+                if value:
+                    try:
+                        return int(value, 0)
+                    except ValueError:
+                        continue
+            return None
+
+        instance_id = (
+            values.get("InstanceId") or values.get("TaskInstanceId") or ""
+        )
+        return {
+            "eventId": int(system_text("EventID") or 0),
+            "recordId": int(system_text("EventRecordID") or 0),
+            "timestamp": timestamp,
+            "level": int(system_text("Level") or 0),
+            "taskName": values.get("TaskName") or "",
+            "instanceId": instance_id,
+            "actionName": values.get("ActionName") or "",
+            "resultCode": integer_value("ResultCode", "ErrorValue", "Result"),
+            "processId": integer_value("EnginePID", "ProcessID"),
+        }
+
+    @staticmethod
+    def _event_xpath_literal(value: str) -> str | None:
+        if "'" not in value:
+            return "'%s'" % value
+        if '"' not in value:
+            return '"%s"' % value
+        return None
+
+    def scheduled_task_events(
+            self, path: str, limit: int = 300) -> ScheduledTaskEventSnapshot:
+        normalized, _, _ = self._scheduled_task_parts(path)
+        limit = max(1, min(int(limit), 5000))
+        issues: list[PlatformIssue] = []
+        history_enabled = None
+        channel_config = query_handle = None
+        event_handles: tuple[object, ...] = ()
+        events: list[dict[str, object]] = []
+        try:
+            try:
+                channel_config = win32evtlog.EvtOpenChannelConfig(
+                    _TASK_SCHEDULER_EVENT_CHANNEL
+                )
+                enabled_value = win32evtlog.EvtGetChannelConfigProperty(
+                    channel_config, win32evtlog.EvtChannelConfigEnabled
+                )
+                history_enabled = bool(enabled_value[0])
+                if not history_enabled:
+                    issues.append(_issue(
+                        "scheduled_task_events", "history_disabled",
+                        "Windows 计划任务历史记录未启用",
+                        degrades=False,
+                    ))
+            except (OSError, pywintypes.error) as exc:
+                issues.append(_issue(
+                    "scheduled_task_events", "history_status_unavailable", str(exc),
+                    degrades=False,
+                ))
+
+            literal = self._event_xpath_literal(normalized)
+            xpath = (
+                "*[EventData[Data[@Name='TaskName']=%s]]" % literal
+                if literal is not None else "*"
+            )
+            query_handle = win32evtlog.EvtQuery(
+                _TASK_SCHEDULER_EVENT_CHANNEL,
+                win32evtlog.EvtQueryChannelPath
+                | win32evtlog.EvtQueryReverseDirection,
+                xpath,
+            )
+            scanned = 0
+            scan_limit = (
+                limit if literal is not None
+                else min(10000, max(1000, limit * 50))
+            )
+            while len(events) < limit and scanned < scan_limit:
+                try:
+                    event_handles = win32evtlog.EvtNext(
+                        query_handle, min(64, scan_limit - scanned)
+                    )
+                except pywintypes.error as exc:
+                    if getattr(exc, "winerror", None) == winerror.ERROR_NO_MORE_ITEMS:
+                        break
+                    raise
+                if not event_handles:
+                    break
+                scanned += len(event_handles)
+                for handle in event_handles:
+                    try:
+                        row = self._scheduled_task_event_row(
+                            win32evtlog.EvtRender(
+                                handle, win32evtlog.EvtRenderEventXml
+                            )
+                        )
+                    except (ElementTree.ParseError, TypeError, ValueError):
+                        continue
+                    finally:
+                        handle.Close()
+                    if str(row.get("taskName") or "").casefold() == normalized.casefold():
+                        events.append(row)
+                        if len(events) >= limit:
+                            break
+                event_handles = ()
+        except (OSError, pywintypes.error, ValueError) as exc:
+            issues.append(_issue(
+                "scheduled_task_events", "query_failed", str(exc),
+                degrades=False,
+            ))
+        finally:
+            for handle in event_handles:
+                handle.Close()
+            if query_handle is not None:
+                query_handle.Close()
+            if channel_config is not None:
+                channel_config.Close()
+        status = (
+            ScanStatus.FAILED if not events and any(
+                issue.code == "query_failed" for issue in issues
+            ) else ScanStatus.PARTIAL if issues else ScanStatus.OK
+        )
+        return ScheduledTaskEventSnapshot(
+            status, tuple(events), history_enabled, tuple(issues)
+        )
+
+    def set_scheduled_task_history_enabled(
+            self, enabled: bool) -> ScheduledTaskHistoryResult:
+        executable = os.path.join(
+            os.environ.get("SystemRoot") or r"C:\Windows",
+            "System32", "wevtutil.exe",
+        )
+        try:
+            completed = subprocess.run(
+                [
+                    executable, "sl", _TASK_SCHEDULER_EVENT_CHANNEL,
+                    "/e:%s" % ("true" if enabled else "false"),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=15,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return ScheduledTaskHistoryResult(
+                False, not enabled, str(exc), "SCHEDULED_TASK_HISTORY_UPDATE_FAILED"
+            )
+        if completed.returncode == 0:
+            return ScheduledTaskHistoryResult(True, enabled)
+        output = completed.stderr or completed.stdout
+        error = output.decode("mbcs", errors="replace").strip()
+        return ScheduledTaskHistoryResult(
+            False, not enabled, error or "wevtutil failed with exit %d" % completed.returncode,
+            "SCHEDULED_TASK_HISTORY_UPDATE_FAILED",
+        )
 
     def run_scheduled_task(self, path: str) -> ScheduledTaskRunResult:
         normalized, folder_path, name = self._scheduled_task_parts(path)

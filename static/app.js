@@ -481,7 +481,7 @@ function paletteActions() {
     },
     {
       icon: 'rocket',
-      title: '收藏程序',
+      title: '添加程序',
       hint: '启动台 · 管理员启动',
       run: () => {
         switchView('launchpad');
@@ -498,6 +498,7 @@ function paletteActions() {
     const isDocker = a.runtimeSource === 'dockerCompose'
       || a.runtimeSource === 'dockerContainer';
     const isElevated = a.runtimeSource === 'windowsElevationBroker';
+    const launchOnlyObserved = isElevated && running;
     const port = openableAppPort(a);
     const name = a.name || '未命名';
     const canToggle = intent.canManage
@@ -509,8 +510,9 @@ function paletteActions() {
       );
     if (canToggle) {
       items.push({
-        icon: running ? 'square' : 'play',
-        title: (running ? (isTask ? '中止 ' : '停止 ')
+        icon: launchOnlyObserved ? 'play' : running ? 'square' : 'play',
+        title: (launchOnlyObserved ? '再次启动 '
+          : running ? (isTask ? '中止 ' : '停止 ')
           : (isTask ? '运行 ' : '启动 ')) + name,
         hint: isTask ? '任务' : appPortHint(a),
         on: running,

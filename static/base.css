@@ -327,6 +327,8 @@
     grid-template-columns: repeat(6, minmax(36px, 1fr));
   }
   .modal-actions { flex-wrap: wrap; }
+  .import-mapping-row { grid-template-columns: minmax(0, 1fr); }
+  .import-mapping-row .import-mapping-remove { justify-self: end; }
 
   .port-discovery-head { align-items: flex-start; }
   .port-discovery-item {
@@ -455,6 +457,7 @@
   button:focus-visible,
   input:focus-visible,
   textarea:focus-visible,
+  select:focus-visible,
   a.icon-btn:focus-visible,
   [tabindex]:focus-visible {
     outline: 2px solid Highlight !important;
@@ -716,6 +719,14 @@
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   max-width: 260px;
 }
+.set-path-copy {
+  padding: 1px 0; border: 0; background: transparent; color: var(--ink-2);
+  text-align: right; cursor: copy;
+}
+.set-path-copy:hover:not(:disabled) { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.set-path-copy:disabled { cursor: default; color: var(--ink-4); }
+.set-info-wide { align-items: flex-start; }
+.set-info-wide > :last-child { max-width: 280px; text-align: right; line-height: 1.5; color: var(--ink-2); }
 
 .tips-text { margin: 0; font-size: 12px; line-height: 1.65; color: var(--ink-2); }
 .tips-ic { display: inline-flex; color: var(--amber); }

@@ -51,5 +51,35 @@ class JavaScriptBindingCheckTests(unittest.TestCase):
         self.assertIn("公共可调用导出", detail)
 
 
+class ProjectCheckScopeTests(unittest.TestCase):
+    def test_auto_scope_selects_common_and_only_the_native_platform(self):
+        self.assertEqual(
+            check_project.scopes_for_request("auto", "darwin"),
+            ("common", "macos"),
+        )
+        self.assertEqual(
+            check_project.scopes_for_request("auto", "win32"),
+            ("common", "windows"),
+        )
+        self.assertEqual(
+            check_project.scopes_for_request("auto", "linux"),
+            ("common",),
+        )
+
+    def test_platform_required_files_do_not_pull_foreign_runtime_artifacts(self):
+        common = check_project.required_files_for_scope("common")
+        macos = check_project.required_files_for_scope("macos")
+        windows = check_project.required_files_for_scope("windows")
+        self.assertNotIn("总控台.app/Contents/Info.plist", common)
+        self.assertNotIn("tools/build_windows.py", common)
+        self.assertIn("总控台.app/Contents/Info.plist", macos)
+        self.assertNotIn("requirements-windows.txt", macos)
+        self.assertIn("tools/build_windows.py", windows)
+        self.assertIn("requirements-build-windows.txt", windows)
+        self.assertIn("tests/windows/test_windows_package_smoke.py", windows)
+        self.assertIn("tests/windows/test_windows_packaging.py", windows)
+        self.assertNotIn("start.command", windows)
+
+
 if __name__ == "__main__":
     unittest.main()

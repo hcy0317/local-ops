@@ -5,12 +5,17 @@
 import { $, el, setText, setChildren, setKpi, setKpiUnit, icon, iconBtn, escapeHtml,
   post, del, act, toast, openLayer, closeLayer, reconcile,
   state, findApp, fmtUptime, fmtDuration, taskExitStatus,
-  localServiceUrl } from './core.js';
-import { openConfirm, openAppModal, openLogs, getIconVer } from './overlays.js';
+  localServiceUrl, hasCapability, platformPresentation,
+  currentPlatform } from './core.js';
+import { openConfirm, openAppModal, openLogs, getIconVer,
+  refreshLifecycleState, offerForceStopAfterTimeout,
+  openBrokerPassword } from './overlays.js';
 import { configuredPort, actualPorts, hasPortMismatch,
   preferredOpenPort, displayedPorts, portIsOpenable } from './ports.js';
+import { lifecyclePayload, lifecycleSnapshot, runLifecycleMutation } from './lifecycle.js';
 
 const svcGrid = $('#svcGrid'), taskGrid = $('#taskGrid');
+const programGrid = $('#programGrid');
 const reorderStatus = $('#reorderStatus');
 /* ---------------- 图标取色光晕 ---------------- */
 function hueFromString(s) {
@@ -160,15 +165,17 @@ function createAppCard() {
   bDiag.hidden = true;
   const bRestart = iconBtn('refresh-cw', '重启应用');
   bRestart.hidden = true;
+  const bSchedule = iconBtn('power', '启用或禁用计划任务');
+  bSchedule.hidden = true;
   const bEdit = iconBtn('pencil', '编辑');
   const bDel = iconBtn('trash-2', '删除', 'danger');
-  sub.append(bCopy, bLogs, bDiag, bRestart, bEdit, bDel);
+  sub.append(bCopy, bLogs, bDiag, bRestart, bSchedule, bEdit, bDel);
   actions.append(primary, sub);
 
   card.append(head, cmd, actions);
   card._r = { iconBox, iconImg, iconGlyph, iconTxt, name, status, dot,
     stText, stPort, stUp, taskHistory, cmd, primary, copy: bCopy, logs: bLogs,
-    diag: bDiag, restart: bRestart, edit: bEdit, del: bDel };
+    diag: bDiag, restart: bRestart, schedule: bSchedule, edit: bEdit, del: bDel };
 
   const id = () => card.dataset.key;
   primary.addEventListener('click', () => toggleApp(id(), primary));
@@ -202,19 +209,31 @@ function createAppCard() {
     const a = findApp(id());
     if (a) confirmRestartApp(a);
   });
+  bSchedule.addEventListener('click', () => {
+    const a = findApp(id());
+    if (a) setScheduledTaskEnabled(a, bSchedule);
+  });
   bEdit.addEventListener('click', () => { const a = findApp(id()); if (a) openAppModal(a); });
   bDel.addEventListener('click', () => { const a = findApp(id()); if (a) confirmDeleteApp(a); });
   return card;
 }
 
 /* 主按钮：服务 = 启动/停止；批处理 = 运行/中止。 */
-function setPrimary(btn, running, kind) {
-  const sig = running + '|' + kind;
+function setPrimary(btn, running, kind, lifecycleState = '') {
+  const sig = running + '|' + kind + '|' + lifecycleState;
   if (btn._sig === sig) return;
   btn._sig = sig;
-  const label = running ? (kind === 'task' ? '中止' : '停止')
-    : (kind === 'task' ? '运行' : '启动');
-  setChildren(btn, icon(running ? 'square' : 'play', 13));
+  const label = lifecycleState === 'starting' ? '启动中'
+    : lifecycleState === 'stopping' ? '停止中'
+      : lifecycleState === 'authorize' ? '解锁'
+        : lifecycleState === 'unavailable' ? '不可用'
+        : running ? (kind === 'task' ? '中止' : '停止')
+          : (kind === 'task' ? '运行' : '启动');
+  const glyph = lifecycleState === 'starting' || lifecycleState === 'stopping'
+    ? 'clock' : lifecycleState === 'authorize' ? 'wrench'
+      : lifecycleState === 'unavailable' ? 'power'
+      : running ? 'square' : 'play';
+  setChildren(btn, icon(glyph, 13));
   btn.appendChild(document.createTextNode(label));
   btn.classList.toggle('btn-stop', running);
   btn.classList.toggle('btn-accent', !running);
@@ -269,6 +288,13 @@ function updateAppCard(card, app) {
   /* 状态副行：运行态、端口冲突，以及服务/任务上次退出结果。 */
   const kind = app.kind || 'service';
   const isTask = kind === 'task';
+  const isScheduled = app.runtimeSource === 'windowsTaskScheduler';
+  const isDocker = app.runtimeSource === 'dockerCompose'
+    || app.runtimeSource === 'dockerContainer';
+  const isElevated = app.runtimeSource === 'windowsElevationBroker';
+  const scheduledState = isScheduled && app.scheduledTask
+    ? app.scheduledTask.state : '';
+  const lifecycle = lifecycleSnapshot(app, currentPlatform());
   const taskStatus = isTask && app.lastExit ? taskExitStatus(app.lastExit) : '';
   const taskFinished = isTask && !app.running && !!app.lastExit;
   const taskFailed = taskFinished && taskStatus === 'failed';
@@ -277,14 +303,50 @@ function updateAppCard(card, app) {
     ? app.health.issues : [];
   const healthIssue = app.health && app.health.blocking && healthIssues.length
     ? healthIssues[0] : null;
+  const compatibility = app.platformCompatibility || null;
+  const compatibilityStatus = compatibility && compatibility.status;
+  const platformBlocked = currentPlatform() === 'windows'
+    && (compatibilityStatus === 'needs_review' || compatibilityStatus === 'blocked');
   const portMismatch = hasPortMismatch(app);
   r.dot.classList.toggle('running', !!app.running);
   r.dot.classList.toggle('success', taskSucceeded);
-  r.dot.classList.toggle('danger', taskFailed);
+  r.dot.classList.toggle('danger', taskFailed || lifecycle.uncertain);
   let stTxt = app.running ? '运行中' : (app.port ? '已停止' : '未运行');
   let stFail = false;
   let taskHistoryText = '';
-  if (app.portConflict) {
+  if (isScheduled && scheduledState === 'running') {
+    stTxt = '运行中 · Windows 计划任务';
+  } else if (isScheduled && scheduledState === 'ready') {
+    stTxt = isTask ? '就绪 · 等待运行' : '计划任务就绪';
+  } else if (isScheduled && scheduledState === 'queued') {
+    stTxt = '已排队 · Windows 计划任务';
+  } else if (isScheduled && scheduledState === 'disabled') {
+    stTxt = '计划任务已禁用';
+    stFail = true;
+  } else if (isScheduled && scheduledState === 'missing') {
+    stTxt = '计划任务不存在';
+    stFail = true;
+  } else if (isDocker && app.running) {
+    stTxt = '运行中 · ' + (app.runtimeSource === 'dockerCompose'
+      ? 'Docker Compose' : 'Docker 容器');
+  } else if (isDocker && lifecycle.status === 'stopped') {
+    stTxt = '已停止 · ' + (app.runtimeSource === 'dockerCompose'
+      ? 'Docker Compose' : 'Docker 容器');
+  } else if (isElevated && !app.controlAvailable) {
+    stTxt = app.elevationBroker && app.elevationBroker.installed
+      ? '等待本次会话解锁' : '管理员代理未安装';
+    stFail = true;
+  } else if (lifecycle.status === 'starting') {
+    stTxt = '启动中';
+  } else if (lifecycle.status === 'stopping') {
+    stTxt = '停止中';
+  } else if (lifecycle.status === 'orphaned') {
+    stTxt = '运行身份无法验证';
+    stFail = true;
+  } else if (lifecycle.status === 'unknown') {
+    stTxt = '运行状态待确认';
+    stFail = true;
+  } else if (app.portConflict) {
     stTxt = '配置冲突';
     stFail = true;
   } else if (app.portOccupied) {
@@ -297,6 +359,9 @@ function updateAppCard(card, app) {
     stTxt = '等待端口';
   } else if (!app.running && healthIssue) {
     stTxt = healthIssue.title || '配置不可用';
+    stFail = true;
+  } else if (!app.running && platformBlocked) {
+    stTxt = compatibilityStatus === 'blocked' ? '当前平台不可用' : '命令需复核';
     stFail = true;
   } else if (taskFinished && (taskStatus === 'canceled' || taskStatus === 'stopped')) {
     stTxt = taskStatus === 'canceled' ? '已取消' : '已中止';
@@ -376,43 +441,125 @@ function updateAppCard(card, app) {
     r.stUp.hidden = true;
     setText(r.stUp, '');
   }
-  setPrimary(r.primary, !!app.running, kind);
+  const needsBrokerAccess = isElevated && !lifecycle.canStart;
+  const primaryState = needsBrokerAccess ? 'authorize' : lifecycle.busy ? lifecycle.status
+    : lifecycle.uncertain || (!lifecycle.canStart && !lifecycle.canManage)
+      ? 'unavailable' : '';
+  setPrimary(r.primary, !!app.running, kind, primaryState);
   const appName = app.name || (isTask ? '任务' : '应用');
-  const primaryVerb = app.running ? (isTask ? '中止' : '停止')
-    : (isTask ? '运行' : '启动');
+  const primaryVerb = primaryState === 'starting' ? '启动中'
+    : primaryState === 'stopping' ? '停止中'
+      : primaryState === 'authorize' ? '解锁管理员启动'
+        : primaryState === 'unavailable' ? '控制不可用'
+        : app.running ? (isTask ? '中止' : '停止')
+          : (isTask ? '运行' : '启动');
   r.primary.setAttribute('aria-label', primaryVerb + ' ' + appName);
   r.copy.setAttribute('aria-label', '复制 ' + appName + ' 的链接');
   r.logs.setAttribute('aria-label', (taskFailed ? '查看失败日志：' : '查看日志：') + appName);
   r.diag.setAttribute('aria-label',
     (isTask ? '配置与运行诊断：' : '配置与启动诊断：') + appName);
   r.restart.setAttribute('aria-label', '重启 ' + appName);
+  const scheduledEnabled = !!(app.scheduledTask && app.scheduledTask.enabled);
+  const scheduleVerb = scheduledEnabled ? '禁用' : '启用';
+  r.schedule.setAttribute('aria-label', scheduleVerb + '计划任务 ' + appName);
   r.edit.setAttribute('aria-label', '编辑 ' + appName);
   r.del.setAttribute('aria-label', '删除 ' + appName);
   card.setAttribute('aria-label', appName + '，' + stTxt);
-  r.restart.hidden = !app.running || kind !== 'service';
-  const blocked = !app.running &&
-    (!!app.portConflict || !!app.portOccupied || !!healthIssue);
+  const canLaunch = hasCapability(
+    isElevated ? 'launch_elevated' : isDocker ? 'control_docker'
+      : isScheduled ? 'run_scheduled_tasks' : 'launch_managed'
+  );
+  const canStop = hasCapability(
+    isElevated ? 'launch_elevated' : isDocker ? 'control_docker'
+      : isScheduled ? 'stop_scheduled_tasks' : 'stop_managed'
+  );
+  const canBrokerAccess = needsBrokerAccess
+    && hasCapability('manage_elevation_broker');
+  const canToggle = canBrokerAccess ? true : lifecycle.canManage ? canStop
+    : lifecycle.canStart ? canLaunch : false;
+  r.restart.hidden = isScheduled || isDocker || isElevated || !lifecycle.canManage
+    || kind !== 'service' || !canStop || !canLaunch;
+  r.schedule.hidden = !isScheduled || scheduledState === 'missing';
+  r.schedule.disabled = !app.scheduledTaskControlAvailable
+    || !hasCapability('toggle_scheduled_tasks');
+  r.schedule.title = r.schedule.disabled
+    ? '当前计划任务不可修改' : scheduleVerb + '计划任务';
+  r.schedule.classList.toggle('active', isScheduled && scheduledEnabled);
+  r.del.disabled = !lifecycle.canDelete
+    || (!isScheduled && !isDocker && !isElevated && lifecycle.canManage && !canStop);
+  r.del.title = r.del.disabled ? platformPresentation().lifecycleNotice : '删除';
+  const blocked = !canToggle || (!needsBrokerAccess && !app.running &&
+    (!!app.portConflict || !!app.portOccupied || !!healthIssue || platformBlocked));
   r.primary.disabled = blocked;
-  r.primary.title = app.portConflict
+  const compatibilityReason = compatibility && Array.isArray(compatibility.reasons)
+    ? compatibility.reasons.map(reason => reason && reason.message).filter(Boolean).join('；')
+    : '';
+  const runtimeIssue = app.runtimeIssue && (app.runtimeIssue.message || app.runtimeIssue.detail);
+  r.primary.title = !canToggle ? runtimeIssue || platformPresentation().lifecycleNotice
+    : app.portConflict
     ? '端口配置重复，请先编辑其中一项'
     : app.portOccupied ? '端口已被其他进程占用；可打开端口诊断或修改当前卡片端口'
-      : healthIssue ? healthIssue.detail || healthIssue.title : '';
+      : healthIssue ? healthIssue.detail || healthIssue.title
+        : platformBlocked ? compatibilityReason || '请先完成当前平台兼容性复核' : '';
   const launchFailed = !app.running && !!app.lastExit
     && (isTask ? taskStatus === 'failed' : app.lastExit.code !== 0);
   card.classList.toggle('running', !!app.running);
   card.classList.toggle('has-error', !!app.portConflict || !!app.portOccupied
-    || portMismatch || launchFailed || !!healthIssue);
-  r.diag.hidden = !launchFailed && !healthIssue;
+    || portMismatch || launchFailed || !!healthIssue || lifecycle.uncertain);
+  r.diag.hidden = !launchFailed && !healthIssue && !lifecycle.uncertain;
   updateCardGlow(card, app);
   r.logs.classList.toggle('attention', taskFailed);
   r.logs.title = taskFailed ? '查看失败日志' : '日志';
   maybeFetchFavicon(card, app);
 }
 
-async function toggleApp(id, button) {
+async function setScheduledTaskEnabled(app, button) {
+  if (!app.scheduledTaskControlAvailable
+      || !hasCapability('toggle_scheduled_tasks')) {
+    toast('当前平台未启用 Windows 计划任务启禁用');
+    return;
+  }
+  const enabled = !(app.scheduledTask && app.scheduledTask.enabled);
+  button.disabled = true;
+  try {
+    const result = await act(post(
+      '/api/apps/' + app.id + '/scheduled-enabled', { enabled },
+    ));
+    await refreshLifecycleState(result);
+    if (result && result.ok !== false) {
+      toast((enabled ? '已启用 ' : '已禁用 ') + (app.name || '计划任务'));
+    }
+  } finally {
+    const latest = findApp(app.id);
+    button.disabled = !latest || !latest.scheduledTaskControlAvailable
+      || !hasCapability('toggle_scheduled_tasks');
+  }
+}
+
+async function toggleApp(id, button, capturedIntent) {
   const app = findApp(id);
   if (!app) return;
   const isTask = (app.kind || 'service') === 'task';
+  const isScheduled = app.runtimeSource === 'windowsTaskScheduler';
+  const isDocker = app.runtimeSource === 'dockerCompose'
+    || app.runtimeSource === 'dockerContainer';
+  const isElevated = app.runtimeSource === 'windowsElevationBroker';
+  const intent = capturedIntent || lifecycleSnapshot(app, currentPlatform());
+  const starting = intent.status === 'stopped';
+  if (isElevated && !intent.canStart) {
+    openBrokerPassword();
+    return;
+  }
+  const capability = starting ? 'launch_managed' : 'stop_managed';
+  const effectiveCapability = isElevated ? 'launch_elevated'
+    : isDocker ? 'control_docker' : isScheduled
+    ? (starting ? 'run_scheduled_tasks' : 'stop_scheduled_tasks')
+    : capability;
+  if ((!starting && !intent.canManage) || (starting && !intent.canStart)
+      || !hasCapability(effectiveCapability)) {
+    toast(platformPresentation().lifecycleNotice);
+    return;
+  }
   if (button && button.dataset.busy === 'true') return;
   if (!app.running && app.portConflict) {
     toast('端口配置重复，请先编辑其中一项');
@@ -422,7 +569,6 @@ async function toggleApp(id, button) {
     toast('端口已被 PID ' + (app.portOccupiedPid || '?') + ' 占用');
     return;
   }
-  const starting = !app.running;
   if (button) {
     button.dataset.busy = 'true';
     button.disabled = true;
@@ -432,28 +578,53 @@ async function toggleApp(id, button) {
     ? (isTask ? '正在运行 ' : '正在启动 ') + targetName + '…'
     : (isTask ? '正在中止 ' : '正在停止 ') + targetName + '…');
   try {
-    const result = await act(post('/api/apps/' + id + '/' + (starting ? 'start' : 'stop')));
+    const { result, stateIsFresh } = await runLifecycleMutation(
+      () => act(post(
+        '/api/apps/' + id + '/' + (starting ? 'start' : 'stop'),
+        lifecyclePayload(intent, starting ? {} : { force: false }),
+      )),
+      refreshLifecycleState,
+    );
     if (result && result.ok !== false) {
       if (starting) {
-        toast(isTask
-          ? targetName + '已开始运行'
-          : '启动命令已执行，正在等待' + (app.port ? ' :' + app.port : '服务'));
-        await window.__poll();
-        setTimeout(window.__poll, 700);
-        setTimeout(window.__poll, 1800);
+        toast(isElevated
+          ? '已通过管理员代理启动 ' + targetName
+          : isTask
+            ? targetName + '已开始运行'
+            : '启动命令已执行，正在等待' + (app.port ? ' :' + app.port : '服务'));
+        if (!isElevated) {
+          setTimeout(window.__poll, 700);
+          setTimeout(window.__poll, 1800);
+        }
       } else {
-        await window.__poll();
         toast((isTask ? '已中止 ' : '已停止 ') + targetName);
       }
-    } else {
-      await window.__poll();
+    } else if (!starting) {
+      offerForceStopAfterTimeout(result, intent, id, targetName, stateIsFresh);
     }
   } finally {
     if (button) {
       delete button.dataset.busy;
       const latest = findApp(id);
-      button.disabled = !!(latest && !latest.running &&
-        (latest.portConflict || latest.portOccupied ||
+      const latestLifecycle = lifecycleSnapshot(latest, currentPlatform());
+      const latestScheduled = latest
+        && latest.runtimeSource === 'windowsTaskScheduler';
+      const latestDocker = latest && (
+        latest.runtimeSource === 'dockerCompose'
+        || latest.runtimeSource === 'dockerContainer'
+      );
+      const latestElevated = latest
+        && latest.runtimeSource === 'windowsElevationBroker';
+      const latestCapability = latestElevated ? 'launch_elevated'
+        : latestDocker ? 'control_docker' : latestScheduled
+        ? (latestLifecycle.canManage ? 'stop_scheduled_tasks' : 'run_scheduled_tasks')
+        : latestLifecycle.canManage ? 'stop_managed' : 'launch_managed';
+      const latestCompatibility = latest && latest.platformCompatibility;
+      const incompatible = currentPlatform() === 'windows' && latestCompatibility &&
+        (latestCompatibility.status === 'needs_review' || latestCompatibility.status === 'blocked');
+      button.disabled = !latest || (!latestLifecycle.canManage && !latestLifecycle.canStart)
+        || !hasCapability(latestCapability) || !!(!latest.running &&
+        (latest.portConflict || latest.portOccupied || incompatible ||
           (latest.health && latest.health.blocking)));
     }
   }
@@ -461,28 +632,71 @@ async function toggleApp(id, button) {
 export { toggleApp };
 
 function confirmRestartApp(app) {
+  const intent = lifecycleSnapshot(app, currentPlatform());
+  if (!intent.canManage || !hasCapability('stop_managed') || !hasCapability('launch_managed')) {
+    toast(platformPresentation().lifecycleNotice);
+    return;
+  }
   openConfirm({
     title: '重启应用',
     bodyHtml: '确定要重启 <b>' + escapeHtml(app.name || '') + '</b> 吗？' +
       '<div class="confirm-detail">总控台会等待旧进程完全退出，然后使用当前配置重新启动。</div>',
     okText: '重新启动',
     onOk: async () => {
-      const r = await act(post('/api/apps/' + app.id + '/restart'));
-      if (r && r.ok !== false) toast('已重启 ' + (app.name || '应用'));
-      window.__poll();
+      if (!intent.canManage || !hasCapability('stop_managed') || !hasCapability('launch_managed')) {
+        toast(platformPresentation().lifecycleNotice);
+        return;
+      }
+      const { result: r, stateIsFresh } = await runLifecycleMutation(
+        () => act(post('/api/apps/' + app.id + '/restart', lifecyclePayload(intent))),
+        refreshLifecycleState,
+      );
+      if (r && r.ok !== false) {
+        toast('已重启 ' + (app.name || '应用'));
+      } else {
+        offerForceStopAfterTimeout(r, intent, app.id, app.name, stateIsFresh, () => {
+          toast('已强制停止，请再次启动应用');
+        });
+      }
     },
   });
 }
 
 function confirmDeleteApp(app) {
+  const intent = lifecycleSnapshot(app, currentPlatform());
+  const isScheduled = app.runtimeSource === 'windowsTaskScheduler';
+  const isDocker = app.runtimeSource === 'dockerCompose'
+    || app.runtimeSource === 'dockerContainer';
+  const isElevated = app.runtimeSource === 'windowsElevationBroker';
+  if (!intent.canDelete || (!isScheduled && !isDocker && !isElevated && intent.canManage
+      && !hasCapability('stop_managed'))) {
+    toast(platformPresentation().lifecycleNotice);
+    return;
+  }
   openConfirm({
     title: '删除应用',
     bodyHtml: '确定要删除 <b>' + escapeHtml(app.name || '') + '</b> 吗？' +
-      '<div class="confirm-detail">将先停止该应用，并删除其图标与日志。</div>',
+      '<div class="confirm-detail">' + (isScheduled
+        ? '只删除监控卡片，不会停止或删除 Windows 计划任务。'
+        : isDocker ? '只删除收藏卡片，不会停止或删除 Docker 资源。'
+        : isElevated ? '只删除程序收藏，不会卸载管理员启动代理。'
+        : (app.running ? '将先停止该应用，并' : '将') + '删除其图标与日志。') + '</div>',
     okText: '删除',
     onOk: async () => {
-      await act(del('/api/apps/' + app.id));
-      window.__poll();
+      if (!intent.canDelete || (!isScheduled && !isDocker && !isElevated && intent.canManage
+          && !hasCapability('stop_managed'))) {
+        toast(platformPresentation().lifecycleNotice);
+        return;
+      }
+      const { result, stateIsFresh } = await runLifecycleMutation(
+        () => act(del('/api/apps/' + app.id, lifecyclePayload(intent))),
+        refreshLifecycleState,
+      );
+      if (intent.canManage && !isScheduled && !isDocker && !isElevated) {
+        offerForceStopAfterTimeout(result, intent, app.id, app.name, stateIsFresh, () => {
+          toast('已强制停止，请再次确认删除');
+        });
+      }
     },
   });
 }
@@ -512,6 +726,8 @@ function setDiagRow(row, node, value) {
 function openPortDiagnostic(app) {
   diagCurrentApp = app;
   const owner = app.portOwner || null;
+  const managedOwner = owner && owner.appId ? findApp(owner.appId) : null;
+  const ownerLifecycle = lifecycleSnapshot(managedOwner, currentPlatform());
   const conflict = !!app.portConflict;
   const occupied = !!app.portOccupied;
   portDiagTitle.textContent = '端口 ' + (app.port || '--') + ' 诊断';
@@ -536,7 +752,14 @@ function openPortDiagnostic(app) {
     diagNote.textContent = '该端口属于当前总控台。你可以修改当前卡片端口，不能在这里结束总控台。';
   } else if (owner && owner.currentUser) {
     const ownerLabel = owner.project || owner.appName || owner.name || ('PID ' + owner.pid);
-    diagNote.textContent = owner.appId
+    const canControlOwner = owner.appId
+      ? hasCapability('stop_managed') && ownerLifecycle.canManage
+      : hasCapability('kill_external');
+    const canAttach = hasCapability('attach_external');
+    diagNote.textContent = !canControlOwner && !canAttach
+      ? '当前平台仅展示监听者“' + ownerLabel + '”。你可以创建未认领的启动卡片、' +
+        '打开服务或修改当前卡片端口；' + platformPresentation().lifecycleNotice
+      : owner.appId
       ? '端口正在由另一个受管应用“' + ownerLabel +
         '”使用。两张卡片可以保存相同端口；若要现在启动当前项目，请等待它停止、' +
         '修改当前项目端口，或确认后停止占用应用。'
@@ -550,10 +773,14 @@ function openPortDiagnostic(app) {
     diagNote.textContent = '暂时无法读取占用者详情，可稍后刷新重试。';
   }
   diagOpen.hidden = !(occupied && owner && app.port);
-  diagAttach.hidden = !(occupied && owner && owner.currentUser && !owner.appId
+  diagAttach.hidden = !hasCapability('attach_external')
+    || !(occupied && owner && owner.currentUser && !owner.appId
     && owner.pid !== (state.data && state.data.consolePid));
   diagEdit.hidden = !(conflict || occupied);
-  diagKill.hidden = !(occupied && owner && owner.currentUser
+  const canControlOwner = owner && owner.appId
+    ? hasCapability('stop_managed') && ownerLifecycle.canManage
+    : hasCapability('kill_external');
+  diagKill.hidden = !canControlOwner || !(occupied && owner && owner.currentUser
     && owner.pid !== (state.data && state.data.consolePid));
   diagKill.textContent = owner && owner.appId ? '停止占用应用' : '结束占用进程';
   openLayer(portDiagMask, diagClose);
@@ -581,6 +808,10 @@ diagEdit.addEventListener('click', () => {
   openAppModal(app);
 });
 diagAttach.addEventListener('click', () => {
+  if (!hasCapability('attach_external')) {
+    toast(platformPresentation().lifecycleNotice);
+    return;
+  }
   const app = diagCurrentApp;
   const owner = app && app.portOwner;
   if (!app || !owner) return;
@@ -593,6 +824,10 @@ diagAttach.addEventListener('click', () => {
       '若卡片目录与进程实际目录不一致，会自动同步为实际目录。</div>',
     okText: '认领',
     onOk: async () => {
+      if (!hasCapability('attach_external')) {
+        toast(platformPresentation().lifecycleNotice);
+        return;
+      }
       const r = await act(post('/api/apps/' + app.id + '/attach', { pid: owner.pid }));
       if (r && r.ok) {
         toast(r.cwdUpdated ? '已认领，卡片目录已同步为进程实际目录' : '已认领为本卡片');
@@ -624,6 +859,13 @@ diagKill.addEventListener('click', () => {
   const app = diagCurrentApp;
   const owner = app && app.portOwner;
   if (!owner) return;
+  const capability = owner.appId ? 'stop_managed' : 'kill_external';
+  const managedApp = owner.appId ? findApp(owner.appId) : null;
+  const intent = lifecycleSnapshot(managedApp, currentPlatform());
+  if (!hasCapability(capability) || (owner.appId && !intent.canManage)) {
+    toast(platformPresentation().lifecycleNotice);
+    return;
+  }
   closePortDiagnostic();
   openConfirm({
     title: owner.appId ? '停止占用应用' : '结束占用进程',
@@ -632,9 +874,29 @@ diagKill.addEventListener('click', () => {
       ' · ' + escapeHtml(owner.name || '') + '</div>',
     okText: owner.appId ? '停止应用' : '结束进程',
     onOk: async () => {
-      if (owner.appId) await act(post('/api/apps/' + owner.appId + '/stop'));
-      else await act(post('/api/kill', { pid: owner.pid, force: false }));
-      window.__poll();
+      if (!hasCapability(capability) || (owner.appId && !intent.canManage)) {
+        toast(platformPresentation().lifecycleNotice);
+        return;
+      }
+      if (owner.appId) {
+        const { result, stateIsFresh } = await runLifecycleMutation(
+          () => act(post(
+            '/api/apps/' + owner.appId + '/stop',
+            lifecyclePayload(intent, { force: false }),
+          )),
+          refreshLifecycleState,
+        );
+        offerForceStopAfterTimeout(
+          result,
+          intent,
+          owner.appId,
+          (managedApp && managedApp.name) || owner.appName,
+          stateIsFresh,
+        );
+      } else {
+        await act(post('/api/kill', { pid: owner.pid, force: false }));
+        window.__poll();
+      }
     },
   });
 });
@@ -982,16 +1244,21 @@ function finishKeyboardSort(commit) {
 
 export function renderLaunchpad(apps, firstRender) {
   if (drag || keyboardSort) return;  // 排序中轮询不打乱 DOM
-  const svcs = apps.filter(a => (a.kind || 'service') !== 'task');
+  const svcs = apps.filter(a => (a.kind || 'service') === 'service');
   const tasks = apps.filter(a => a.kind === 'task');
+  const programs = apps.filter(a => a.kind === 'program');
   const addSvc = $('#addSvcCard');
   const addTask = $('#addTaskCard');
+  const addProgram = $('#addProgramCard');
   addSvc.remove();
   addTask.remove();
+  addProgram.remove();
   reconcile(svcGrid, svcs, a => a.id, createAppCard, updateAppCard, firstRender);
   svcGrid.prepend(addSvc);                  // 新增入口始终优先可见
   reconcile(taskGrid, tasks, a => a.id, createAppCard, updateAppCard, firstRender);
   taskGrid.prepend(addTask);                // 批处理新增入口始终优先可见
+  reconcile(programGrid, programs, a => a.id, createAppCard, updateAppCard, firstRender);
+  programGrid.prepend(addProgram);
   renderLpKpi(apps, svcs, tasks);
   latestSvcs = svcs;
   latestTasks = tasks;
@@ -999,6 +1266,7 @@ export function renderLaunchpad(apps, firstRender) {
   syncTaskFilterUI();
   setText($('#svcSecCount'), svcs.length ? String(svcs.length) : '');
   setText($('#taskSecCount'), tasks.length ? String(tasks.length) : '');
+  setText($('#programSecCount'), programs.length ? String(programs.length) : '');
 }
 
 function syncSvcFilterUI() {

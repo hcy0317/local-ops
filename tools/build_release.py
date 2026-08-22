@@ -44,6 +44,7 @@ INCLUDE = (
     "licenses",
     *REQUIRED_LICENSES,
     "server.py",
+    "localops",
     "start.command",
     "总控台.app",
     "static",
@@ -51,6 +52,8 @@ INCLUDE = (
     "tests",
     "tools",
     "requirements-dev.txt",
+    "requirements-build-windows.txt",
+    "requirements-windows.txt",
     "Makefile",
 )
 EXCLUDED_PARTS = {

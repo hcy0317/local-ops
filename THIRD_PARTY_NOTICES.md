@@ -47,3 +47,16 @@ OFL 1.1 允许字体与软件一同捆绑和再分发，前提是每份副本包
 ## 开发期工具
 
 `tools/gen_brand_assets.py` 使用 `requirements-dev.txt` 精确锁定的 Pillow，并调用 macOS 自带的 `iconutil`；`tools/gen_icons.py` 由 vendored Lucide SVG 重新生成 `static/icons.js`。这些工具只用于重新生成已入库资源，不随总控台运行，也不是运行时依赖。更新版本时必须重新核对各自上游许可和来源记录。
+
+## Windows runtime dependencies
+
+Windows 源码运行从 Python package index 安装下列精确锁定依赖；它们未以源码副本 vendored 到本仓库。Windows 打包阶段必须把对应发行版许可文件纳入最终产物并重新核对版本。
+
+- `psutil` 7.2.2 — <https://github.com/giampaolo/psutil> — BSD 3-Clause License。
+- `pywin32` 312 — <https://github.com/mhammond/pywin32> — Python Software Foundation License，并包含上游声明的组件许可。
+
+Windows self-contained 构建使用 build-only `PyInstaller` 6.21.0 —
+<https://pyinstaller.org/> — GPL-2.0-or-later，并适用上游 bootloader
+exception。构建脚本会从精确安装的 Python、psutil、pywin32 和 PyInstaller
+distributions 收集各自许可文件到 `THIRD-PARTY-LICENSES/`；这些许可文件是
+Windows ZIP 审计的必需内容，不依赖开发机上的全局包。

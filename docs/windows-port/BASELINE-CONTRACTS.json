@@ -1,0 +1,107 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "a5c3adae1f1fa0bd9f0ac7b090ec422e285d0c0f",
+  "config": {
+    "currentSchemaVersion": 1,
+    "default": {
+      "schemaVersion": 1,
+      "apps": [],
+      "hidden": [],
+      "pinned": [],
+      "promoted": [],
+      "watchedKeywords": [],
+      "uiTheme": "ops"
+    },
+    "appDefault": {
+      "id": null,
+      "name": "",
+      "command": "",
+      "cwd": null,
+      "port": null,
+      "emoji": null,
+      "glyph": null,
+      "icon": null,
+      "favicon": null,
+      "kind": "service",
+      "lastPid": null,
+      "lastPgid": null,
+      "runToken": null,
+      "attached": false,
+      "lastExit": null,
+      "createdAt": 0
+    },
+    "invariants": [
+      "A missing schemaVersion is migrated from v0 to v1.",
+      "A future schema version is rejected without falling back to an older backup.",
+      "The previous good payload is written to config.json.bak before replacing config.json.",
+      "Writes use a temporary file, fsync, and os.replace.",
+      "If both primary and backup candidates are unusable, the configuration becomes read-only."
+    ]
+  },
+  "state": {
+    "keys": [
+      "services",
+      "watched",
+      "apps",
+      "watchedKeywords",
+      "consolePort",
+      "consolePid",
+      "consoleCwd",
+      "version",
+      "schemaVersion",
+      "platform",
+      "capabilities",
+      "degraded",
+      "degradedReasons",
+      "configHealth",
+      "uiTheme",
+      "themes"
+    ],
+    "degradedComponents": [
+      "services",
+      "watched",
+      "apps",
+      "version",
+      "config"
+    ],
+    "cacheTtlSeconds": 2.2
+  },
+  "routes": [
+    {"method": "GET", "path": "/api/health"},
+    {"method": "GET", "path": "/api/state"},
+    {"method": "GET", "path": "/api/console/log?tail={n}"},
+    {"method": "GET", "path": "/api/apps/{id}/logs?tail={n}"},
+    {"method": "POST", "path": "/api/kill"},
+    {"method": "POST", "path": "/api/services/flag"},
+    {"method": "POST", "path": "/api/watch"},
+    {"method": "POST", "path": "/api/ui/theme"},
+    {"method": "POST", "path": "/api/pick"},
+    {"method": "POST", "path": "/api/project/detect"},
+    {"method": "POST", "path": "/api/console/restart"},
+    {"method": "POST", "path": "/api/console/stop"},
+    {"method": "POST", "path": "/api/apps"},
+    {"method": "POST", "path": "/api/apps/reorder"},
+    {"method": "POST", "path": "/api/apps/{id}/start"},
+    {"method": "POST", "path": "/api/apps/{id}/stop"},
+    {"method": "POST", "path": "/api/apps/{id}/restart"},
+    {"method": "POST", "path": "/api/apps/{id}/diagnose"},
+    {"method": "POST", "path": "/api/apps/{id}/attach"},
+    {"method": "POST", "path": "/api/apps/{id}/icon"},
+    {"method": "POST", "path": "/api/apps/{id}/favicon"},
+    {"method": "PUT", "path": "/api/apps/{id}"},
+    {"method": "DELETE", "path": "/api/apps/{id}"},
+    {"method": "DELETE", "path": "/api/apps/{id}/icon"},
+    {"method": "OPTIONS", "path": "*", "expectedStatus": 403}
+  ],
+  "httpSecurity": {
+    "bindHost": "127.0.0.1",
+    "allowedHostnames": ["127.0.0.1", "localhost", "::1"],
+    "hostPortMustMatchRuntime": true,
+    "browserWritesRequireSameOriginSession": true,
+    "sessionCookie": ["HttpOnly", "SameSite=Strict"],
+    "corsPreflight": "denied",
+    "headerlessLocalJsonCli": "supported",
+    "rejectedBodiesCloseConnection": true,
+    "acceptedBodiesAreConsumedBeforeKeepAliveReuse": true
+  }
+}

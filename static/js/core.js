@@ -45,7 +45,6 @@ export function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
-export function shortHome(p) { return p ? p.replace(/^\/Users\/[^/]+/, '~') : ''; }
 export function truncateMiddle(s, max = 34) {
   if (!s) return '';
   if (s.length <= max) return s;
@@ -60,6 +59,30 @@ export function localServiceUrl(item, port) {
   if (!host && item) host = item.openHost;
   host = host === 'localhost' ? 'localhost' : '127.0.0.1';
   return 'http://' + host + ':' + value;
+}
+export function currentPlatform(data = state.data) {
+  return data && typeof data.platform === 'string' ? data.platform : 'unknown';
+}
+export function platformPresentation(data = state.data) {
+  const info = data && data.platformInfo && typeof data.platformInfo === 'object'
+    ? data.platformInfo : {};
+  const modifier = info.shortcutModifier === 'Ctrl' || info.shortcutModifier === '⌘'
+    ? info.shortcutModifier : 'Ctrl/⌘';
+  const text = key => typeof info[key] === 'string' ? info[key] : '';
+  return {
+    shortcutModifier: modifier,
+    dataDir: text('dataDir'),
+    logsDir: text('logsDir'),
+    consoleLogPath: text('consoleLogPath'),
+    launchInstruction: text('launchInstruction') || '请使用当前平台提供的启动入口。',
+    lifecycleNotice: text('lifecycleNotice') || '当前平台仅开放已验证的操作。',
+  };
+}
+export function shortcutLabel(key, data = state.data) {
+  return platformPresentation(data).shortcutModifier + '+' + key;
+}
+export function hasCapability(name, data = state.data) {
+  return !!(data && data.capabilities && data.capabilities[name] === true);
 }
 /* 秒 → 刚刚 / Nm / NhNm / NdNh */
 export function fmtUptime(sec) {
@@ -165,7 +188,7 @@ async function req(method, path, body) {
 }
 export const post = (p, b = {}) => req('POST', p, b);
 export const put = (p, b) => req('PUT', p, b);
-export const del = p => req('DELETE', p);
+export const del = (p, b) => req('DELETE', p, b);
 
 /* 动作请求统一错误提示 */
 export async function act(p) {
@@ -201,8 +224,8 @@ function setShellInert(value) {
   const shell = document.querySelector('.shell');
   if (shell) shell.inert = value;
 }
-export function openLayer(layer, focusTarget) {
-  layerReturnFocus.set(layer, document.activeElement);
+export function openLayer(layer, focusTarget, returnFocusTarget = document.activeElement) {
+  layerReturnFocus.set(layer, returnFocusTarget);
   layer.inert = false;
   layer.setAttribute('aria-hidden', 'false');
   layer.classList.add('open');
@@ -212,7 +235,7 @@ export function openLayer(layer, focusTarget) {
     if (target) target.focus();
   }, 40);
 }
-export function closeLayer(layer) {
+export function closeLayer(layer, restoreFocus = true) {
   if (!layer.classList.contains('open')) return;
   layer.classList.remove('open');
   layer.setAttribute('aria-hidden', 'true');
@@ -220,11 +243,11 @@ export function closeLayer(layer) {
   const target = layerReturnFocus.get(layer);
   layerReturnFocus.delete(layer);
   if (!activeLayer()) setShellInert(false);
-  if (target && target.isConnected) setTimeout(() => target.focus(), 0);
+  if (restoreFocus && target && target.isConnected) setTimeout(() => target.focus(), 0);
 }
 const LAYER_IDS = ['#confirmMask', '#portDiagMask',
   '#appDiagMask', '#appModalMask', '#paletteMask', '#logDrawer',
-  '#logsMask', '#settingsMask'];
+  '#logsMask', '#settingsMask', '#importMask'];
 export function activeLayer() {
   for (const id of LAYER_IDS) {
     const layer = $(id);
@@ -518,4 +541,3 @@ export function applyUiTheme(name, persist = false) {
   });
   return queued;
 }
-

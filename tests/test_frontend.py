@@ -193,14 +193,15 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("if (s.appId)", source)
         self.assertIn("if (linked) openAppModal(linked);", source)
         self.assertIn("linked ? 'pencil' : 'plus'", source)
-        self.assertIn("svc.appId ? '编辑启动台应用' : '添加到启动台'", source)
+        self.assertIn("svc.appId ? '编辑启动台应用' : hasCapability('attach_external')", source)
         self.assertNotIn("configuredPortClaims", source)
 
     def test_adding_a_running_service_creates_and_attaches_in_one_flow(self):
         services = (ROOT / "static/js/services.js").read_text(encoding="utf-8")
         overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
 
-        self.assertIn("attachPid: s.pid", services)
+        self.assertIn("if (hasCapability('attach_external'))", services)
+        self.assertIn("draft.attachPid = s.pid", services)
         self.assertIn("let pendingAttach = null", overlays)
         self.assertIn("保存并认领", overlays)
         self.assertIn("body.attachPid = attachRequest.pid", overlays)
@@ -223,6 +224,258 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("配置与运行诊断", launchpad)
         self.assertIn("const isTask = modalKind === 'task'", overlays)
         self.assertIn("const stopVerb = isTask ? '中止任务' : '停止服务'", overlays)
+
+    def test_windows_scheduled_tasks_are_selectable_and_render_native_state(self):
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        app = (ROOT / "static/app.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="scheduledTaskField"', html)
+        self.assertIn('id="fScheduledTaskPath"', html)
+        self.assertIn("'/api/windows/scheduled-tasks'", overlays)
+        self.assertIn("scheduledTaskPath", overlays)
+        self.assertIn("app.runtimeSource === 'windowsTaskScheduler'", launchpad)
+        self.assertIn("app.scheduledTask", launchpad)
+        self.assertIn("'stop_scheduled_tasks'", launchpad)
+        self.assertIn("scheduledTaskControlAvailable", launchpad)
+        self.assertIn("'toggle_scheduled_tasks'", launchpad)
+        self.assertIn("'/scheduled-enabled'", launchpad)
+        self.assertIn("'stop_scheduled_tasks'", app)
+
+    def test_docker_compose_and_container_resources_are_selectable_and_controllable(self):
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="dockerResourceField"', html)
+        self.assertIn('id="fDockerResource"', html)
+        self.assertIn("'/api/docker/resources'", overlays)
+        self.assertIn("dockerResource", overlays)
+        self.assertIn("app.runtimeSource === 'dockerCompose'", launchpad)
+        self.assertIn("app.runtimeSource === 'dockerContainer'", launchpad)
+        self.assertIn("'control_docker'", launchpad)
+
+    def test_program_favorites_use_session_unlocked_elevation_broker(self):
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        app = (ROOT / "static/app.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="programGrid"', html)
+        self.assertIn('id="addProgramCard"', html)
+        self.assertIn('data-kind="program"', html)
+        self.assertIn('id="elevatedField"', html)
+        self.assertIn('id="fProgramArgs"', html)
+        self.assertIn('id="brokerPasswordMask"', html)
+        self.assertIn("'/api/windows/elevation-broker/install'", overlays)
+        self.assertIn("'/api/windows/elevation-broker/unlock'", overlays)
+        self.assertIn("act, toast, state, openLayer", overlays)
+        self.assertIn("elevated", overlays)
+        self.assertIn("app.runtimeSource === 'windowsElevationBroker'", launchpad)
+        self.assertIn("'launch_elevated'", launchpad)
+        self.assertIn("promptForElevationSession", app)
+        self.assertIn("brokerPromptedConsolePid", app)
+        self.assertIn("closeBrokerPassword", app)
+        self.assertIn("$('#brokerPasswordMask').classList.contains('open')", app)
+
+    def test_watched_process_row_can_remove_its_keywords_without_killing_process(self):
+        services = (ROOT / "static/js/services.js").read_text(encoding="utf-8")
+
+        self.assertIn("const bUnwatch = iconBtn('eye-off', '取消关注')", services)
+        self.assertIn("Array.isArray(w.keywords)", services)
+        self.assertIn("action: 'remove'", services)
+        self.assertIn("不会结束进程", services)
+
+    def test_health_notice_does_not_report_connection_loss(self):
+        app = (ROOT / "static/app.js").read_text(encoding="utf-8")
+        widgets = (ROOT / "static/js/widgets.js").read_text(encoding="utf-8")
+        ops = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
+
+        self.assertIn("banner.dataset.connection = ok ? 'up' : 'down'", app)
+        self.assertIn("banner.dataset.connection === 'down'", widgets)
+        self.assertIn("attributeFilter: ['data-connection']", widgets)
+        self.assertNotIn("banner.classList.contains('show')", widgets)
+        self.assertEqual(app.count("banner.dataset.connection = 'down'"), 2)
+        self.assertIn(".banner.show ~ .shell > .rail", ops)
+        self.assertIn(".banner.show ~ .shell > .shell-col { padding-top: 38px; }", ops)
+
+    def test_cwd_changes_discard_only_stale_command_compatibility(self):
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+
+        helper = re.search(
+            r"function invalidateCommandCompatibility\(\) \{(?P<body>.*?)\n\}",
+            overlays,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(helper)
+        self.assertIn("selectedCompatibility = null;", helper.group("body"))
+        self.assertNotIn("selectedCommandSpec =", helper.group("body"))
+        self.assertIn(
+            "fCwd.value = r.path;\n        invalidateCommandCompatibility();",
+            overlays,
+        )
+        self.assertIn(
+            "fCwd.addEventListener('input', () => {\n"
+            "    invalidateCommandCompatibility();",
+            overlays,
+        )
+
+    def test_log_drawer_layers_above_banner_and_below_toast(self):
+        ops = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
+
+        def z_index(selector):
+            match = re.search(r"z-index:\s*(\d+)", theme_block(ops, selector))
+            self.assertIsNotNone(match, f"Missing z-index for {selector}")
+            return int(match.group(1))
+
+        banner = z_index(".banner")
+        drawer_mask = z_index(".drawer-mask")
+        drawer = z_index(".drawer")
+        toast = z_index(".toast")
+        self.assertLess(banner, drawer_mask)
+        self.assertLess(drawer_mask, drawer)
+        self.assertLess(drawer, toast)
+
+    def test_console_controls_follow_platform_capability(self):
+        app = (ROOT / "static/app.js").read_text(encoding="utf-8")
+
+        self.assertIn("function consoleLifecycleSupported()", app)
+        self.assertIn("return hasCapability('restart_console');", app)
+        self.assertIn("restartConsoleBtn.disabled = !lifecycleSupported", app)
+        self.assertIn("stopConsoleBtn.disabled = !lifecycleSupported", app)
+        self.assertEqual(app.count("if (!consoleLifecycleSupported()) return;"), 2)
+        self.assertGreaterEqual(app.count("if (!consoleLifecycleSupported()) {"), 2)
+
+    def test_platform_presentation_comes_from_state(self):
+        core = (ROOT / "static/js/core.js").read_text(encoding="utf-8")
+        widgets = (ROOT / "static/js/widgets.js").read_text(encoding="utf-8")
+        app = (ROOT / "static/app.js").read_text(encoding="utf-8")
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+
+        for field in (
+            "shortcutModifier",
+            "dataDir",
+            "logsDir",
+            "consoleLogPath",
+            "launchInstruction",
+            "lifecycleNotice",
+        ):
+            self.assertIn(field, core)
+        self.assertIn("shortcutLabel('K', data)", widgets)
+        self.assertIn("shortcutLabel('J', data)", widgets)
+        self.assertIn("shortcutLabel('V', data)", widgets)
+        self.assertIn("platformPresentation().launchInstruction", app)
+        self.assertNotIn("总控台.app", app)
+        self.assertNotIn("~/Library", html)
+        self.assertNotIn("kill -9", html)
+
+    def test_picker_uses_structured_path_and_command_fields(self):
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+
+        self.assertIn("r.commandSpec", overlays)
+        self.assertIn("r.platformCompatibility", overlays)
+        self.assertIn("r.dir", overlays)
+        self.assertIn("r.stem", overlays)
+        self.assertNotIn("shellQuotePath", overlays)
+        self.assertNotIn("fallbackScriptCommand", overlays)
+        self.assertNotIn("split('/')", overlays)
+        self.assertNotIn("lastIndexOf('/')", overlays)
+        self.assertIn("if (selectedCommandSpec) body.commandSpec", overlays)
+
+        core = (ROOT / "static/js/core.js").read_text(encoding="utf-8")
+        services = (ROOT / "static/js/services.js").read_text(encoding="utf-8")
+        self.assertNotIn("shortHome", core + services)
+        self.assertNotIn("/Users/", core + services)
+
+    def test_lifecycle_and_external_process_actions_are_capability_gated(self):
+        app = (ROOT / "static/app.js").read_text(encoding="utf-8")
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+        services = (ROOT / "static/js/services.js").read_text(encoding="utf-8")
+        widgets = (ROOT / "static/js/widgets.js").read_text(encoding="utf-8")
+
+        self.assertIn("intent.canManage", app)
+        self.assertIn("hasCapability('stop_managed')", app)
+        self.assertIn("const capability = starting ? 'launch_managed' : 'stop_managed'", launchpad)
+        self.assertIn("diagAttach.hidden = !hasCapability('attach_external')", launchpad)
+        self.assertIn("ownerLifecycle.canManage", launchpad)
+        self.assertIn(": hasCapability('kill_external')", launchpad)
+        self.assertGreaterEqual(overlays.count("hasCapability('kill_external')"), 2)
+        self.assertIn("pendingAttach = hasCapability('attach_external')", overlays)
+        self.assertIn("r.kill.hidden = !hasCapability('kill_external')", services)
+        self.assertIn("if (!hasCapability('kill_external')) return;", services)
+        self.assertIn("batchStop.hidden = !canStop", widgets)
+        self.assertGreaterEqual(widgets.count("if (!hasCapability('stop_managed'))"), 2)
+
+    def test_phase4_lifecycle_mutations_freeze_generation_and_fail_closed(self):
+        app = (ROOT / "static/app.js").read_text(encoding="utf-8")
+        core = (ROOT / "static/js/core.js").read_text(encoding="utf-8")
+        lifecycle = (ROOT / "static/js/lifecycle.js").read_text(encoding="utf-8")
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+        widgets = (ROOT / "static/js/widgets.js").read_text(encoding="utf-8")
+
+        self.assertIn("return Object.freeze({", lifecycle)
+        self.assertIn("expectedGeneration: status === 'stopped' ? null : generation", lifecycle)
+        self.assertIn("const hasExplicitStatus", lifecycle)
+        self.assertIn("const hasExplicitControl", lifecycle)
+        self.assertIn("status === 'orphaned' || status === 'unknown'", lifecycle)
+        self.assertIn("const pending = pollPromise", app)
+        self.assertIn("if (pending) await pending", app)
+        self.assertIn("return poll(true)", app)
+        self.assertIn("return Promise.resolve(false)", app)
+
+        self.assertIn("toggleApp(a.id, null, intent)", app)
+        self.assertIn("restartAppFromPalette(a.id, intent, name)", app)
+        self.assertIn("lifecyclePayload(intent)", app)
+        self.assertIn("capturedIntent || lifecycleSnapshot", launchpad)
+        self.assertIn("lifecycle.status === 'orphaned'", launchpad)
+        self.assertIn("lifecycle.status === 'unknown'", launchpad)
+        self.assertIn("lifecycleState === 'unavailable' ? '不可用'", launchpad)
+        self.assertIn("lifecyclePayload(intent, starting ? {} : { force: false })", launchpad)
+        self.assertIn("del('/api/apps/' + app.id, lifecyclePayload(intent))", launchpad)
+        self.assertIn("'/api/apps/' + owner.appId + '/stop'", launchpad)
+        self.assertIn("lifecyclePayload(intent, { force: false })", launchpad)
+
+        self.assertIn("body.expectedGeneration = editingAppOriginal.lifecycle.expectedGeneration", overlays)
+        self.assertIn("await refreshLifecycleState(app)", overlays)
+        self.assertIn("sameLifecycleGeneration(intent, latest, currentPlatform())", overlays)
+        self.assertIn("if (!stateIsFresh || !hasCapability('force_stop_managed')", overlays)
+        self.assertIn("return stateIsFresh", overlays)
+        self.assertIn("lifecyclePayload(forceIntent, { force: true })", overlays)
+        self.assertIn("isGenerationMismatch(result)", overlays)
+        self.assertIn("item.intent.canManage", widgets)
+        self.assertIn("lifecyclePayload(item.intent, { force: false })", widgets)
+        self.assertIn("const del = (p, b) => req('DELETE', p, b)", core)
+
+    def test_windows_import_wizard_follows_preview_commit_rollback_contract(self):
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+        widgets = (ROOT / "static/js/widgets.js").read_text(encoding="utf-8")
+
+        for element_id in (
+            "importMask",
+            "importSourcePath",
+            "importMappingList",
+            "importPreview",
+            "importCommit",
+            "importRollback",
+        ):
+            self.assertIn(f'id="{element_id}"', html)
+        self.assertIn("post('/api/config/import/preview', request)", widgets)
+        self.assertIn("post('/api/config/import/commit', request)", widgets)
+        self.assertIn("post('/api/config/import/rollback', { importId: importReceiptId })", widgets)
+        self.assertIn("new Set(['ready', 'needs_review'])", widgets)
+        self.assertIn("checkbox.disabled = !selectable", widgets)
+        self.assertIn("selectedAppIds", widgets)
+        self.assertIn("platform !== 'windows'", widgets)
+        self.assertIn("closeSettingsCenter(false)", widgets)
+        self.assertIn("openLayer(importMask, importSourcePath, returnFocus)", widgets)
+
+    def test_windows_font_stack_precedes_macos_fallbacks(self):
+        ops = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
+        font_line = next(line for line in ops.splitlines() if "--font-sans:" in line)
+        self.assertLess(font_line.index("'Segoe UI'"), font_line.index("-apple-system"))
 
     def test_new_port_discovery_is_session_scoped_and_actionable(self):
         html = (ROOT / "static/index.html").read_text(encoding="utf-8")

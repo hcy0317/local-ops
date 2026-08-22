@@ -7,12 +7,11 @@
 API 契约与实现要点见 AGENTS.md。
 """
 
-import glob
-import fcntl
 import functools
 import errno
 import json
 import logging
+import ntpath
 import os
 import re
 import secrets
@@ -27,34 +26,74 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-import webbrowser
+import uuid
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from localops.platform.contracts import (
+    LaunchRequest,
+    PlatformScanError,
+    RuntimeIdentity,
+    ScanStatus,
+)
+from localops.platform.loader import load_platform
+from localops.command_spec import (
+    CommandSpecError,
+    command_spec_for_executable,
+    command_spec_for_script,
+    direct_command_spec,
+    display_command,
+    is_local_windows_path,
+    legacy_command_spec,
+    normalize_command_spec,
+    platform_compatibility,
+    prepared_invocation,
+    python_command_spec,
+    select_python_executable,
+    static_preflight,
+)
+from localops.config_import import (
+    ConfigImportError,
+    commit_import,
+    config_hash,
+    preview_import,
+    rollback_import,
+)
+from localops.docker_resources import (
+    DockerController,
+    DockerSnapshot,
+    normalize_docker_resource,
+)
+from localops.elevation_broker import new_password_record
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_PATH = os.path.join(BASE_DIR, "VERSION")
 LEGACY_DATA_DIR = os.path.join(BASE_DIR, "data")
-DEFAULT_DATA_DIR = os.path.expanduser(
-    "~/Library/Application Support/总控台")
-DEFAULT_LOGS_DIR = os.path.expanduser("~/Library/Logs/总控台")
+PLATFORM = load_platform(BASE_DIR, __file__)
+DOCKER = DockerController()
+PLATFORM_PATHS = PLATFORM.runtime_paths()
+DEFAULT_DATA_DIR = PLATFORM_PATHS.data_dir
+DEFAULT_LOGS_DIR = PLATFORM_PATHS.logs_dir
 
 
 def resolve_runtime_dir(name, default):
     """解析专用运行目录，拒绝空值、相对路径和过宽目标。"""
-    if name not in os.environ:
-        return os.path.abspath(default), False
-    raw = (os.environ.get(name) or "").strip()
+    overridden = name in os.environ
+    raw = (os.environ.get(name) or "").strip() if overridden else default
     if not raw:
         raise RuntimeError("%s 不能为空" % name)
     expanded = os.path.expanduser(raw)
-    if not os.path.isabs(expanded):
+    if overridden and not os.path.isabs(expanded):
         raise RuntimeError("%s 必须是绝对路径" % name)
     path = os.path.abspath(expanded)
     forbidden = {os.path.abspath(os.sep), os.path.abspath(os.path.expanduser("~")),
                  os.path.abspath(BASE_DIR)}
-    if path in forbidden:
-        raise RuntimeError("%s 必须指向专用子目录" % name)
-    return path, True
+    try:
+        path = PLATFORM.validate_runtime_path(path, forbidden)
+    except ValueError as exc:
+        raise RuntimeError("%s 必须指向安全的专用子目录: %s" %
+                           (name, exc)) from exc
+    return path, overridden
 
 
 DATA_DIR, DATA_DIR_OVERRIDDEN = resolve_runtime_dir(
@@ -66,8 +105,9 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 THEMES_DIR = os.path.join(STATIC_DIR, "themes")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 INSTANCE_LOCK_PATH = os.path.join(DATA_DIR, "console.lock")
+IMPORT_RECORDS_DIR = os.path.join(DATA_DIR, "imports")
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 4
 
 # 默认 UI 主题：新安装与无偏好回退均使用它，主题清单中固定排首位。
 DEFAULT_UI_THEME = "ops"
@@ -106,12 +146,57 @@ RUN_TOKEN_ARG_PREFIX = "console-run:"
 TASK_CANCELED_EXIT_CODE = 130
 
 SELF_PID = os.getpid()
-SELF_UID = os.getuid()
+SELF_PRINCIPAL = PLATFORM.current_principal()
+# Compatibility name used throughout the macOS domain model and existing tests.
+SELF_UID = SELF_PRINCIPAL.numeric_id
 ICON_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".ico")
 LOG = logging.getLogger("console")
 LOG_LOCK = threading.RLock()
 MANUAL_STOP_LOCK = threading.RLock()
 MANUAL_STOP_TOKENS = set()
+_PLATFORM_SCAN_STATE = threading.local()
+# One terminal generation clear is a single transaction: config CAS, runtime
+# record release, and any identity restore must not race state reconciliation.
+# A global lock keeps this uncommon path simple and also serializes recovery
+# scans with release I/O; normal process inspection and lifecycle control do
+# not take it.
+_WINDOWS_RELEASE_LOCK = threading.RLock()
+_WINDOWS_PENDING_RELEASES = {}
+
+
+def process_owned_by_current(info):
+    """Match native process ownership without assuming a POSIX numeric UID."""
+    if not info:
+        return False
+    owner = info.get("owner")
+    if owner is not None:
+        return owner == SELF_PRINCIPAL.identifier
+    return info.get("uid") == SELF_UID
+
+
+def process_owner_value(info):
+    if not info:
+        return None
+    owner = info.get("owner")
+    return owner if owner is not None else info.get("uid")
+
+
+def _begin_platform_scan_cycle():
+    _PLATFORM_SCAN_STATE.issues = []
+
+
+def _record_platform_issues(status, issues):
+    current = getattr(_PLATFORM_SCAN_STATE, "issues", None)
+    if current is not None:
+        current.extend(issue for issue in issues if issue not in current)
+    if status is ScanStatus.FAILED:
+        raise PlatformScanError(issues)
+
+
+def _consume_platform_scan_issues():
+    issues = list(getattr(_PLATFORM_SCAN_STATE, "issues", []))
+    _PLATFORM_SCAN_STATE.issues = []
+    return issues
 
 
 def classify_task_exit(code):
@@ -171,7 +256,7 @@ code{background:#f5f5f7;border:1px solid rgba(0,0,0,.05);border-radius:6px;paddi
 </div></body></html>"""
 
 APP_ROUTE_RE = re.compile(
-    r"^/api/apps/([0-9a-fA-F]{8})(?:/(start|stop|restart|icon|logs|favicon|diagnose|attach))?$")
+    r"^/api/apps/([0-9a-fA-F]{8})(?:/(start|stop|restart|icon|logs|favicon|diagnose|attach|scheduled-enabled))?$")
 
 
 # ---------------------------------------------------------------- 运行目录
@@ -183,8 +268,10 @@ def _ensure_private_dir(path):
     if os.path.islink(path) or not os.path.isdir(path):
         raise OSError("私有运行路径不是安全目录: %s" % path)
     try:
-        os.chmod(path, 0o700)
+        PLATFORM.ensure_private_directory(path)
     except OSError:
+        if PLATFORM.requires_verified_permissions:
+            raise
         LOG.warning("无法收紧目录权限: %s", path)
 
 
@@ -202,6 +289,7 @@ def _copy_private_regular_file(source, target):
         target_fd = os.open(
             target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
+            PLATFORM.ensure_private_file(target)
             with os.fdopen(os.dup(source_fd), "rb") as src, \
                     os.fdopen(target_fd, "wb") as dst:
                 target_fd = -1
@@ -213,7 +301,7 @@ def _copy_private_regular_file(source, target):
                 os.close(target_fd)
     finally:
         os.close(source_fd)
-    os.chmod(target, 0o600)
+    PLATFORM.ensure_private_file(target)
     return True
 
 
@@ -228,7 +316,7 @@ def _install_migrated_directory(target, populate):
     staging = tempfile.mkdtemp(prefix=".console-migration-", dir=parent)
     installed = False
     try:
-        os.chmod(staging, 0o700)
+        PLATFORM.ensure_private_directory(staging)
         populate(staging)
         try:
             os.rename(staging, target)
@@ -255,6 +343,8 @@ def migrate_legacy_runtime_data(
     旧文件不会被删除或改权限。
     """
     result = {"dataMigrated": False, "logsMigrated": False}
+    if not PLATFORM.should_migrate_legacy_data():
+        return result
     legacy_data_dir = os.path.abspath(legacy_data_dir)
     data_dir = os.path.abspath(data_dir)
     logs_dir = os.path.abspath(logs_dir)
@@ -300,12 +390,18 @@ def migrate_legacy_runtime_data(
 
 def prepare_runtime_storage():
     migration = migrate_legacy_runtime_data()
+    security_issues = []
     for private_dir in (DATA_DIR, ICONS_DIR, LOGS_DIR):
-        _ensure_private_dir(private_dir)
+        try:
+            _ensure_private_dir(private_dir)
+        except PermissionError as exc:
+            security_issues.append("运行目录 ACL 验证失败: %s" % exc)
     for path in (CONFIG_PATH, CONFIG_PATH + ".bak", INSTANCE_LOCK_PATH):
         try:
             if stat.S_ISREG(os.lstat(path).st_mode):
-                os.chmod(path, 0o600)
+                PLATFORM.ensure_private_file(path)
+        except PermissionError as exc:
+            security_issues.append("运行文件 ACL 验证失败: %s" % exc)
         except OSError:
             pass
     for directory in (ICONS_DIR, LOGS_DIR):
@@ -317,20 +413,29 @@ def prepare_runtime_storage():
             for entry in entries:
                 try:
                     if entry.is_file(follow_symlinks=False):
-                        os.chmod(entry.path, 0o600)
+                        PLATFORM.ensure_private_file(entry.path)
+                except PermissionError as exc:
+                    security_issues.append("运行文件 ACL 验证失败: %s" % exc)
                 except OSError:
                     LOG.warning("无法收紧文件权限: %s", entry.path)
+    migration["securityIssues"] = list(dict.fromkeys(security_issues))
     return migration
 
 
 def write_private_bytes(path, payload):
     """以 0600 权限写入用户数据文件。"""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(payload)
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(path, 0o600)
+    try:
+        PLATFORM.ensure_private_file(path)
+        with os.fdopen(fd, "wb") as f:
+            fd = -1
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    PLATFORM.ensure_private_file(path)
 
 
 # ---------------------------------------------------------------- 配置
@@ -344,6 +449,288 @@ class FutureConfigSchemaError(ConfigSchemaError):
     pass
 
 
+_WINDOWS_RUNTIME_IDENTITY_FIELDS = {
+    "platform",
+    "kind",
+    "ownerSid",
+    "generationId",
+    "runnerPid",
+    "runnerCreateTime",
+    "rootPid",
+    "rootCreateTime",
+    "jobName",
+    "tokenDigest",
+    "startedAt",
+}
+_WINDOWS_SID_RE = re.compile(r"^S-1-(?:\d+-){1,14}\d+$")
+_TOKEN_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_LIFECYCLE_ERROR_MESSAGES = {
+    "GENERATION_REQUIRED": "请求缺少有效的运行代次",
+    "GENERATION_MISMATCH": "应用运行代次已变化，请刷新状态后重试",
+    "RUNTIME_IDENTITY_INVALID": "保存的运行身份无效，已禁止控制",
+    "RUNTIME_IDENTITY_UNVERIFIED": "无法完整验证受管运行身份，已禁止控制",
+    "RUNTIME_RECORD_INSECURE": "运行记录安全验证失败，已禁止控制",
+    "LAUNCH_PREPARE_FAILED": "无法安全准备受管进程",
+    "LAUNCH_COMMIT_FAILED": "无法在启动前保存运行身份",
+    "LAUNCH_ACTIVATE_FAILED": "运行身份已保存，但进程未能安全恢复",
+    "STOP_TIMEOUT": "应用未在限定时间内退出，仍保留管理身份",
+    "RUNTIME_CONTROL_FAILED": "受管进程控制失败，仍保留管理身份",
+}
+
+
+def runtime_generation(app):
+    """Return the persisted managed generation, never a legacy PID token."""
+    identity = app.get("runtimeIdentity") if isinstance(app, dict) else None
+    return identity.get("generationId") if isinstance(identity, dict) else None
+
+
+def normalize_expected_generation(data, *, required):
+    """Validate the observed generation carried by a lifecycle request."""
+    if "expectedGeneration" not in data:
+        if required:
+            return None, "请求缺少 expectedGeneration"
+        return None, None
+    value = data.get("expectedGeneration")
+    if value is None:
+        return None, None
+    if not isinstance(value, str):
+        return None, "expectedGeneration 必须是 UUID 字符串或 null"
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return None, "expectedGeneration 必须是 UUID 字符串或 null"
+    if str(parsed) != value:
+        return None, "expectedGeneration 必须使用规范的小写 UUID"
+    return value, None
+
+
+def normalize_runtime_identity(value, app_id, *, current_owner=None):
+    """Validate the exact public Windows Job identity stored in schema v2."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != _WINDOWS_RUNTIME_IDENTITY_FIELDS:
+        raise ConfigSchemaError("runtimeIdentity 必须是受支持的完整 Windows Job 身份")
+    if value.get("platform") != "windows" or value.get("kind") != "job":
+        raise ConfigSchemaError("runtimeIdentity 平台或类型无效")
+
+    owner_sid = value.get("ownerSid")
+    if not isinstance(owner_sid, str) or not _WINDOWS_SID_RE.fullmatch(owner_sid):
+        raise ConfigSchemaError("runtimeIdentity ownerSid 无效")
+    if current_owner is not None and owner_sid != current_owner:
+        raise ConfigSchemaError("runtimeIdentity 不属于当前 Windows 用户")
+
+    generation = value.get("generationId")
+    try:
+        parsed_generation = uuid.UUID(generation) if isinstance(generation, str) else None
+    except (ValueError, AttributeError):
+        parsed_generation = None
+    if parsed_generation is None or str(parsed_generation) != generation:
+        raise ConfigSchemaError("runtimeIdentity generationId 无效")
+
+    for field in ("runnerPid", "rootPid", "startedAt"):
+        field_value = value.get(field)
+        if isinstance(field_value, bool) or not isinstance(field_value, int) or field_value <= 0:
+            raise ConfigSchemaError("runtimeIdentity %s 无效" % field)
+    for field in ("runnerCreateTime", "rootCreateTime"):
+        field_value = value.get(field)
+        if (isinstance(field_value, bool)
+                or not isinstance(field_value, (int, float))
+                or not (0 < field_value < float("inf"))):
+            raise ConfigSchemaError("runtimeIdentity %s 无效" % field)
+
+    prefix = "Local\\LocalOps-%s-%s-" % (app_id, generation)
+    job_name = value.get("jobName")
+    token_digest = value.get("tokenDigest")
+    if (not isinstance(token_digest, str)
+            or not _TOKEN_DIGEST_RE.fullmatch(token_digest)):
+        raise ConfigSchemaError("runtimeIdentity tokenDigest 无效")
+    expected_job_name = prefix + token_digest[7:23]
+    if job_name != expected_job_name:
+        raise ConfigSchemaError("runtimeIdentity jobName 无效")
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def public_runtime_identity(identity, app_id):
+    """Serialize only the non-secret v3 identity fields."""
+    if identity is None or identity.app_id != app_id:
+        raise ConfigSchemaError("runner 返回的 runtimeIdentity 未绑定当前应用")
+    public = {
+        "platform": identity.platform,
+        "kind": identity.kind,
+        "ownerSid": identity.owner,
+        "generationId": identity.generation_id,
+        "runnerPid": identity.runner_pid,
+        "runnerCreateTime": identity.runner_create_time,
+        "rootPid": identity.root_pid,
+        "rootCreateTime": identity.root_create_time,
+        "jobName": identity.job_name,
+        "tokenDigest": identity.token_digest,
+        "startedAt": identity.started_at,
+    }
+    return normalize_runtime_identity(
+        public,
+        app_id,
+        current_owner=(
+            SELF_PRINCIPAL.identifier if PLATFORM.name == "windows" else None
+        ),
+    )
+
+
+def native_runtime_identity(app):
+    """Rehydrate internal adapter context without exposing runtime paths/secrets."""
+    app_id = app.get("id")
+    public = normalize_runtime_identity(
+        app.get("runtimeIdentity"),
+        app_id,
+        current_owner=(
+            SELF_PRINCIPAL.identifier if PLATFORM.name == "windows" else None
+        ),
+    )
+    if public is None:
+        return None
+    return RuntimeIdentity(
+        platform=public["platform"],
+        kind=public["kind"],
+        identifier=public["jobName"],
+        owner=public["ownerSid"],
+        members=(public["rootPid"],),
+        app_id=app_id,
+        generation_id=public["generationId"],
+        runner_pid=public["runnerPid"],
+        runner_create_time=public["runnerCreateTime"],
+        root_pid=public["rootPid"],
+        root_create_time=public["rootCreateTime"],
+        job_name=public["jobName"],
+        token_digest=public["tokenDigest"],
+        started_at=public["startedAt"],
+    )
+
+
+def lifecycle_error(code, fallback="RUNTIME_IDENTITY_UNVERIFIED"):
+    stable = code if code in _LIFECYCLE_ERROR_MESSAGES else fallback
+    return {"code": stable, "message": _LIFECYCLE_ERROR_MESSAGES[stable]}
+
+
+def inspect_windows_runtime(app):
+    """Return fail-closed lifecycle presentation for one Windows app."""
+    identity = app.get("runtimeIdentity")
+    if identity is None:
+        return {
+            "status": "stopped",
+            "running": False,
+            "controlAvailable": True,
+            "deleteAvailable": True,
+            "issue": None,
+            "members": (),
+            "verified": True,
+        }
+    try:
+        native = native_runtime_identity(app)
+        inspection = PLATFORM.inspect_managed(native)
+    except (ConfigSchemaError, OSError, ValueError, TypeError):
+        return {
+            "status": "orphaned",
+            "running": False,
+            "controlAvailable": False,
+            "deleteAvailable": False,
+            "issue": lifecycle_error("RUNTIME_IDENTITY_INVALID"),
+            "members": (),
+            "verified": False,
+        }
+    except Exception:
+        LOG.exception("检查 Windows 受管运行身份失败: %s", app.get("id"))
+        return {
+            "status": "unknown",
+            "running": False,
+            "controlAvailable": False,
+            "deleteAvailable": False,
+            "issue": lifecycle_error("RUNTIME_IDENTITY_UNVERIFIED"),
+            "members": (),
+            "verified": False,
+        }
+
+    raw_status = getattr(inspection, "status", None) or "unknown"
+    status_map = {
+        "prepared": "starting",
+        "starting": "starting",
+        "running": "running",
+        "stopping": "stopping",
+    }
+    status = status_map.get(raw_status)
+    verified = bool(getattr(inspection, "verified", False))
+    if not verified:
+        raw_code = getattr(inspection, "code", None)
+        issue_code = getattr(getattr(inspection, "issue", None), "code", None)
+        code = raw_code if raw_code in _LIFECYCLE_ERROR_MESSAGES else issue_code
+        insecure = code in {
+            "RUNTIME_IDENTITY_INVALID",
+            "RUNTIME_RECORD_INSECURE",
+        }
+        return {
+            "status": "orphaned" if insecure else "unknown",
+            "running": False,
+            "controlAvailable": False,
+            "deleteAvailable": False,
+            "issue": lifecycle_error(code),
+            "members": (),
+            "verified": False,
+        }
+    if not _windows_inspection_matches(native, inspection):
+        return {
+            "status": "unknown",
+            "running": False,
+            "controlAvailable": False,
+            "deleteAvailable": False,
+            "issue": lifecycle_error("RUNTIME_IDENTITY_UNVERIFIED"),
+            "members": (),
+            "verified": False,
+        }
+    members = tuple(getattr(inspection, "members", ()) or ())
+    inspection_running = bool(getattr(inspection, "running", False))
+    if (status in ("running", "stopping")
+            and (not inspection_running or not members)):
+        return {
+            "status": "unknown",
+            "running": False,
+            "controlAvailable": False,
+            "deleteAvailable": False,
+            "issue": lifecycle_error("RUNTIME_IDENTITY_UNVERIFIED"),
+            "members": (),
+            "verified": False,
+        }
+    if status is None:
+        terminal = (
+            raw_status in ("exited", "failed")
+            and not inspection_running
+            and not members
+        )
+        return {
+            "status": "unknown",
+            "running": False,
+            "controlAvailable": False,
+            "deleteAvailable": terminal,
+            "issue": lifecycle_error(
+                getattr(inspection, "code", None),
+                "RUNTIME_CONTROL_FAILED",
+            ),
+            "members": members,
+            "verified": True,
+        }
+    return {
+        "status": status,
+        "running": (
+            status in ("running", "stopping")
+            and inspection_running
+            and bool(members)
+        ),
+        "controlAvailable": status == "running",
+        "deleteAvailable": status == "running",
+        "issue": None,
+        "members": members,
+        "verified": True,
+    }
+
+
 def migrate_config_v0_to_v1(raw):
     """旧配置没有 schemaVersion；v1 只建立显式版本基线。"""
     migrated = dict(raw)
@@ -351,7 +738,58 @@ def migrate_config_v0_to_v1(raw):
     return migrated
 
 
-CONFIG_MIGRATIONS = {0: migrate_config_v0_to_v1}
+def migrate_config_v1_to_v2(raw):
+    """Add command metadata without changing legacy macOS runtime state."""
+    migrated = json.loads(json.dumps(raw, ensure_ascii=False))
+    apps = migrated.get("apps")
+    if isinstance(apps, list):
+        for app in apps:
+            if not isinstance(app, dict):
+                continue
+            command = app.get("command")
+            if not isinstance(app.get("commandSpec"), dict):
+                safe_command = (command if isinstance(command, str)
+                                and "\x00" not in command else "")
+                app["commandSpec"] = legacy_command_spec(
+                    safe_command)
+                if safe_command != command:
+                    app["importStatus"] = "blocked"
+            app["runtimeIdentity"] = None
+            app.setdefault("importStatus", "needs_review")
+    migrated["schemaVersion"] = 2
+    return migrated
+
+
+def migrate_config_v2_to_v3(raw):
+    """Add explicit external-resource identity without changing managed apps."""
+    migrated = json.loads(json.dumps(raw, ensure_ascii=False))
+    apps = migrated.get("apps")
+    if isinstance(apps, list):
+        for app in apps:
+            if isinstance(app, dict):
+                app.setdefault("dockerResource", None)
+    migrated["schemaVersion"] = 3
+    return migrated
+
+
+def migrate_config_v3_to_v4(raw):
+    """Add explicit per-app elevation intent; existing apps remain standard."""
+    migrated = json.loads(json.dumps(raw, ensure_ascii=False))
+    apps = migrated.get("apps")
+    if isinstance(apps, list):
+        for app in apps:
+            if isinstance(app, dict):
+                app.setdefault("elevated", False)
+    migrated["schemaVersion"] = 4
+    return migrated
+
+
+CONFIG_MIGRATIONS = {
+    0: migrate_config_v0_to_v1,
+    1: migrate_config_v1_to_v2,
+    2: migrate_config_v2_to_v3,
+    3: migrate_config_v3_to_v4,
+}
 
 
 def migrate_config(raw):
@@ -386,18 +824,25 @@ class Config:
                "apps": [], "hidden": [], "pinned": [], "promoted": [],
                "watchedKeywords": [], "uiTheme": DEFAULT_UI_THEME}
     APP_DEFAULT = {"id": None, "name": "", "command": "", "cwd": None,
+                   "commandSpec": None, "runtimeIdentity": None,
+                   "importStatus": "needs_review",
+                   "scheduledTaskPath": None,
+                   "dockerResource": None,
+                   "elevated": False,
                    "port": None, "emoji": None, "glyph": None, "icon": None,
                    "favicon": None, "kind": "service", "lastPid": None,
                    "lastPgid": None, "runToken": None,
                    "attached": False, "lastExit": None, "createdAt": 0}
 
-    def __init__(self, path):
+    def __init__(self, path, force_read_only_reason=None):
         self._lock = threading.RLock()
         self._path = path
-        self._writable = True
+        self._writable = not bool(force_read_only_reason)
         self._recovered_from_backup = False
         self._migration_from = None
-        self._health_issues = []
+        self._health_issues = (
+            [str(force_read_only_reason)] if force_read_only_reason else []
+        )
         self._data = self._load()
 
     @staticmethod
@@ -405,7 +850,7 @@ class Config:
         return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
 
     @classmethod
-    def _normalize(cls, raw):
+    def _normalize(cls, raw, *, strict_runtime=False):
         data = {"schemaVersion": CURRENT_SCHEMA_VERSION}
         for key, default in cls.DEFAULT.items():
             if key == "schemaVersion":
@@ -424,6 +869,62 @@ class Config:
             for key in app:
                 if key in item:
                     app[key] = item[key]
+            invalid_external_resource = False
+            try:
+                app["runtimeIdentity"] = normalize_runtime_identity(
+                    app.get("runtimeIdentity"),
+                    app["id"],
+                    current_owner=(
+                        SELF_PRINCIPAL.identifier
+                        if PLATFORM.name == "windows" else None
+                    ),
+                )
+            except ConfigSchemaError:
+                if strict_runtime:
+                    raise
+                # Explicit imports normalize first and clear legacy identity
+                # later; an untrusted PID-only source must never survive that
+                # pipeline or become a Windows ownership claim.
+                app["runtimeIdentity"] = None
+            try:
+                resource = app.get("dockerResource")
+                app["dockerResource"] = (
+                    normalize_docker_resource(resource)
+                    if resource is not None else None
+                )
+            except ValueError as exc:
+                if strict_runtime:
+                    raise ConfigSchemaError(
+                        "dockerResource 无效: %s" % exc
+                    ) from exc
+                app["dockerResource"] = None
+                app["importStatus"] = "blocked"
+                invalid_external_resource = True
+            app["elevated"] = app.get("elevated") is True
+            invalid_command_spec = False
+            try:
+                command_spec = app.get("commandSpec")
+                if command_spec is None:
+                    command = app.get("command")
+                    safe_command = (command if isinstance(command, str)
+                                    and "\x00" not in command else "")
+                    command_spec = legacy_command_spec(
+                        safe_command)
+                    if safe_command != command:
+                        app["importStatus"] = "blocked"
+                        invalid_command_spec = True
+                app["commandSpec"] = normalize_command_spec(command_spec)
+            except CommandSpecError:
+                command = app.get("command")
+                safe_command = (command if isinstance(command, str)
+                                and "\x00" not in command else "")
+                app["commandSpec"] = legacy_command_spec(
+                    safe_command)
+                app["importStatus"] = "blocked"
+                invalid_command_spec = True
+            if not invalid_command_spec and not invalid_external_resource:
+                app["importStatus"] = command_import_status(
+                    app["commandSpec"], app.get("cwd"))
             apps.append(app)
         data["apps"] = apps
         return data
@@ -436,15 +937,16 @@ class Config:
                 with open(path, "r", encoding="utf-8") as f:
                     raw = json.load(f)
                 migrated, source_version = migrate_config(raw)
-                data = self._normalize(migrated)
+                data = self._normalize(migrated, strict_runtime=True)
                 if index:
                     self._recovered_from_backup = True
                     LOG.warning("主配置不可读，已从备份恢复: %s", path)
                 if source_version < CURRENT_SCHEMA_VERSION:
                     self._migration_from = source_version
-                self._persist_loaded_state(
-                    data, raw, source_index=index,
-                    source_version=source_version)
+                if self._writable:
+                    self._persist_loaded_state(
+                        data, raw, source_index=index,
+                        source_version=source_version)
                 return data
             except FileNotFoundError:
                 continue
@@ -466,6 +968,8 @@ class Config:
             self._health_issues.append(
                 "主配置与备份均不可读，已进入只读保护状态")
             return data
+        if not self._writable:
+            return data
         try:
             self._write_atomic(self._path, self._payload(data))
         except OSError as e:
@@ -481,7 +985,9 @@ class Config:
         try:
             if not source_index and needs_migration:
                 # 迁移前的配置是上一份良好版本。
-                self._write_atomic(self._path + ".bak", self._payload(raw))
+                if not self._write_atomic(
+                        self._path + ".bak", self._payload(raw)):
+                    raise OSError("配置备份权限验证失败")
             # 从 .bak 恢复时只修复主文件，保留已验证的备份。
             self._write_atomic(self._path, self._payload(data))
         except OSError as e:
@@ -514,7 +1020,9 @@ class Config:
                 payload = self._payload(self._data)
                 previous_payload = self._payload(previous)
                 # 先保存上一份良好内容，再替换主文件。
-                self._write_atomic(self._path + ".bak", previous_payload)
+                if not self._write_atomic(
+                        self._path + ".bak", previous_payload):
+                    raise OSError("配置备份权限验证失败")
                 self._write_atomic(self._path, payload)
                 invalidate_state_cache()
                 return result
@@ -522,64 +1030,136 @@ class Config:
                 self._data = previous
                 raise
 
-    @staticmethod
-    def _write_atomic(path, payload):
+    def mutate_app_if_generation(self, app_id, expected_generation, fn):
+        """Apply one app mutation only when its runtime generation still matches.
+
+        A mismatch performs no file write, backup rotation, or cache invalidation.
+        Returns ``(status, result, actual_generation)`` where status is one of
+        ``applied``, ``not_found``, or ``mismatch``.
+        """
+        with self._lock:
+            if not self._writable:
+                raise OSError("配置处于只读保护状态，请先恢复配置或权限")
+            target = find_app(self._data, app_id)
+            if target is None:
+                return "not_found", None, None
+            actual_generation = runtime_generation(target)
+            if actual_generation != expected_generation:
+                return "mismatch", None, actual_generation
+            previous = json.loads(json.dumps(self._data, ensure_ascii=False))
+            try:
+                result = fn(self._data, target)
+                payload = self._payload(self._data)
+                previous_payload = self._payload(previous)
+                if not self._write_atomic(
+                        self._path + ".bak", previous_payload):
+                    raise OSError("配置备份权限验证失败")
+                self._write_atomic(self._path, payload)
+                invalidate_state_cache()
+                return "applied", result, runtime_generation(target)
+            except Exception:
+                self._data = previous
+                raise
+
+    def replace_if_hash(self, expected_hash, replacement):
+        """Atomically replace the full config only if its normalized hash matches."""
+        return self._replace_if_hash(
+            expected_hash, replacement, normalize_replacement=True
+        )
+
+    def replace_normalized_if_hash(self, expected_hash, replacement):
+        """Commit an already-normalized import payload without re-running probes."""
+        return self._replace_if_hash(
+            expected_hash, replacement, normalize_replacement=False
+        )
+
+    def _replace_if_hash(
+            self, expected_hash, replacement, *, normalize_replacement):
+        with self._lock:
+            if not self._writable:
+                raise OSError("配置处于只读保护状态，请先恢复配置或权限")
+            if config_hash(self._data) != expected_hash:
+                return False
+            if normalize_replacement:
+                normalized = self._normalize(
+                    replacement, strict_runtime=True
+                )
+            else:
+                if (not isinstance(replacement, dict)
+                        or replacement.get("schemaVersion")
+                        != CURRENT_SCHEMA_VERSION
+                        or not isinstance(replacement.get("apps"), list)):
+                    raise ValueError(
+                        "导入配置不是已规范化的当前 schema"
+                    )
+                normalized = json.loads(json.dumps(
+                    replacement, ensure_ascii=False
+                ))
+            previous = json.loads(json.dumps(self._data, ensure_ascii=False))
+            try:
+                if not self._write_atomic(
+                        self._path + ".bak", self._payload(previous)):
+                    raise OSError("配置备份权限验证失败")
+                self._write_atomic(self._path, self._payload(normalized))
+                self._data = normalized
+                invalidate_state_cache()
+                return True
+            except Exception:
+                self._data = previous
+                raise
+
+    def _write_atomic(self, path, payload):
         _ensure_private_dir(os.path.dirname(path) or ".")
         tmp = path + ".tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
+        try:
+            PLATFORM.ensure_private_file(tmp)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = -1
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+        finally:
+            if fd >= 0:
+                os.close(fd)
         os.replace(tmp, path)
-        os.chmod(path, 0o600)
+        try:
+            PLATFORM.ensure_private_file(path)
+        except OSError:
+            # os.replace above is the commit point. The new bytes are already
+            # authoritative, so callers must keep memory aligned with disk.
+            # Fail closed for later writes instead of reporting a false
+            # rollback that would strand an import without its receipt.
+            self._writable = False
+            issue = "配置文件提交后权限验证失败，已进入只读保护"
+            if issue not in self._health_issues:
+                self._health_issues.append(issue)
+            LOG.exception("配置文件提交后权限验证失败: %s", path)
+            return False
+        return True
+
+
+def normalize_import_config(raw):
+    """Migrate and normalize import data through the existing config contract."""
+    migrated, _source_version = migrate_config(raw)
+    return Config._normalize(migrated)
 
 
 def acquire_instance_lock(path=INSTANCE_LOCK_PATH):
-    """Acquire the per-project process lock and keep its file object alive.
-
-    Port fallback alone is not a single-instance guarantee: two servers on
-    :9600/:9601 would still update the same config.  flock ties exclusivity to
-    this data directory and is released automatically if the process crashes.
-    """
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    lock_file = os.fdopen(fd, "r+", encoding="ascii")
-    try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as e:
-        lock_file.close()
-        if e.errno in (errno.EACCES, errno.EAGAIN):
-            return None
-        raise
-    try:
-        os.fchmod(lock_file.fileno(), 0o600)
-        lock_file.seek(0)
-        lock_file.truncate()
-        lock_file.write("%d\n" % SELF_PID)
-        lock_file.flush()
-        os.fsync(lock_file.fileno())
-    except OSError:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        lock_file.close()
-        raise
-    return lock_file
+    """Acquire the native per-data-directory single-instance lock."""
+    return PLATFORM.acquire_instance_lock(path)
 
 
 def release_instance_lock(lock_file):
     if lock_file is None:
         return
-    try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-    finally:
-        lock_file.close()
+    lock_file.release()
 
 
 # ---------------------------------------------------------------- 子进程与解析
 
 def run_cmd(args, timeout=SUBPROCESS_TIMEOUT):
-    """运行命令并返回 stdout；任何异常/超时都返回空串，绝不上抛。"""
+    """Legacy test helper; production platform scans do not use it."""
     try:
         r = subprocess.run(args, capture_output=True, text=True,
                            errors="replace", timeout=timeout)
@@ -617,38 +1197,10 @@ def _to_float(tok, default=0.0):
 
 
 def scan_listeners():
-    """lsof 监听快照 → {(pid, port): {bind_host, ...}}。
-
-    字典仍可像旧集合一样迭代/判断 ``(pid, port)``，同时保留监听地址，
-    供前端区分仅监听 ``::1`` 的服务（需通过 localhost 打开）。
-    """
-    out = run_cmd(["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"])
-    found = {}
-    for line in out.splitlines():
-        if not line or line.startswith("COMMAND"):
-            continue
-        parts = line.split()
-        if len(parts) < 9:
-            continue
-        try:
-            pid = int(parts[1])
-        except ValueError:
-            continue
-        # NAME 列形如 *:8791 / 127.0.0.1:8080 / [::1]:8765，末尾可能跟 "(LISTEN)"
-        port = None
-        bind_host = None
-        for tok in reversed(parts):
-            m = re.search(r":(\d+)$", tok)
-            if m:
-                port = int(m.group(1))
-                bind_host = tok[:m.start()]
-                if bind_host.startswith("[") and bind_host.endswith("]"):
-                    bind_host = bind_host[1:-1]
-                break
-        if port is None:
-            continue
-        found.setdefault((pid, port), set()).add(bind_host or "")
-    return found
+    """Return native listener data while preserving scan failures."""
+    snapshot = PLATFORM.scan_listeners()
+    _record_platform_issues(snapshot.status, snapshot.issues)
+    return snapshot.listeners
 
 
 def listener_open_host(listeners, port, pids=None):
@@ -680,92 +1232,21 @@ def listener_open_host(listeners, port, pids=None):
 
 
 def ps_snapshot(pids=None, with_uid=True):
-    """批量进程信息 → {pid: {"uid","comm","args","cpu","mem","etime"}}。
-
-    pids=None 表示全部进程（ps -ax）。解析：左边固定列 pid[/uid]/etime/cpu/mem，
-    其余部分（可含空格）即 comm；args 单独一次 ps 取。
-    注意：不能用 `comm=` 抑制表头——macOS ps 会把空表头列压到 16 字节截断
-    内容；保留表头后解析时跳过表头行即可（首列非数字的行）。
-    """
-    base = ["ps"]
-    if pids is None:
-        base.append("-ax")
-    else:
-        pids = [int(p) for p in pids]
-        if not pids:
-            return {}
-        base += ["-p", ",".join(str(p) for p in pids)]
-    # comm 必须放在最后一列：macOS ps 只保证最后一列不被定宽截断
-    # （comm 在中间列时会被压成约 16 字节，长路径被砍断）。
-    fields = ["pid"] + (["uid"] if with_uid else []) + \
-             ["etime", "%cpu", "%mem", "comm"]
-    out1 = run_cmd(base + ["-o", ",".join(fields)])
-    out2 = run_cmd(base + ["-o", "pid,args"])
-
-    snap = {}
-    fixed = 5 if with_uid else 4  # pid [uid] etime cpu mem 之后的都是 comm
-    for line in out1.splitlines():
-        toks = line.split()
-        if len(toks) < fixed + 1:
-            continue
-        try:
-            pid = int(toks[0])
-        except ValueError:
-            continue  # 表头行
-        i = 1
-        entry = {"args": ""}
-        if with_uid:
-            try:
-                entry["uid"] = int(toks[1])
-            except ValueError:
-                entry["uid"] = -1
-            i = 2
-        entry["etime"] = parse_etime(toks[i])
-        entry["cpu"] = _to_float(toks[i + 1])
-        entry["mem"] = _to_float(toks[i + 2])
-        entry["comm"] = " ".join(toks[i + 3:])
-        snap[pid] = entry
-    for line in out2.splitlines():
-        toks = line.split(None, 1)
-        if not toks:
-            continue
-        try:
-            pid = int(toks[0])
-        except ValueError:
-            continue
-        if pid in snap:
-            snap[pid]["args"] = toks[1] if len(toks) > 1 else ""
-    return snap
+    snapshot = PLATFORM.process_snapshot(
+        None if pids is None else set(pids), with_owner=with_uid,
+    )
+    _record_platform_issues(snapshot.status, snapshot.issues)
+    return snapshot.processes
 
 
 def lsof_cwds(pids):
-    """lsof -a -p <pids> -d cwd -Fn → {pid: cwd}。"""
-    pids = [int(p) for p in pids]
-    if not pids:
-        return {}
-    out = run_cmd(["lsof", "-a", "-p", ",".join(str(p) for p in pids),
-                   "-d", "cwd", "-Fn"])
-    result = {}
-    cur = None
-    for line in out.splitlines():
-        if line.startswith("p"):
-            try:
-                cur = int(line[1:])
-            except ValueError:
-                cur = None
-        elif line.startswith("n") and cur is not None:
-            result[cur] = line[1:]
-    return result
+    snapshot = PLATFORM.process_cwds(set(pids))
+    _record_platform_issues(snapshot.status, snapshot.issues)
+    return snapshot.cwds
 
 
 def pid_alive(pid):
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except PermissionError:
-        return True
-    except (OSError, ValueError, TypeError):
-        return False
+    return PLATFORM.pid_alive(int(pid))
 
 
 # ---------------------------------------------------------------- 状态构建
@@ -874,19 +1355,14 @@ _ORIGIN_BUNDLE_RE = re.compile(r"/([^/]+)\.app/Contents/MacOS/", re.I)
 _ORIGIN_MULTIPLEXERS = {"tmux": "tmux", "screen": "screen"}
 
 
-def origin_snapshot():
-    """ps -axo pid=,ppid=,args → {pid: (ppid, args)}，供来源溯源。"""
-    table = {}
-    for line in run_cmd(["ps", "-axo", "pid=,ppid=,args"]).splitlines():
-        toks = line.split(None, 2)
-        if len(toks) < 2:
-            continue
-        try:
-            pid, ppid = int(toks[0]), int(toks[1])
-        except ValueError:
-            continue
-        table[pid] = (ppid, toks[2] if len(toks) > 2 else "")
-    return table
+def origin_snapshot(pids=None):
+    """Return {pid: (ppid, args)} for origin attribution."""
+    snapshot = PLATFORM.process_parents(None if pids is None else set(pids))
+    _record_platform_issues(snapshot.status, snapshot.issues)
+    return {
+        pid: (int(info.get("ppid", 0)), str(info.get("args") or ""))
+        for pid, info in snapshot.processes.items()
+    }
 
 
 def attribute_origin(pid, table):
@@ -938,9 +1414,9 @@ def build_services(cfg, groups=None):
     snap = ps_snapshot({pid for pid, _ in listeners}, with_uid=True)
     mine_pids = [pid for pid, _ in listeners
                  if pid != SELF_PID and pid in snap
-                 and snap[pid].get("uid") == SELF_UID]
+                 and process_owned_by_current(snap[pid])]
     cwds = lsof_cwds(mine_pids)
-    origin_table = origin_snapshot()
+    origin_table = origin_snapshot(mine_pids) if mine_pids else {}
 
     hidden = set(cfg.get("hidden") or [])
     pinned = set(cfg.get("pinned") or [])
@@ -955,7 +1431,7 @@ def build_services(cfg, groups=None):
         if pid == SELF_PID:
             continue
         info = snap.get(pid)
-        if not info or info.get("uid") != SELF_UID:
+        if not process_owned_by_current(info):
             continue
         comm = info.get("comm") or ""
         args = info.get("args") or comm
@@ -998,10 +1474,14 @@ def build_watched(keywords):
         normalized.append((keyword, lowered))
     if not normalized:
         return []
-    snap = ps_snapshot(None, with_uid=True)
+    snapshot = PLATFORM.processes_matching_keywords(
+        [keyword for keyword, _ in normalized]
+    )
+    _record_platform_issues(snapshot.status, snapshot.issues)
+    snap = snapshot.processes
     result = []
     for pid, info in sorted(snap.items()):
-        if pid == SELF_PID or info.get("uid") != SELF_UID:
+        if pid == SELF_PID or not process_owned_by_current(info):
             continue
         name = os.path.basename(info.get("comm") or "") or "?"
         if name in ("ps", "lsof"):
@@ -1021,20 +1501,15 @@ def build_watched(keywords):
 
 
 def pgid_members_map():
-    """ps -axo pid=,pgid= → {pgid: [pid, ...]}。
-    进程退出后其子孙仍保留原 pgid（被 launchd 收养也不变），
-    因此按 pgid 能找到「脚本把服务放后台后自己退出」的存活成员。"""
-    groups = {}
-    for line in run_cmd(["ps", "-axo", "pid=,pgid="]).splitlines():
-        parts = line.split()
-        if len(parts) != 2:
-            continue
-        try:
-            pid, pgid = int(parts[0]), int(parts[1])
-        except ValueError:
-            continue
-        groups.setdefault(pgid, []).append(pid)
-    return groups
+    """Return {group_id: [pid, ...]} from the native adapter."""
+    snapshot = PLATFORM.process_groups()
+    _record_platform_issues(snapshot.status, snapshot.issues)
+    result = {}
+    for group_id, info in snapshot.processes.items():
+        members = info.get("members")
+        if isinstance(members, list):
+            result[group_id] = [int(pid) for pid in members]
+    return result
 
 
 def _managed_candidates(app, groups):
@@ -1070,7 +1545,7 @@ def managed_process_index(apps, groups=None):
         marker = RUN_TOKEN_ARG_PREFIX + token if token else None
         current_user = sorted(
             pid for pid in candidates.get(app.get("id"), set())
-            if snap.get(pid, {}).get("uid") == SELF_UID)
+            if process_owned_by_current(snap.get(pid)))
         controller_found = bool(marker and any(
             marker in snap.get(pid, {}).get("args", "") for pid in current_user))
         # 随机标记在进程组的常驻外层 shell 上；校验后整组均为受控后代。
@@ -1114,7 +1589,7 @@ def legacy_managed_pid(app, listeners=None, snap=None, cwds=None):
         cwds = lsof_cwds(port_pids)
     matches = []
     for pid in sorted(port_pids):
-        if snap.get(pid, {}).get("uid") != SELF_UID:
+        if not process_owned_by_current(snap.get(pid)):
             continue
         actual_cwd = cwds.get(pid)
         if not actual_cwd:
@@ -1131,18 +1606,21 @@ def legacy_managed_pid(app, listeners=None, snap=None, cwds=None):
     return matches[0] if app.get("attached") and len(matches) == 1 else None
 
 
-def listener_app_owners(apps, listeners, snap, cwds, groups=None):
+def listener_app_owners(
+        apps, listeners, snap, cwds, groups=None, managed_override=None):
     """返回真实受管监听进程的 ``pid -> app`` 映射。
 
     端口只是配置与网络资源，不能作为进程所有权证明。映射沿用应用状态的
     run token / PGID / UID 校验，并为升级前的进程保留严格 legacy 识别。
     如果异常配置让同一 PID 同时命中多张卡片，则不做关联，避免误导 UI。
     """
-    managed, _, _ = managed_process_index(apps, groups)
+    managed = managed_override
+    if managed is None:
+        managed, _, _ = managed_process_index(apps, groups)
     candidates = {}
     for app in apps:
         live = managed.get(app.get("id"), [])
-        if not live:
+        if not live and managed_override is None:
             legacy_pid = legacy_managed_pid(app, listeners, snap, cwds)
             live = [legacy_pid] if legacy_pid else []
         for pid in live:
@@ -1154,7 +1632,357 @@ def listener_app_owners(apps, listeners, snap, cwds, groups=None):
     }
 
 
-def build_apps(cfg, listeners, groups=None):
+def scheduled_task_path(app):
+    value = app.get("scheduledTaskPath") if isinstance(app, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def elevated_favorite(app):
+    return bool(isinstance(app, dict) and app.get("elevated") is True)
+
+
+def build_scheduled_task_index(cfg):
+    paths = {
+        value for value in (
+            scheduled_task_path(app) for app in (cfg.get("apps") or [])
+        ) if value
+    }
+    if not paths:
+        return {}
+    snapshot = PLATFORM.scheduled_tasks(paths)
+    _record_platform_issues(snapshot.status, snapshot.issues)
+    return snapshot.tasks
+
+
+def scheduled_task_health(task):
+    if not isinstance(task, dict) or task.get("state") == "missing":
+        return {
+            "status": "error",
+            "blocking": True,
+            "issues": [{
+                "kind": "scheduled-task-missing",
+                "title": "Windows 计划任务不存在",
+                "detail": "请重新选择一个已注册的 Windows 计划任务。",
+                "action": "select-scheduled-task",
+            }],
+        }
+    if not task.get("enabled") or task.get("state") == "disabled":
+        return {
+            "status": "error",
+            "blocking": True,
+            "issues": [{
+                "kind": "scheduled-task-disabled",
+                "title": "Windows 计划任务已禁用",
+                "detail": "请先在任务计划程序中启用该任务。",
+                "action": "select-scheduled-task",
+            }],
+        }
+    return {"status": "ok", "blocking": False, "issues": []}
+
+
+def scheduled_task_last_exit(app, task):
+    if ((app.get("kind") or "service") != "task"
+            or not isinstance(task, dict)
+            or task.get("state") in ("running", "queued", "missing")):
+        return public_last_exit(app)
+    result = task.get("lastResult")
+    ended_at = task.get("lastRunAt")
+    if not isinstance(result, int) or not isinstance(ended_at, int):
+        return public_last_exit(app)
+    return {
+        "code": result,
+        "at": ended_at,
+        "status": "succeeded" if result == 0 else "failed",
+    }
+
+
+def scheduled_task_app_row(app, task):
+    task = task if isinstance(task, dict) else {
+        "path": scheduled_task_path(app),
+        "name": scheduled_task_path(app),
+        "state": "missing",
+        "enabled": False,
+        "enginePids": [],
+    }
+    state = task.get("state") or "unknown"
+    running = state == "running"
+    lifecycle_status = (
+        "running" if running else "starting" if state == "queued"
+        else "unknown" if state in ("missing", "unknown") else "stopped"
+    )
+    engine_pids = [
+        int(pid) for pid in (task.get("enginePids") or [])
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+    ]
+    started_at = task.get("lastRunAt")
+    uptime = (
+        max(0, int(time.time()) - started_at)
+        if running and isinstance(started_at, int) else None
+    )
+    health = scheduled_task_health(task)
+    can_run = (
+        state == "ready" and bool(task.get("enabled"))
+        and bool(getattr(PLATFORM.capabilities, "run_scheduled_tasks", False))
+    )
+    can_stop = (
+        state == "running"
+        and bool(getattr(PLATFORM.capabilities, "stop_scheduled_tasks", False))
+    )
+    issue = None
+    if health["blocking"]:
+        first = health["issues"][0]
+        issue = {"code": first["kind"], "message": first["detail"]}
+    command_spec = app.get("commandSpec")
+    if command_spec is None:
+        command_spec = legacy_command_spec(app.get("command") or "")
+    return {
+        "id": app["id"],
+        "name": app["name"],
+        "command": app["command"],
+        "commandSpec": command_spec,
+        "runtimeIdentity": None,
+        "runtimeSource": "windowsTaskScheduler",
+        "scheduledTask": task,
+        "scheduledTaskPath": scheduled_task_path(app),
+        "scheduledTaskControlAvailable": (
+            state != "missing"
+            and bool(getattr(
+                PLATFORM.capabilities, "toggle_scheduled_tasks", False
+            ))
+        ),
+        "dockerResource": None,
+        "docker": None,
+        "lifecycleStatus": lifecycle_status,
+        "controlAvailable": can_run or can_stop,
+        "deleteAvailable": True,
+        "runtimeIssue": issue,
+        "importStatus": "ready",
+        "platformCompatibility": {"status": "ready", "reasons": []},
+        "cwd": None,
+        "port": None,
+        "emoji": app.get("emoji"),
+        "glyph": app.get("glyph"),
+        "icon": app.get("icon"),
+        "favicon": app.get("favicon"),
+        "running": running,
+        "pid": engine_pids[0] if engine_pids else None,
+        "uptimeSec": uptime,
+        "kind": app.get("kind") or "service",
+        "attached": False,
+        "lastExit": scheduled_task_last_exit(app, task),
+        "health": health,
+        "ports": [],
+        "openHosts": {},
+        "listening": False,
+        "portOccupied": False,
+        "portOccupiedPid": None,
+        "portOwner": None,
+        "portConflict": False,
+        "portConflictApps": [],
+        "legacyManaged": False,
+    }
+
+
+def elevation_broker_public(status):
+    if status is None:
+        return {
+            "installed": False, "verified": False,
+            "running": False, "unlocked": False,
+            "issue": None,
+        }
+    issue = getattr(status, "issue", None)
+    return {
+        "installed": bool(getattr(status, "installed", False)),
+        "verified": bool(getattr(status, "verified", False)),
+        "running": bool(getattr(status, "running", False)),
+        "unlocked": bool(getattr(status, "unlocked", False)),
+        "issue": ({
+            "code": issue.code, "message": issue.message,
+        } if issue is not None else None),
+    }
+
+
+def elevated_program_app_row(app, broker_status):
+    broker = elevation_broker_public(broker_status)
+    try:
+        command_spec = normalize_command_spec(app.get("commandSpec"))
+        executable = command_spec.get("executable")
+        spec_valid = (
+            command_spec.get("mode") == "direct"
+            and isinstance(executable, str)
+            and ntpath.isabs(executable)
+            and executable.casefold().endswith(".exe")
+        )
+    except CommandSpecError:
+        spec_valid = False
+    unlocked = (
+        spec_valid and broker["installed"]
+        and broker["verified"] and broker["unlocked"]
+    )
+    if not spec_valid:
+        detail = "收藏的程序不是有效的 absolute EXE。"
+        action = "edit-command"
+    elif not broker["installed"]:
+        detail = "管理员启动代理尚未安装。"
+        action = "install-elevation-broker"
+    elif not broker["verified"]:
+        detail = "管理员启动代理定义无法验证，需要重新安装。"
+        action = "install-elevation-broker"
+    else:
+        detail = "本次 Local Ops 会话尚未输入解锁密码。"
+        action = "unlock-elevation-broker"
+    issues = [] if unlocked else [{
+        "kind": "elevation-broker-locked",
+        "severity": "error",
+        "title": "管理员启动未解锁",
+        "detail": detail,
+        "fix": "请完成代理安装或输入本次会话的解锁密码。",
+        "action": action,
+    }]
+    return {
+        "id": app["id"], "name": app["name"], "command": app["command"],
+        "commandSpec": app.get("commandSpec"),
+        "runtimeIdentity": None,
+        "runtimeSource": "windowsElevationBroker",
+        "scheduledTask": None,
+        "scheduledTaskPath": None,
+        "scheduledTaskControlAvailable": False,
+        "dockerResource": None, "docker": None,
+        "elevated": True,
+        "elevationBroker": broker,
+        "lifecycleStatus": "stopped",
+        "controlAvailable": bool(
+            unlocked and getattr(PLATFORM.capabilities, "launch_elevated", False)
+        ),
+        "deleteAvailable": True,
+        "runtimeIssue": None if unlocked else {
+            "code": "ELEVATION_BROKER_LOCKED", "message": detail,
+        },
+        "importStatus": "ready",
+        "platformCompatibility": {"status": "ready", "reasons": []},
+        "cwd": app.get("cwd"), "port": None,
+        "emoji": app.get("emoji"), "glyph": app.get("glyph"),
+        "icon": app.get("icon"), "favicon": app.get("favicon"),
+        "running": False, "pid": None,
+        "uptimeSec": None, "kind": "program", "attached": False,
+        "lastExit": app.get("lastExit"),
+        "health": {
+            "status": "ok" if unlocked else "error",
+            "blocking": not unlocked, "issues": issues,
+        },
+        "ports": [], "openHosts": {}, "listening": False,
+        "portOccupied": False, "portOccupiedPid": None, "portOwner": None,
+        "portConflict": False, "portConflictApps": [], "legacyManaged": False,
+    }
+
+
+def docker_resource(app):
+    value = app.get("dockerResource") if isinstance(app, dict) else None
+    return value if isinstance(value, dict) else None
+
+
+def build_docker_snapshot(cfg):
+    if not any(docker_resource(app) for app in (cfg.get("apps") or [])):
+        return None
+    return DOCKER.discover()
+
+
+def docker_app_row(app, snapshot):
+    resource = docker_resource(app)
+    containers = {
+        row.get("id"): row for row in (snapshot.containers if snapshot else ())
+        if isinstance(row, dict) and row.get("id")
+    }
+    projects = {
+        row.get("projectName"): row for row in (snapshot.projects if snapshot else ())
+        if isinstance(row, dict) and row.get("projectName")
+    }
+    kind = resource.get("kind") if resource else None
+    observed = (
+        containers.get(resource.get("containerId"))
+        if kind == "container" else projects.get(resource.get("projectName"))
+    ) if resource else None
+    snapshot_ok = snapshot is not None and snapshot.status is not ScanStatus.FAILED
+    issues = []
+    if not snapshot_ok:
+        detail = (
+            snapshot.issues[0].message
+            if snapshot is not None and snapshot.issues else "Docker 状态不可用"
+        )
+        issues.append({
+            "kind": "docker-unavailable", "severity": "error",
+            "title": "Docker 不可用", "detail": detail,
+            "fix": "请启动 Docker Desktop 并确认 docker CLI 可以连接本机 daemon。",
+            "action": None,
+        })
+    elif kind == "container" and observed is None:
+        issues.append({
+            "kind": "docker-container-missing", "severity": "error",
+            "title": "容器不存在", "detail": "收藏的 exact container ID 已不存在。",
+            "fix": "请删除该收藏并重新选择当前容器。", "action": None,
+        })
+    elif kind == "compose":
+        missing = [
+            path for path in (resource.get("configFiles") or [])
+            if not os.path.isfile(path)
+        ]
+        if not os.path.isdir(resource.get("workingDir") or "") or missing:
+            issues.append({
+                "kind": "docker-compose-config-missing", "severity": "error",
+                "title": "Compose 配置不存在",
+                "detail": "工作目录或 Compose 配置文件已移动。",
+                "fix": "请重新收藏当前 Compose 项目。", "action": None,
+            })
+    running = bool(observed and observed.get("running"))
+    blocking = bool(issues)
+    control = (
+        not blocking
+        and bool(getattr(PLATFORM.capabilities, "control_docker", False))
+    )
+    runtime_source = (
+        "dockerContainer" if kind == "container" else "dockerCompose"
+    )
+    issue = None
+    if issues:
+        issue = {"code": issues[0]["kind"], "message": issues[0]["detail"]}
+    return {
+        "id": app["id"], "name": app["name"], "command": app["command"],
+        "commandSpec": app.get("commandSpec"),
+        "runtimeIdentity": None,
+        "runtimeSource": runtime_source,
+        "scheduledTask": None,
+        "scheduledTaskPath": None,
+        "scheduledTaskControlAvailable": False,
+        "dockerResource": resource,
+        "docker": observed,
+        "lifecycleStatus": "unknown" if not snapshot_ok else (
+            "running" if running else "stopped"
+        ),
+        "controlAvailable": control,
+        "deleteAvailable": True,
+        "runtimeIssue": issue,
+        "importStatus": "ready",
+        "platformCompatibility": {"status": "ready", "reasons": []},
+        "cwd": resource.get("workingDir") if kind == "compose" else None,
+        "port": None,
+        "emoji": app.get("emoji"), "glyph": app.get("glyph"),
+        "icon": app.get("icon"), "favicon": app.get("favicon"),
+        "running": running, "pid": None, "uptimeSec": None,
+        "kind": "service", "attached": False,
+        "lastExit": app.get("lastExit"),
+        "health": {
+            "status": "error" if blocking else "ok",
+            "blocking": blocking, "issues": issues,
+        },
+        "ports": [], "openHosts": {}, "listening": False,
+        "portOccupied": False, "portOccupiedPid": None, "portOwner": None,
+        "portConflict": False, "portConflictApps": [], "legacyManaged": False,
+    }
+
+
+def build_apps(
+        cfg, listeners, groups=None, scheduled_tasks=None, docker_snapshot=None,
+        broker_status=None):
     """token 校验通过或严格命中旧版身份的进程才算 running。
 
     多张卡片可共享配置端口；只有当前真实监听者不属于本卡片时才返回
@@ -1164,7 +1992,23 @@ def build_apps(cfg, listeners, groups=None):
     for pid, port in listeners:
         port_map.setdefault(port, []).append(pid)
     apps_cfg = cfg.get("apps") or []
-    managed, snap, _ = managed_process_index(apps_cfg, groups)
+    scheduled_tasks = scheduled_tasks or {}
+    runtime_states = (
+        {app["id"]: inspect_windows_runtime(app) for app in apps_cfg
+         if not scheduled_task_path(app)
+         and not docker_resource(app)
+         and not elevated_favorite(app)}
+        if PLATFORM.name == "windows" else {}
+    )
+    if PLATFORM.name == "windows":
+        managed = {
+            app_id: list(state["members"])
+            for app_id, state in runtime_states.items()
+            if state["verified"] and state["status"] in ("running", "stopping")
+        }
+        snap = {}
+    else:
+        managed, snap, _ = managed_process_index(apps_cfg, groups)
     listen_by_pid = {}
     for pid, port in listeners:
         listen_by_pid.setdefault(pid, []).append(port)
@@ -1178,18 +2022,42 @@ def build_apps(cfg, listeners, groups=None):
                      if configured_listener_pids else {})
     listener_cwds = lsof_cwds(configured_listener_pids)
     verified_owner = listener_app_owners(
-        apps_cfg, listeners, listener_snap, listener_cwds)
+        apps_cfg,
+        listeners,
+        listener_snap,
+        listener_cwds,
+        managed_override=managed if PLATFORM.name == "windows" else None,
+    )
 
     apps = []
     for app in apps_cfg:
+        if elevated_favorite(app):
+            apps.append(elevated_program_app_row(app, broker_status))
+            continue
+        if docker_resource(app):
+            apps.append(docker_app_row(app, docker_snapshot))
+            continue
+        task_path = scheduled_task_path(app)
+        if task_path:
+            apps.append(scheduled_task_app_row(
+                app, scheduled_tasks.get(task_path.casefold())
+            ))
+            continue
+        runtime_state = runtime_states.get(app["id"])
         managed_live = managed.get(app["id"], [])
-        legacy_pid = None if managed_live else legacy_managed_pid(
-            app, listeners, listener_snap, listener_cwds)
+        legacy_pid = (
+            None
+            if PLATFORM.name == "windows" or managed_live
+            else legacy_managed_pid(app, listeners, listener_snap, listener_cwds)
+        )
         if (legacy_pid and
                 (verified_owner.get(legacy_pid) or {}).get("id") != app.get("id")):
             legacy_pid = None
         live = managed_live or ([legacy_pid] if legacy_pid else [])
-        lp = app.get("lastPid")
+        lp = (
+            (app.get("runtimeIdentity") or {}).get("rootPid")
+            if PLATFORM.name == "windows" else app.get("lastPid")
+        )
         pid = lp if lp in live else (live[0] if live else None)
         port = app.get("port")
         configured_listeners = port_map.get(port, []) if port else []
@@ -1211,7 +2079,7 @@ def build_apps(cfg, listeners, groups=None):
                 "cwd": owner_cwd,
                 "project": project_name(owner_cwd),
                 "uid": owner_info.get("uid"),
-                "currentUser": owner_info.get("uid") == SELF_UID,
+                "currentUser": process_owned_by_current(owner_info),
                 "uptimeSec": owner_info.get("etime"),
                 "appId": owner_app.get("id") if owner_app else None,
                 "appName": owner_app.get("name") if owner_app else None,
@@ -1228,12 +2096,66 @@ def build_apps(cfg, listeners, groups=None):
         except Exception as exc:
             LOG.warning("检查应用配置失败（%s）：%s", app.get("id"), exc)
             health = {"status": "unknown", "blocking": False, "issues": []}
+        command_spec = app.get("commandSpec")
+        if command_spec is None:
+            command_spec = legacy_command_spec(app.get("command") or "")
+        try:
+            command_spec = normalize_command_spec(command_spec)
+            compatibility = platform_compatibility(
+                command_spec, app.get("cwd"), PLATFORM.name)
+            if (app.get("importStatus") == "blocked"
+                    and compatibility.get("status") != "blocked"):
+                compatibility = {
+                    "status": "blocked",
+                    "reasons": [{
+                        "code": "COMMAND_SPEC_INVALID",
+                        "message": "The stored command requires correction.",
+                    }],
+                }
+        except CommandSpecError as exc:
+            command_spec = legacy_command_spec(app.get("command") or "")
+            compatibility = {
+                "status": "blocked",
+                "reasons": [{
+                    "code": "COMMAND_SPEC_INVALID",
+                    "message": str(exc),
+                }],
+            }
         apps.append({
             "id": app["id"], "name": app["name"], "command": app["command"],
+            "commandSpec": command_spec,
+            "runtimeIdentity": app.get("runtimeIdentity"),
+            "runtimeSource": "managed",
+            "scheduledTask": None,
+            "scheduledTaskPath": None,
+            "scheduledTaskControlAvailable": False,
+            "dockerResource": None,
+            "docker": None,
+            "lifecycleStatus": (
+                runtime_state["status"]
+                if runtime_state is not None
+                else ("running" if live else "stopped")
+            ),
+            "controlAvailable": (
+                runtime_state["controlAvailable"]
+                if runtime_state is not None else True
+            ),
+            "deleteAvailable": (
+                runtime_state["deleteAvailable"]
+                if runtime_state is not None else True
+            ),
+            "runtimeIssue": (
+                runtime_state["issue"] if runtime_state is not None else None
+            ),
+            "importStatus": compatibility.get("status", "blocked"),
+            "platformCompatibility": compatibility,
             "cwd": app.get("cwd"), "port": port,
             "emoji": app.get("emoji"), "glyph": app.get("glyph"), "icon": app.get("icon"),
             "favicon": app.get("favicon"),
-            "running": bool(live), "pid": pid,
+            "running": (
+                runtime_state["running"]
+                if runtime_state is not None else bool(live)
+            ), "pid": pid,
             "uptimeSec": ((snap.get(pid) or listener_snap.get(pid) or {}).get("etime")
                           if pid else None),
             "kind": app.get("kind") or "service",
@@ -1256,28 +2178,74 @@ def build_apps(cfg, listeners, groups=None):
 
 
 def build_state(cfg, console_port, config_health=None):
+    _begin_platform_scan_cycle()
     degraded_reasons = []
+    visibility_notices = []
     # 一次 pgid 快照供 build_services / build_apps 共享，避免每轮两次全量 ps。
     needs_groups = any(
         app.get("runToken")
         and isinstance(app.get("lastPgid") or app.get("lastPid"), int)
         for app in cfg.get("apps") or [])
-    groups = pgid_members_map() if needs_groups else None
+    try:
+        groups = pgid_members_map() if needs_groups else None
+    except Exception:
+        LOG.exception("构建受控进程组状态失败")
+        groups = {}
+        degraded_reasons.append({"component": "process_groups"})
     try:
         services, listeners = build_services(cfg, groups)
-    except Exception as e:
+    except Exception:
         LOG.exception("构建服务监控状态失败")
         services, listeners = [], set()
         degraded_reasons.append({"component": "services"})
     try:
         watched = build_watched(cfg.get("watchedKeywords"))
-    except Exception as e:
+    except Exception:
         LOG.exception("构建关注进程状态失败")
         watched = []
         degraded_reasons.append({"component": "watched"})
     try:
-        apps = build_apps(cfg, listeners, groups)
-    except Exception as e:
+        scheduled_tasks = build_scheduled_task_index(cfg)
+    except Exception:
+        LOG.exception("构建 Windows 计划任务状态失败")
+        scheduled_tasks = {}
+        if any(scheduled_task_path(app) for app in (cfg.get("apps") or [])):
+            degraded_reasons.append({"component": "scheduled_tasks"})
+    try:
+        docker_snapshot = build_docker_snapshot(cfg)
+        if (docker_snapshot is not None
+                and docker_snapshot.status is ScanStatus.FAILED):
+            degraded_reasons.append({
+                "component": "docker",
+                "error": (
+                    docker_snapshot.issues[0].message
+                    if docker_snapshot.issues else "Docker 状态不可用"
+                ),
+            })
+    except Exception as exc:
+        LOG.exception("构建 Docker 状态失败")
+        docker_snapshot = DockerSnapshot(ScanStatus.FAILED)
+        if any(docker_resource(app) for app in (cfg.get("apps") or [])):
+            degraded_reasons.append({"component": "docker", "error": str(exc)})
+    try:
+        broker_status = (
+            PLATFORM.elevation_broker_status()
+            if getattr(PLATFORM.capabilities, "manage_elevation_broker", False)
+            else None
+        )
+    except Exception as exc:
+        LOG.exception("构建管理员启动代理状态失败")
+        broker_status = None
+        if any(elevated_favorite(app) for app in (cfg.get("apps") or [])):
+            degraded_reasons.append({
+                "component": "elevation_broker", "error": str(exc),
+            })
+    try:
+        apps = build_apps(
+            cfg, listeners, groups, scheduled_tasks, docker_snapshot,
+            broker_status,
+        )
+    except Exception:
         LOG.exception("构建启动台状态失败")
         apps = []
         degraded_reasons.append({"component": "apps"})
@@ -1286,6 +2254,36 @@ def build_state(cfg, console_port, config_health=None):
             {"component": "version", "error": VERSION_LOAD_ERROR})
     for issue in (config_health or {}).get("issues", []):
         degraded_reasons.append({"component": "config", "error": issue})
+    for issue in _consume_platform_scan_issues():
+        if getattr(issue, "degrades", True):
+            reason = {
+                "component": issue.component,
+                "code": issue.code,
+                "error": issue.message,
+            }
+            if reason not in degraded_reasons:
+                degraded_reasons.append(reason)
+        else:
+            notice = {
+                "component": issue.component,
+                "code": issue.code,
+                "message": issue.message,
+            }
+            if notice not in visibility_notices:
+                visibility_notices.append(notice)
+    platform_metadata = PLATFORM.platform_metadata()
+    platform_name = platform_metadata.get("platform", PLATFORM.name)
+    if platform_name == "windows":
+        launch_instruction = "运行 python server.py 启动总控台。"
+        lifecycle_notice = (
+            "仅可控制由 Local Ops 创建且身份验证完整的 Windows Job；"
+            "当前项目不可控时请查看诊断。"
+        )
+        shortcut_modifier = "Ctrl"
+    else:
+        launch_instruction = "运行 start.command 或打开总控台应用。"
+        lifecycle_notice = "仅对总控台验证启动的进程提供生命周期控制。"
+        shortcut_modifier = "⌘"
     return {
         "services": services,
         "watched": watched,
@@ -1296,8 +2294,20 @@ def build_state(cfg, console_port, config_health=None):
         "consoleCwd": BASE_DIR,
         "version": APP_VERSION,
         "schemaVersion": cfg.get("schemaVersion", CURRENT_SCHEMA_VERSION),
+        "platform": platform_name,
+        "capabilities": dict(platform_metadata.get("capabilities") or {}),
+        "elevationBroker": elevation_broker_public(broker_status),
+        "platformInfo": {
+            "shortcutModifier": shortcut_modifier,
+            "dataDir": DATA_DIR,
+            "logsDir": LOGS_DIR,
+            "consoleLogPath": os.path.join(LOGS_DIR, "console.log"),
+            "launchInstruction": launch_instruction,
+            "lifecycleNotice": lifecycle_notice,
+        },
         "degraded": bool(degraded_reasons),
         "degradedReasons": degraded_reasons,
+        "visibilityNotices": visibility_notices,
         "configHealth": dict(config_health or {}),
         "uiTheme": cfg.get("uiTheme") or DEFAULT_UI_THEME,
         "themes": list_themes(),
@@ -1306,16 +2316,18 @@ def build_state(cfg, console_port, config_health=None):
 
 # ---------------------------------------------------------------- 状态快照缓存
 # 每次快照要跑约十余个 ps/lsof 子进程。TTL 略大于前端 2s 轮询周期：
-# 单标签页约每 2-3 轮重建一次，多标签页请求自动合并（锁内构建排队后
-# 第二个请求直接命中缓存）。配置/进程变更时 invalidate 立即失效。
+# 单标签页约每 2-3 轮重建一次，多标签页请求通过独立 build lock 合并。
+# cache lock 只保护元数据；配置/进程变更时 invalidate 立即失效。
 STATE_CACHE_TTL = 2.2  # 秒
 _state_cache_lock = threading.Lock()
-_state_cache = {"mono": 0.0, "state": None}
+_state_build_lock = threading.Lock()
+_state_cache = {"mono": 0.0, "state": None, "epoch": 0}
 
 
 def invalidate_state_cache():
     with _state_cache_lock:
         _state_cache["state"] = None
+        _state_cache["epoch"] = int(_state_cache.get("epoch", 0)) + 1
 
 
 def get_state_snapshot(cfg, console_port):
@@ -1324,10 +2336,25 @@ def get_state_snapshot(cfg, console_port):
         cached = _state_cache["state"]
         if cached is not None and now - _state_cache["mono"] < STATE_CACHE_TTL:
             return cached
-        state = build_state(cfg.snapshot(), console_port, cfg.health_info())
-        _state_cache["mono"] = time.monotonic()
-        _state_cache["state"] = state
-        return state
+    with _state_build_lock:
+        now = time.monotonic()
+        with _state_cache_lock:
+            cached = _state_cache["state"]
+            if cached is not None and now - _state_cache["mono"] < STATE_CACHE_TTL:
+                return cached
+
+        while True:
+            with _state_cache_lock:
+                epoch = int(_state_cache.get("epoch", 0))
+            config_snapshot = cfg.snapshot()
+            config_health = cfg.health_info()
+            state = build_state(config_snapshot, console_port, config_health)
+            with _state_cache_lock:
+                if epoch != int(_state_cache.get("epoch", 0)):
+                    continue
+                _state_cache["mono"] = time.monotonic()
+                _state_cache["state"] = state
+                return state
 
 
 def build_health(cfg):
@@ -1342,6 +2369,11 @@ def build_health(cfg):
             issues.append("%s 目录不存在" % label)
         elif not os.access(path, os.R_OK | os.W_OK | os.X_OK):
             issues.append("%s 目录不可读写" % label)
+        elif PLATFORM.name == "windows":
+            try:
+                PLATFORM.verify_private_directory(path)
+            except (OSError, PermissionError) as e:
+                issues.append("%s 目录 ACL 不符合私有权限要求: %s" % (label, e))
         else:
             try:
                 mode = os.lstat(path).st_mode
@@ -1360,7 +2392,12 @@ def build_health(cfg):
         except OSError as e:
             issues.append("无法检查 %s: %s" % (label, e))
             continue
-        if not stat.S_ISREG(mode) or mode & 0o077:
+        if PLATFORM.name == "windows":
+            try:
+                PLATFORM.verify_private_file(path)
+            except (OSError, PermissionError) as e:
+                issues.append("%s 文件 ACL 不符合私有权限要求: %s" % (label, e))
+        elif not stat.S_ISREG(mode) or mode & 0o077:
             issues.append("%s 文件权限不是 0600" % label)
     degraded = bool(issues)
     snapshot = cfg.snapshot()
@@ -1410,36 +2447,19 @@ def list_themes():
 # ---------------------------------------------------------------- 进程/应用操作
 
 def process_uid(pid):
-    """返回进程 uid；进程不存在返回 None。"""
-    out = run_cmd(["ps", "-o", "uid=", "-p", str(int(pid))])
-    toks = out.split()
-    if not toks:
-        return None
+    """Return the native owner id for one process, or None."""
     try:
-        return int(toks[0])
-    except ValueError:
+        snapshot = PLATFORM.process_snapshot({int(pid)}, with_owner=True)
+        _record_platform_issues(snapshot.status, snapshot.issues)
+    except PlatformScanError:
         return None
+    return process_owner_value(snapshot.processes.get(int(pid)))
 
 
 def kill_process(pid, force):
-    """结束单个进程；只允许当前用户的进程。返回 (ok, error)。"""
-    if pid == SELF_PID:
-        return False, "不能结束总控台自身进程"
-    uid = process_uid(pid)
-    if uid is None:
-        return False, "进程不存在"
-    if uid != SELF_UID:
-        return False, "只能结束当前用户的进程"
-    sig = signal.SIGKILL if force else signal.SIGTERM
-    try:
-        os.kill(pid, sig)
-    except ProcessLookupError:
-        return False, "进程不存在"
-    except PermissionError:
-        return False, "没有权限结束该进程"
-    except OSError as e:
-        return False, "结束失败: %s" % e
-    return True, None
+    """End one external current-user process through the platform boundary."""
+    result = PLATFORM.stop_external_process(int(pid), bool(force))
+    return result.ok, result.error
 
 
 def stop_pid_tree(pid, sig=signal.SIGTERM):
@@ -1450,15 +2470,16 @@ def stop_pid_tree(pid, sig=signal.SIGTERM):
     failures must never be swallowed: callers use them to retain management
     identity instead of creating an orphan process.
     """
-    try:
-        os.killpg(int(pid), sig)
-        return True, None
-    except ProcessLookupError:
-        return True, None
-    except PermissionError:
-        return False, "没有权限停止受控进程组"
-    except OSError as e:
-        return False, "停止受控进程组失败: %s" % e
+    identity = RuntimeIdentity(
+        PLATFORM.name,
+        "group",
+        int(pid),
+        SELF_PRINCIPAL.identifier,
+    )
+    result = PLATFORM.stop_managed(
+        identity, force=sig == getattr(signal, "SIGKILL", None)
+    )
+    return result.ok, result.error
 
 
 def app_running(app, listeners=None):
@@ -1471,36 +2492,11 @@ def app_alive_sign(app, listeners=None):
 
 
 def build_launch_env(token, environ=None):
-    """构建无 Terminal 启动时仍可找到常见开发工具的环境。
-
-    Finder/LSUIElement 启动的应用通常只有系统 PATH，不会读取用户 shell 配置；
-    因此显式补入 Homebrew、npm/pnpm、Volta、NVM、fnm 等常见目录。
-    """
-    env = dict(os.environ if environ is None else environ)
-    home = os.path.expanduser("~")
-    preferred = [
-        os.path.join(home, ".local", "bin"),
-        os.path.join(home, ".volta", "bin"),
-        os.path.join(home, ".bun", "bin"),
-        os.path.join(home, "Library", "pnpm"),
-        os.path.join(home, ".asdf", "shims"),
-        "/opt/homebrew/bin", "/opt/homebrew/sbin",
-        "/usr/local/bin", "/usr/local/sbin",
-    ]
-    preferred.extend(sorted(
-        glob.glob(os.path.join(home, ".nvm", "versions", "node", "*", "bin")),
-        reverse=True))
-    preferred.extend(sorted(
-        glob.glob(os.path.join(home, ".fnm", "node-versions", "*", "installation", "bin")),
-        reverse=True))
-    preferred.extend((env.get("PATH") or "").split(os.pathsep))
-    preferred.extend(("/usr/bin", "/bin", "/usr/sbin", "/sbin"))
-    seen = set()
-    env["PATH"] = os.pathsep.join(
-        path for path in preferred if path and not (path in seen or seen.add(path)))
-    env.setdefault("PNPM_HOME", os.path.join(home, "Library", "pnpm"))
-    env[RUN_TOKEN_ENV] = token
-    return env
+    """Compatibility wrapper for the native launch environment."""
+    builder = getattr(PLATFORM, "launch_environment", None)
+    if builder is None:
+        raise RuntimeError("当前平台尚未实现启动环境")
+    return builder(token, environ)
 
 
 def start_app(app):
@@ -1509,33 +2505,623 @@ def start_app(app):
     log_path = os.path.join(LOGS_DIR, "%s.log" % app["id"])
     rotate_log_file(log_path)
     cwd = app.get("cwd") or os.path.expanduser("~")
+    result = PLATFORM.launch(LaunchRequest(
+        app_id=app["id"],
+        command=app["command"],
+        cwd=cwd,
+        log_path=log_path,
+    ))
+    return (result.ok, result.error, result.process, result.group_id,
+            result.token)
+
+
+def _windows_lifecycle_result(ok, *, code=None, pid=None,
+                              generation_id=None, status=None):
+    result = {"ok": bool(ok)}
+    if code:
+        error = lifecycle_error(code)
+        result.update({"code": error["code"], "error": error["message"]})
+    if pid is not None:
+        result["pid"] = pid
+    if generation_id is not None:
+        result["generationId"] = generation_id
+    if status is not None:
+        result["lifecycleStatus"] = status
+    return result
+
+
+def _windows_inspection_matches(identity, inspection):
+    """Accept inspection evidence only when it is bound to the exact identity."""
+    if not bool(getattr(inspection, "verified", False)):
+        return False
+    observed = getattr(inspection, "identity", None)
+    if observed is None:
+        return False
     try:
-        log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                         0o600)
-        os.fchmod(log_fd, 0o600)
-        logf = os.fdopen(log_fd, "ab", buffering=0)
-    except OSError as e:
-        return False, "无法打开日志文件: %s" % e, None, None, None
-    token = secrets.token_urlsafe(24)
-    env = build_launch_env(token)
-    marker = RUN_TOKEN_ARG_PREFIX + token
-    # 外层 shell 在 argv[0] 中持有随机标记并等待内层；内层等待用户命令
-    # 留下的后台作业。因此进程组既可验证，也不会因启动脚本过早退出而失去锚点。
-    outer_script = '/bin/bash -c "$1"\nconsole_status=$?\nexit "$console_status"'
-    inner_script = (app["command"] +
-                    '\nconsole_status=$?\nwait\nexit "$console_status"')
+        return public_runtime_identity(observed, identity.app_id) == (
+            public_runtime_identity(identity, identity.app_id)
+        )
+    except (ConfigSchemaError, TypeError, ValueError):
+        return False
+
+
+def _windows_terminal_last_exit(app, inspection, *, manually_stopped=False):
+    """Map authenticated terminal receipt metadata to bounded product state."""
+    if manually_stopped:
+        if (app.get("kind") or "service") != "task":
+            return None
+        return {"status": "stopped", "code": None, "at": int(time.time())}
+    if not hasattr(inspection, "exit_code"):
+        return None
+    exit_code = getattr(inspection, "exit_code", None)
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        exit_code = None
+    updated_at = getattr(inspection, "updated_at", None)
+    if isinstance(updated_at, bool) or not isinstance(updated_at, (int, float)):
+        ended_at = int(time.time())
+    else:
+        ended_at = int(updated_at / 1000 if updated_at > 10_000_000_000
+                       else updated_at)
+    value = {"code": exit_code, "at": ended_at}
+    if (app.get("kind") or "service") == "task":
+        value["status"] = (
+            classify_task_exit(exit_code)
+            if exit_code is not None else "failed"
+        )
+    return value
+
+
+def _defer_windows_release(identity):
+    release_key = (str(identity.app_id), str(identity.generation_id))
+    with _WINDOWS_RELEASE_LOCK:
+        previous = _WINDOWS_PENDING_RELEASES.get(release_key) or {"attempts": 0}
+        attempts = int(previous["attempts"]) + 1
+        _WINDOWS_PENDING_RELEASES[release_key] = {
+            "attempts": attempts,
+            "nextAttempt": time.monotonic() + min(60.0, 2.0 ** min(attempts, 6)),
+            "identity": identity,
+        }
+
+
+def _release_windows_runtime_records(identity):
+    release_key = (str(identity.app_id), str(identity.generation_id))
+    with _WINDOWS_RELEASE_LOCK:
+        try:
+            release_managed = getattr(PLATFORM, "release_managed", None)
+            released = (
+                release_managed(identity) if release_managed is not None else None
+            )
+        except Exception:
+            LOG.exception(
+                "Windows runtime record cleanup failed: %s generation %s",
+                release_key[0], release_key[1],
+            )
+            released = None
+        if released is not None and bool(getattr(released, "ok", False)):
+            _WINDOWS_PENDING_RELEASES.pop(release_key, None)
+            return True
+        _defer_windows_release(identity)
+        LOG.warning(
+            "Windows runtime record cleanup deferred for app %s generation %s",
+            release_key[0], release_key[1],
+        )
+        return False
+
+
+def _abort_unpersisted_windows_runtime(identity):
+    """Abort and release only a generation proven absent from config."""
     try:
-        header = "\n===== 启动于 %s =====\n" % time.strftime("%Y-%m-%d %H:%M:%S")
-        logf.write(header.encode("utf-8"))
-        proc = subprocess.Popen(
-            ["/bin/bash", "-c", outer_script, marker, inner_script],
-            cwd=cwd, stdout=logf, stderr=subprocess.STDOUT,
-            start_new_session=True, env=env)
-    except Exception as e:
-        logf.close()
-        return False, "启动失败: %s" % e, None, None, None
-    logf.close()  # 子进程已持有副本，父进程关闭避免 fd 泄漏
-    return True, None, proc, proc.pid, token
+        aborted = PLATFORM.abort_managed(identity)
+    except Exception:
+        LOG.exception("Windows prepared Job abort failed: %s", identity.app_id)
+        _defer_windows_release(identity)
+        return False
+    if not bool(getattr(aborted, "ok", False)):
+        _defer_windows_release(identity)
+        return False
+    return _release_windows_runtime_records(identity)
+
+
+def _persist_windows_cleanup_identity(cfg, app_id, identity):
+    """Retain an ambiguous generation so restart reconciliation can finish it."""
+    try:
+        public = public_runtime_identity(identity, app_id)
+    except (ConfigSchemaError, TypeError, ValueError):
+        return False
+
+    def persist(_data, target):
+        target["runtimeIdentity"] = public
+        target["lastPid"] = None
+        target["lastPgid"] = None
+        target["runToken"] = None
+        target["attached"] = False
+        return True
+
+    try:
+        status, saved, _ = cfg.mutate_app_if_generation(
+            app_id, None, persist
+        )
+    except OSError:
+        return False
+    return status == "applied" and bool(saved)
+
+
+def _abort_or_retain_windows_runtime(cfg, app_id, identity):
+    """Clean an unpublished generation or durably retain its exact identity."""
+    with _WINDOWS_RELEASE_LOCK:
+        if _abort_unpersisted_windows_runtime(identity):
+            return True
+        return _persist_windows_cleanup_identity(cfg, app_id, identity)
+
+
+def _clear_windows_generation(cfg, app, inspection, *, manually_stopped=False):
+    generation_id = runtime_generation(app)
+    try:
+        identity = native_runtime_identity(app)
+    except (ConfigSchemaError, TypeError, ValueError):
+        return False, "invalid"
+    if identity is None:
+        return False, "invalid"
+    release_key = (str(identity.app_id), str(identity.generation_id))
+    with _WINDOWS_RELEASE_LOCK:
+        pending = _WINDOWS_PENDING_RELEASES.get(release_key)
+        if pending is not None and time.monotonic() < pending["nextAttempt"]:
+            return False, "cleanup_pending"
+        last_exit = _windows_terminal_last_exit(
+            app, inspection, manually_stopped=manually_stopped
+        )
+
+        def op(_data, target):
+            target["runtimeIdentity"] = None
+            target["lastPid"] = None
+            target["lastPgid"] = None
+            target["runToken"] = None
+            target["attached"] = False
+            if last_exit is not None:
+                target["lastExit"] = last_exit
+            return True
+
+        try:
+            status, cleared, _ = cfg.mutate_app_if_generation(
+                app["id"], generation_id, op
+            )
+        except OSError:
+            return False, "failed"
+        if status != "applied" or not cleared:
+            return False, status
+
+        if _release_windows_runtime_records(identity):
+            return True, status
+
+        # Keep the terminal identity when possible so a later state reconciliation
+        # can authenticate the same receipt and retry exact-generation cleanup.
+        public = public_runtime_identity(identity, app["id"])
+
+        def restore(_data, target):
+            target["runtimeIdentity"] = public
+            return True
+
+        try:
+            restore_status, restored, _ = cfg.mutate_app_if_generation(
+                app["id"], None, restore
+            )
+        except OSError:
+            restore_status, restored = "failed", False
+        return False, (
+            "cleanup_pending"
+            if restore_status == "applied" and restored else "cleanup_failed"
+        )
+
+
+def _retry_windows_pending_releases(cfg):
+    """Retry exact terminal cleanup, including records recovered after restart."""
+    if PLATFORM.name != "windows":
+        return
+    with _WINDOWS_RELEASE_LOCK:
+        persisted = {
+            (str(app.get("id")), str(runtime_generation(app)))
+            for app in cfg.snapshot().get("apps", [])
+            if runtime_generation(app) is not None
+        }
+        try:
+            recover = getattr(PLATFORM, "recover_managed_cleanups", None)
+            recovered = recover() if recover is not None else ()
+        except Exception:
+            LOG.exception("Windows terminal cleanup recovery failed")
+            recovered = ()
+        for identity in recovered:
+            key = (str(identity.app_id), str(identity.generation_id))
+            if key in persisted:
+                continue
+            _WINDOWS_PENDING_RELEASES.setdefault(key, {
+                "attempts": 0,
+                "nextAttempt": 0.0,
+                "identity": identity,
+            })
+        now = time.monotonic()
+        due = [
+            (key, value["identity"])
+            for key, value in _WINDOWS_PENDING_RELEASES.items()
+            if key not in persisted and now >= value["nextAttempt"]
+        ]
+        for key, identity in due:
+            current = _WINDOWS_PENDING_RELEASES.get(key)
+            if current is None:
+                continue
+            current_app = find_app(cfg.snapshot(), key[0])
+            if current_app is not None and runtime_generation(current_app) == key[1]:
+                # The identity was restored after an earlier release failure.
+                # Its authenticated terminal reconciliation owns the next CAS.
+                continue
+            _release_windows_runtime_records(identity)
+
+
+def _inspect_windows_terminal(identity):
+    """Return a verified terminal inspection, or None without guessing."""
+    try:
+        inspection = PLATFORM.inspect_managed(identity)
+    except Exception:
+        LOG.exception("Windows runtime reconciliation failed: %s", identity.app_id)
+        return None
+    if not _windows_inspection_matches(identity, inspection):
+        return None
+    members = tuple(getattr(inspection, "members", ()) or ())
+    status = getattr(inspection, "status", None)
+    if (not bool(getattr(inspection, "running", False))
+            and not members and status in ("exited", "failed")):
+        return inspection
+    return None
+
+
+def start_windows_app(cfg, app):
+    """Prepare, persist, activate, and verify one new Windows Job generation."""
+    if not bool(cfg.health_info().get("writable")):
+        return _windows_lifecycle_result(False, code="LAUNCH_COMMIT_FAILED")
+    generation_id = str(uuid.uuid4())
+    _ensure_private_dir(LOGS_DIR)
+    log_path = os.path.join(LOGS_DIR, "%s.log" % app["id"])
+    rotate_log_file(log_path)
+    cwd = app.get("cwd") or os.path.expanduser("~")
+    try:
+        command_spec = normalize_command_spec(app.get("commandSpec"))
+        # Revalidate the native boundary before the runner creates any process.
+        prepared_invocation(command_spec)
+        prepared = PLATFORM.launch(LaunchRequest(
+            app_id=app["id"],
+            command=app["command"],
+            cwd=cwd,
+            log_path=log_path,
+            command_spec=command_spec,
+            generation_id=generation_id,
+        ))
+    except Exception:
+        LOG.exception("Windows managed launch preparation failed: %s", app["id"])
+        return _windows_lifecycle_result(
+            False, code="LAUNCH_PREPARE_FAILED"
+        )
+    identity = getattr(prepared, "runtime_identity", None)
+    if not getattr(prepared, "ok", False) or identity is None:
+        if identity is not None:
+            _abort_or_retain_windows_runtime(cfg, app["id"], identity)
+        return _windows_lifecycle_result(False, code=(
+            prepared.code
+            if getattr(prepared, "code", None) in _LIFECYCLE_ERROR_MESSAGES
+            else "LAUNCH_PREPARE_FAILED"
+        ))
+    try:
+        public = public_runtime_identity(identity, app["id"])
+        if (public["generationId"] != generation_id
+                or getattr(prepared, "status", None) != "prepared"):
+            raise ConfigSchemaError("runner did not prepare the requested generation")
+    except (ConfigSchemaError, TypeError, ValueError):
+        _abort_or_retain_windows_runtime(cfg, app["id"], identity)
+        return _windows_lifecycle_result(False, code="LAUNCH_PREPARE_FAILED")
+
+    def persist(_data, target):
+        target["runtimeIdentity"] = public
+        target["lastPid"] = None
+        target["lastPgid"] = None
+        target["runToken"] = None
+        target["attached"] = False
+        if (target.get("kind") or "service") != "task":
+            target["lastExit"] = None
+        return True
+
+    try:
+        commit_status, saved, _ = cfg.mutate_app_if_generation(
+            app["id"], None, persist
+        )
+    except Exception:
+        commit_status, saved = "failed", False
+    config_writable = bool(cfg.health_info().get("writable"))
+    if commit_status != "applied" or not saved or not config_writable:
+        current = find_app(cfg.snapshot(), app["id"])
+        identity_was_persisted = (
+            current is not None
+            and runtime_generation(current) == generation_id
+        )
+        if identity_was_persisted:
+            try:
+                PLATFORM.abort_managed(identity)
+            except Exception:
+                LOG.exception("Windows launch rollback failed: %s", app["id"])
+        else:
+            _abort_or_retain_windows_runtime(cfg, app["id"], identity)
+        return _windows_lifecycle_result(False, code="LAUNCH_COMMIT_FAILED")
+
+    try:
+        activation = PLATFORM.activate_managed(identity)
+    except Exception:
+        LOG.exception("Windows managed activation response failed: %s", app["id"])
+        activation = None
+    try:
+        inspection = PLATFORM.inspect_managed(identity)
+    except Exception:
+        inspection = None
+    if inspection is not None and _windows_inspection_matches(identity, inspection):
+        members = tuple(getattr(inspection, "members", ()) or ())
+        inspection_status = getattr(inspection, "status", None)
+        if (bool(getattr(inspection, "running", False))
+                and members and inspection_status == "running"):
+            return _windows_lifecycle_result(
+                True,
+                pid=(getattr(activation, "process_id", None)
+                     or identity.root_pid),
+                generation_id=generation_id,
+                status="running",
+            )
+        if (not bool(getattr(inspection, "running", False))
+                and not members and inspection_status in ("exited", "failed")):
+            current = find_app(cfg.snapshot(), app["id"])
+            cleared = False
+            clear_status = "not_found"
+            if current is not None:
+                cleared, clear_status = _clear_windows_generation(
+                    cfg, current, inspection
+                )
+            if ((app.get("kind") or "service") == "task"
+                    and inspection_status == "exited" and cleared):
+                return _windows_lifecycle_result(
+                    True,
+                    pid=identity.root_pid,
+                    generation_id=generation_id,
+                    status="stopped",
+                )
+            if clear_status == "mismatch":
+                return _windows_lifecycle_result(
+                    False, code="GENERATION_MISMATCH"
+                )
+    # Resume may have reached the runner even when its response was lost. Keep
+    # the persisted identity so a later authenticated inspect can reconcile it.
+    return _windows_lifecycle_result(False, code="LAUNCH_ACTIVATE_FAILED")
+
+
+def start_scheduled_task_app(platform, app):
+    path = scheduled_task_path(app)
+    if not path:
+        return {
+            "ok": False,
+            "error": "应用没有关联 Windows 计划任务",
+            "code": "SCHEDULED_TASK_NOT_CONFIGURED",
+        }
+    result = platform.run_scheduled_task(path)
+    payload = {
+        "ok": bool(getattr(result, "ok", False)),
+        "taskPath": getattr(result, "task_path", path) or path,
+        "runtimeSource": "windowsTaskScheduler",
+    }
+    if not payload["ok"]:
+        payload["error"] = (
+            getattr(result, "error", None) or "Windows 计划任务启动失败"
+        )
+        payload["code"] = (
+            getattr(result, "code", None) or "SCHEDULED_TASK_RUN_FAILED"
+        )
+    return payload
+
+
+def stop_scheduled_task_app(platform, app):
+    path = scheduled_task_path(app)
+    if not path:
+        return {
+            "ok": False,
+            "error": "应用没有关联 Windows 计划任务",
+            "code": "SCHEDULED_TASK_NOT_CONFIGURED",
+        }
+    result = platform.stop_scheduled_task(path)
+    payload = {
+        "ok": bool(getattr(result, "ok", False)),
+        "taskPath": getattr(result, "task_path", path) or path,
+        "runtimeSource": "windowsTaskScheduler",
+    }
+    if not payload["ok"]:
+        payload["error"] = (
+            getattr(result, "error", None) or "Windows 计划任务停止失败"
+        )
+        payload["code"] = (
+            getattr(result, "code", None) or "SCHEDULED_TASK_STOP_FAILED"
+        )
+    return payload
+
+
+def set_scheduled_task_enabled_app(platform, app, enabled):
+    path = scheduled_task_path(app)
+    if not path:
+        return {
+            "ok": False,
+            "error": "应用没有关联 Windows 计划任务",
+            "code": "SCHEDULED_TASK_NOT_CONFIGURED",
+        }
+    result = platform.set_scheduled_task_enabled(path, enabled)
+    payload = {
+        "ok": bool(getattr(result, "ok", False)),
+        "taskPath": getattr(result, "task_path", path) or path,
+        "enabled": enabled,
+        "runtimeSource": "windowsTaskScheduler",
+    }
+    if not payload["ok"]:
+        payload["error"] = (
+            getattr(result, "error", None) or "Windows 计划任务状态修改失败"
+        )
+        payload["code"] = (
+            getattr(result, "code", None) or "SCHEDULED_TASK_TOGGLE_FAILED"
+        )
+    return payload
+
+
+def control_docker_app(controller, app, start):
+    resource = docker_resource(app)
+    if not resource:
+        return {
+            "ok": False, "error": "应用没有关联 Docker 资源",
+            "code": "DOCKER_RESOURCE_NOT_CONFIGURED",
+        }
+    result = controller.start(resource) if start else controller.stop(resource)
+    payload = {
+        "ok": bool(getattr(result, "ok", False)),
+        "runtimeSource": (
+            "dockerContainer" if resource.get("kind") == "container"
+            else "dockerCompose"
+        ),
+    }
+    if not payload["ok"]:
+        payload["error"] = getattr(result, "error", None) or "Docker 操作失败"
+        payload["code"] = getattr(result, "code", None) or "DOCKER_CONTROL_FAILED"
+    return payload
+
+
+def launch_elevated_program_app(platform, app):
+    result = platform.launch_elevated(
+        app.get("commandSpec"), app.get("cwd")
+    )
+    payload = {
+        "ok": bool(getattr(result, "ok", False)),
+        "pid": getattr(result, "process_id", None),
+        "runtimeSource": "windowsElevationBroker",
+    }
+    if not payload["ok"]:
+        payload["error"] = getattr(result, "error", None) or "管理员程序启动失败"
+        payload["code"] = getattr(result, "code", None) or "ELEVATED_LAUNCH_FAILED"
+    return payload
+
+
+def stop_windows_app(
+        cfg, app, *, force=False, timeout=APP_STOP_TIMEOUT_SEC,
+        initial_inspection=None):
+    """Stop only the authenticated Job and clear only the same generation."""
+    try:
+        identity = native_runtime_identity(app)
+    except (ConfigSchemaError, TypeError, ValueError):
+        return _windows_lifecycle_result(False, code="RUNTIME_IDENTITY_INVALID")
+    if identity is None:
+        return _windows_lifecycle_result(False, code="GENERATION_MISMATCH")
+    before = initial_inspection
+    if before is None:
+        try:
+            before = PLATFORM.inspect_managed(identity)
+        except Exception:
+            before = None
+    if before is not None and _windows_inspection_matches(identity, before):
+        before_members = tuple(getattr(before, "members", ()) or ())
+        before_status = getattr(before, "status", None)
+        if (not bool(getattr(before, "running", False))
+                and not before_members and before_status in ("exited", "failed")):
+            cleared, cas_status = _clear_windows_generation(
+                cfg, app, before, manually_stopped=True
+            )
+            if cleared:
+                return _windows_lifecycle_result(
+                    True,
+                    generation_id=identity.generation_id,
+                    status="stopped",
+                )
+            return _windows_lifecycle_result(
+                False,
+                code=("GENERATION_MISMATCH" if cas_status == "mismatch"
+                      else "RUNTIME_CONTROL_FAILED"),
+            )
+        controllable_statuses = (
+            ("running", "stopping") if force else ("running",)
+        )
+        if not (bool(getattr(before, "running", False))
+                and before_members and before_status in controllable_statuses):
+            return _windows_lifecycle_result(
+                False, code="RUNTIME_IDENTITY_UNVERIFIED"
+            )
+    else:
+        return _windows_lifecycle_result(
+            False, code="RUNTIME_IDENTITY_UNVERIFIED"
+        )
+    try:
+        result = PLATFORM.stop_managed(
+            identity, force=bool(force), timeout=float(timeout)
+        )
+    except Exception:
+        LOG.exception("Windows managed stop failed: %s", app["id"])
+        result = None
+    terminal = _inspect_windows_terminal(identity)
+    if terminal is not None:
+        cleared, cas_status = _clear_windows_generation(
+            cfg, app, terminal, manually_stopped=True
+        )
+        if cleared:
+            return _windows_lifecycle_result(
+                True,
+                generation_id=identity.generation_id,
+                status="stopped",
+            )
+        return _windows_lifecycle_result(
+            False,
+            code=("GENERATION_MISMATCH" if cas_status == "mismatch"
+                  else "RUNTIME_CONTROL_FAILED"),
+        )
+    code = getattr(result, "code", None)
+    if (code == "STOP_TIMEOUT"
+            or bool(getattr(result, "still_running", False))
+            or getattr(result, "status", None) in ("running", "stopping")):
+        return _windows_lifecycle_result(False, code="STOP_TIMEOUT")
+    if code in _LIFECYCLE_ERROR_MESSAGES:
+        return _windows_lifecycle_result(False, code=code)
+    return _windows_lifecycle_result(False, code="RUNTIME_CONTROL_FAILED")
+
+
+def reconcile_windows_terminal_runtimes(cfg):
+    """Clear only authenticated terminal receipts for the exact persisted generation."""
+    if PLATFORM.name != "windows":
+        return
+    _retry_windows_pending_releases(cfg)
+    for app in cfg.snapshot().get("apps", []):
+        if app.get("runtimeIdentity") is None:
+            continue
+        try:
+            identity = native_runtime_identity(app)
+        except (ConfigSchemaError, TypeError, ValueError):
+            continue
+        terminal = _inspect_windows_terminal(identity)
+        if terminal is not None:
+            _clear_windows_generation(cfg, app, terminal)
+
+
+def start_windows_runtime_reconciler(cfg, interval=30.0):
+    """Run authenticated terminal cleanup without delaying HTTP state reads."""
+    stop = threading.Event()
+    if PLATFORM.name != "windows":
+        return stop
+
+    def _reconcile_loop():
+        while not stop.is_set():
+            try:
+                reconcile_windows_terminal_runtimes(cfg)
+            except Exception:
+                LOG.exception("Windows runtime background reconciliation failed")
+            stop.wait(max(1.0, float(interval)))
+
+    threading.Thread(
+        target=_reconcile_loop,
+        name="windows-runtime-reconciler",
+        daemon=True,
+    ).start()
+    return stop
 
 
 def startup_failure_message(app_id, code):
@@ -1634,19 +3220,46 @@ def stop_app_for_update(cfg, app, timeout=5.0):
 
 
 def pick_path(what):
-    """macOS 原生文件/目录选择框（osascript）。返回 (path|None, canceled)。"""
-    if what == "dir":
-        script = 'POSIX path of (choose folder with prompt "选择工作目录")'
-    else:
-        script = 'POSIX path of (choose file with prompt "选择批处理脚本")'
-    try:
-        r = subprocess.run(["osascript", "-e", script],
-                           capture_output=True, text=True, timeout=180)
-    except Exception:
-        return None, False
-    if r.returncode != 0:  # 用户按了取消（"User canceled."）
-        return None, True
-    return r.stdout.strip().rstrip("/") or None, False
+    """Open the native file/folder picker."""
+    return PLATFORM.pick_path(what)
+
+
+def command_import_status(command_spec, cwd):
+    """Return the persisted Phase 3 status from the platform contract."""
+    status = platform_compatibility(command_spec, cwd, PLATFORM.name).get(
+        "status")
+    return status if status in ("ready", "needs_review", "blocked") else "blocked"
+
+
+def picker_payload(path, what):
+    """Return native path components so the browser never parses separators."""
+    normalized = os.path.abspath(os.path.expanduser(str(path)))
+    parent = os.path.dirname(normalized)
+    stem = os.path.splitext(os.path.basename(normalized))[0]
+    payload = {
+        "ok": True,
+        "canceled": False,
+        "path": normalized,
+        "dir": parent,
+        "stem": stem,
+    }
+    if what == "script":
+        python_executable = (
+            select_python_executable(
+                PLATFORM.name,
+                current_executable=sys.executable,
+                current_version=sys.version_info[:2],
+                frozen=bool(getattr(sys, "frozen", False)),
+            ) if PLATFORM.name == "windows" else None)
+        spec = command_spec_for_script(
+            normalized, PLATFORM.name, python_executable)
+        payload["command"] = (display_command(spec)
+                              if PLATFORM.name == "windows"
+                              else command_for_script(normalized))
+        payload["commandSpec"] = spec
+        payload["platformCompatibility"] = platform_compatibility(
+            spec, parent, PLATFORM.name)
+    return payload
 
 
 def command_for_script(path):
@@ -1755,6 +3368,10 @@ def _script_target(tokens, cwd):
 
 def inspect_app_health(app):
     """静态检查配置是否可运行；只读文件系统，绝不执行或展开用户命令。"""
+    if PLATFORM.name == "windows":
+        spec = app.get("commandSpec") or legacy_command_spec(
+            app.get("command") or "")
+        return static_preflight(spec, app.get("cwd"), "windows")
     issues = []
 
     def add(kind, title, detail, fix, action):
@@ -1899,7 +3516,10 @@ def detect_project(root):
     """只读分析项目根目录，返回可由启动台直接使用的启动候选。"""
     if not isinstance(root, str) or not root.strip():
         return None, "请选择项目文件夹"
-    root = os.path.abspath(os.path.expanduser(root.strip()))
+    raw_root = root.strip()
+    if PLATFORM.name == "windows" and not is_local_windows_path(raw_root):
+        return None, "项目文件夹不存在或不可访问"
+    root = os.path.abspath(os.path.expanduser(raw_root))
     if not os.path.isdir(root):
         return None, "项目文件夹不存在或不可访问"
 
@@ -1914,13 +3534,21 @@ def detect_project(root):
         return exists
 
     def add(command, label, source, port=None, priority=50, detail=None,
-            kind="service"):
+            kind="service", command_spec=None):
         if not command or any(item["command"] == command for item in candidates):
             return
         if port is not None and not (isinstance(port, int) and 1 <= port <= 65535):
             port = None
+        if command_spec is None:
+            command_spec = legacy_command_spec(command)
+        command_spec = normalize_command_spec(command_spec)
+        if PLATFORM.name == "windows":
+            command = display_command(command_spec)
         candidates.append({
             "command": command,
+            "commandSpec": command_spec,
+            "platformCompatibility": platform_compatibility(
+                command_spec, root, PLATFORM.name),
             "label": label,
             "source": source,
             "port": port,
@@ -1928,6 +3556,12 @@ def detect_project(root):
             "detail": detail,
             "_priority": priority,
         })
+
+    def native_spec(executable, args=()):
+        if PLATFORM.name == "windows":
+            return command_spec_for_executable(
+                executable, args, platform_name="windows", cwd=root)
+        return direct_command_spec(executable, args)
 
     # Node / 前端 / 博客项目：优先读取 package.json 的 scripts。
     package = {}
@@ -1989,18 +3623,21 @@ def detect_project(root):
             port = _port_from_command(script)
             if port is None:
                 port = _package_default_port(str(name).lower(), script, deps)
+            spec = native_spec(runner.split()[0], [
+                *runner.split()[1:], str(name)])
             add(command, labels.get(str(name).lower(), "项目脚本：%s" % name),
                 "package.json · scripts.%s" % name, port,
-                10 + index, "由项目自己的脚本定义")
+                10 + index, "由项目自己的脚本定义", command_spec=spec)
 
     # Hexo 即使没有 scripts 也有稳定 CLI：服务与清缓存分别作为服务/任务。
     if is_hexo:
         if hexo_config:
             note_file("_config.yml")
         add("hexo s", "Hexo 本地服务", "Hexo 项目结构", 4000, 8,
-            "等同于 hexo server")
+            "等同于 hexo server", command_spec=native_spec("hexo", ["s"]))
         add("hexo cl", "Hexo 清除缓存", "Hexo 项目结构", None, 9,
-            "清除缓存和已生成文件，不启动服务", kind="task")
+            "清除缓存和已生成文件，不启动服务", kind="task",
+            command_spec=native_spec("hexo", ["cl"]))
 
     # 常见博客与静态站点生成器。
     hugo_config = next((name for name in ("hugo.toml", "hugo.yaml", "hugo.yml")
@@ -2011,13 +3648,15 @@ def detect_project(root):
         source = hugo_config or "config.toml"
         note_file(source)
         add("hugo server -D", "Hugo 本地预览", source, 1313, 18,
-            "包含草稿内容")
+            "包含草稿内容",
+            command_spec=native_spec("hugo", ["server", "-D"]))
 
     gemfile = _read_project_text(root, "Gemfile")
     if gemfile is not None:
         note_file("Gemfile", gemfile)
         if "jekyll" in gemfile.lower():
-            add("bundle exec jekyll serve", "Jekyll 本地预览", "Gemfile", 4000, 19)
+            add("bundle exec jekyll serve", "Jekyll 本地预览", "Gemfile", 4000, 19,
+                command_spec=native_spec("bundle", ["exec", "jekyll", "serve"]))
 
     # Python Web 项目。
     pyproject = _read_project_text(root, "pyproject.toml")
@@ -2033,7 +3672,16 @@ def detect_project(root):
     if os.path.isfile(os.path.join(root, "manage.py")):
         note_file("manage.py")
         prefix = "uv run python" if python_runner == "uv run" else "python3"
-        add(prefix + " manage.py runserver", "Django 开发服务器", "manage.py", 8000, 20)
+        django_spec = (native_spec("uv", ["run", "python", "manage.py", "runserver"])
+                       if python_runner == "uv run" else
+                       python_command_spec(
+                           ["manage.py", "runserver"],
+                           platform_name=PLATFORM.name,
+                           current_executable=sys.executable,
+                           current_version=sys.version_info[:2],
+                           frozen=bool(getattr(sys, "frozen", False))))
+        add(prefix + " manage.py runserver", "Django 开发服务器", "manage.py", 8000, 20,
+            command_spec=django_spec)
     else:
         for module_file in ("app.py", "main.py", "server.py"):
             module_text = _read_project_text(root, module_file)
@@ -2049,20 +3697,49 @@ def detect_project(root):
             if "streamlit" in py_deps or imports_streamlit:
                 note_file(module_file, module_text)
                 prefix = "uv run" if python_runner == "uv run" else "python3 -m"
+                streamlit_spec = (native_spec("uv", ["run", "streamlit", "run", module_file])
+                                  if python_runner == "uv run" else
+                                  python_command_spec(
+                                      ["-m", "streamlit", "run", module_file],
+                                      platform_name=PLATFORM.name,
+                                      current_executable=sys.executable,
+                                      current_version=sys.version_info[:2],
+                                      frozen=bool(getattr(sys, "frozen", False))))
                 add(prefix + " streamlit run " + module_file,
-                    "Streamlit 应用", module_file, 8501, 22)
+                    "Streamlit 应用", module_file, 8501, 22,
+                    command_spec=streamlit_spec)
                 break
             if "fastapi" in py_deps or imports_fastapi:
                 note_file(module_file, module_text)
                 prefix = "uv run" if python_runner == "uv run" else "python3 -m"
+                uvicorn_args = ["uvicorn", "%s:app" % module, "--reload"]
+                fastapi_spec = (native_spec("uv", ["run", *uvicorn_args])
+                                if python_runner == "uv run" else
+                                python_command_spec(
+                                    ["-m", *uvicorn_args],
+                                    platform_name=PLATFORM.name,
+                                    current_executable=sys.executable,
+                                    current_version=sys.version_info[:2],
+                                    frozen=bool(getattr(sys, "frozen", False))))
                 add(prefix + " uvicorn %s:app --reload" % module,
-                    "FastAPI 开发服务器", module_file, 8000, 23)
+                    "FastAPI 开发服务器", module_file, 8000, 23,
+                    command_spec=fastapi_spec)
                 break
             if "flask" in py_deps or imports_flask:
                 note_file(module_file, module_text)
                 prefix = "uv run" if python_runner == "uv run" else "python3 -m"
+                flask_args = ["flask", "--app", module, "run", "--debug"]
+                flask_spec = (native_spec("uv", ["run", *flask_args])
+                              if python_runner == "uv run" else
+                              python_command_spec(
+                                  ["-m", *flask_args],
+                                  platform_name=PLATFORM.name,
+                                  current_executable=sys.executable,
+                                  current_version=sys.version_info[:2],
+                                  frozen=bool(getattr(sys, "frozen", False))))
                 add(prefix + " flask --app %s run --debug" % module,
-                    "Flask 开发服务器", module_file, 5000, 24)
+                    "Flask 开发服务器", module_file, 5000, 24,
+                    command_spec=flask_spec)
                 break
 
     # Docker Compose、Go、Rust 和已有的常用启动脚本。
@@ -2077,26 +3754,52 @@ def detect_project(root):
             if match and 1 <= int(match.group(1)) <= 65535:
                 port = int(match.group(1))
         add("docker compose up", "Docker Compose", compose_name, port, 55,
-            "以前台方式运行，停止按钮可正常关闭")
+            "以前台方式运行，停止按钮可正常关闭",
+            command_spec=native_spec("docker", ["compose", "up"]))
     if os.path.isfile(os.path.join(root, "go.mod")):
         note_file("go.mod")
-        add("go run .", "Go 项目", "go.mod", None, 60)
+        add("go run .", "Go 项目", "go.mod", None, 60,
+            command_spec=native_spec("go", ["run", "."]))
     if os.path.isfile(os.path.join(root, "Cargo.toml")):
         note_file("Cargo.toml")
-        add("cargo run", "Rust 项目", "Cargo.toml", None, 61)
+        add("cargo run", "Rust 项目", "Cargo.toml", None, 61,
+            command_spec=native_spec("cargo", ["run"]))
 
-    for script_name in ("start.command", "dev.command", "run.command", "start.sh", "dev.sh", "run.sh"):
+    script_names = (
+        ("start.cmd", "dev.cmd", "run.cmd",
+         "start.bat", "dev.bat", "run.bat",
+         "start.ps1", "dev.ps1", "run.ps1",
+         "start.command", "dev.command", "run.command",
+         "start.sh", "dev.sh", "run.sh")
+        if PLATFORM.name == "windows" else
+        ("start.command", "dev.command", "run.command",
+         "start.sh", "dev.sh", "run.sh")
+    )
+    for script_name in script_names:
         if os.path.isfile(os.path.join(root, script_name)):
             note_file(script_name)
-            add("bash %s" % shlex.quote("./" + script_name),
+            script_spec = command_spec_for_script(
+                os.path.join(root, script_name), PLATFORM.name)
+            command = (display_command(script_spec)
+                       if PLATFORM.name == "windows"
+                       else "bash %s" % shlex.quote("./" + script_name))
+            add(command,
                 "现有启动脚本", script_name, None, 70,
-                "也可以继续使用“选择脚本”手动指定")
-            break
+                "也可以继续使用“选择脚本”手动指定",
+                command_spec=script_spec)
+            if PLATFORM.name != "windows":
+                break
 
     # 纯静态站点最后兜底，避免把 Vite/Next 等项目误当成普通文件目录。
     if not candidates and os.path.isfile(os.path.join(root, "index.html")):
         note_file("index.html")
-        add("python3 -m http.server 8000", "静态网站预览", "index.html", 8000, 90)
+        add("python3 -m http.server 8000", "静态网站预览", "index.html", 8000, 90,
+            command_spec=python_command_spec(
+                ["-m", "http.server", "8000"],
+                platform_name=PLATFORM.name,
+                current_executable=sys.executable,
+                current_version=sys.version_info[:2],
+                frozen=bool(getattr(sys, "frozen", False))))
 
     candidates.sort(key=lambda item: item.pop("_priority"))
     return {
@@ -2120,7 +3823,7 @@ def _current_user_group_members(pgid):
         return []
     snap = ps_snapshot(members, with_uid=True)
     return sorted(pid for pid in members
-                  if snap.get(pid, {}).get("uid") == SELF_UID)
+                  if process_owned_by_current(snap.get(pid)))
 
 
 def resolve_app_stop_target(app, listeners=None):
@@ -2134,11 +3837,9 @@ def resolve_app_stop_target(app, listeners=None):
     legacy_pid = legacy_managed_pid(app, listeners)
     if legacy_pid:
         if app.get("attached"):
-            try:
-                pgid = os.getpgid(legacy_pid)
-            except (ProcessLookupError, PermissionError, OSError):
-                pgid = None
-            if isinstance(pgid, int) and pgid > 0 and pgid != os.getpgrp():
+            pgid = PLATFORM.process_group_id(legacy_pid)
+            own_group = PLATFORM.current_process_group_id()
+            if isinstance(pgid, int) and pgid > 0 and pgid != own_group:
                 members = _current_user_group_members(pgid)
                 member_cwds = lsof_cwds(members)
                 expected_cwd = app.get("cwd")
@@ -2163,42 +3864,27 @@ def resolve_app_stop_target(app, listeners=None):
 
 def signal_app_stop(target, sig=signal.SIGTERM):
     """Signal a target returned by resolve_app_stop_target."""
-    ident = target["id"]
-    if target["kind"] == "group":
-        return stop_pid_tree(ident, sig)
-    try:
-        os.kill(ident, sig)
-        return True, None
-    except ProcessLookupError:
-        return True, None
-    except PermissionError:
-        return False, "没有权限停止受控进程"
-    except OSError as e:
-        return False, "停止受控进程失败: %s" % e
+    identity = RuntimeIdentity(
+        PLATFORM.name,
+        target["kind"],
+        target["id"],
+        SELF_PRINCIPAL.identifier,
+        tuple(target.get("members") or ()),
+    )
+    result = PLATFORM.stop_managed(
+        identity, force=sig == getattr(signal, "SIGKILL", None)
+    )
+    return result.ok, result.error
 
 
 def stop_target_alive(target, expected_uid=None):
     if target["kind"] == "group":
-        try:
-            os.killpg(target["id"], 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return True
-    try:
-        os.kill(target["id"], 0)
-        if expected_uid is None:
-            expected_uid = process_uid(target["id"])
-        return expected_uid == SELF_UID
-    except ProcessLookupError:
+        return bool(_current_user_group_members(target["id"]))
+    if not PLATFORM.pid_alive(target["id"]):
         return False
-    except PermissionError:
-        return True
-    except OSError:
-        return True
+    if expected_uid is None:
+        expected_uid = process_uid(target["id"])
+    return expected_uid in (SELF_UID, SELF_PRINCIPAL.identifier)
 
 
 def stop_app_and_wait(app, timeout=APP_STOP_TIMEOUT_SEC, listeners=None):
@@ -2273,7 +3959,7 @@ def inspect_attach_process(cfg, app, pid):
     if (pid, port) not in listeners:
         return False, "PID %d 并未监听端口 %d，进程可能已退出" % (pid, port), {"status": 409}
     snap = ps_snapshot({pid}, with_uid=True)
-    if snap.get(pid, {}).get("uid") != SELF_UID:
+    if not process_owned_by_current(snap.get(pid)):
         return False, "该进程不属于当前用户，不能认领", {"status": 403}
     cfg_now = cfg.snapshot()
     owners = listener_app_owners(cfg_now.get("apps") or [], listeners, snap, None)
@@ -2656,18 +4342,91 @@ def validate_port(value):
     return port, None
 
 
+def normalize_scheduled_task_path(value):
+    if value is None or value == "":
+        return None, None
+    if not isinstance(value, str):
+        return None, "scheduledTaskPath 必须是字符串或 null"
+    if any(ord(char) < 32 for char in value) or '"' in value:
+        return None, "scheduledTaskPath 包含非法字符"
+    normalized = "\\" + value.strip().replace("/", "\\").lstrip("\\")
+    parts = normalized.split("\\")[1:]
+    if (len(normalized) > 512 or not parts or any(
+            not part or part in (".", "..") for part in parts)):
+        return None, "scheduledTaskPath 不是有效的 Windows 计划任务路径"
+    return normalized, None
+
+
+def scheduled_task_command(path):
+    return 'schtasks.exe /Run /TN "%s"' % path
+
+
+def scheduled_task_command_spec(path):
+    executable = os.path.join(
+        os.environ.get("SystemRoot") or r"C:\Windows", "System32", "schtasks.exe"
+    )
+    return direct_command_spec(executable, ["/Run", "/TN", path])
+
+
+def docker_resource_command_spec(resource):
+    if resource["kind"] == "container":
+        args = ["container", "start", resource["containerId"]]
+    else:
+        args = [
+            "compose", "--project-name", resource["projectName"],
+            "--project-directory", resource["workingDir"],
+        ]
+        for path in resource["configFiles"]:
+            args.extend(["--file", path])
+        args.extend(["up", "--detach"])
+    return direct_command_spec("docker", args)
+
+
+def docker_resource_command(resource):
+    return display_command(docker_resource_command_spec(resource))
+
+
 def validate_app_fields(data, partial):
     """校验/规范化应用字段。partial=True 时仅校验出现的字段。
     返回 (fields, error)：fields 为规范化后的字段子集。"""
     fields = {}
+    if "dockerResource" in data:
+        value = data["dockerResource"]
+        if value is None:
+            fields["dockerResource"] = None
+        else:
+            try:
+                fields["dockerResource"] = normalize_docker_resource(value)
+            except ValueError as exc:
+                return None, "dockerResource 无效: %s" % exc
+    elif not partial:
+        fields["dockerResource"] = None
+    if "scheduledTaskPath" in data:
+        task_path, err = normalize_scheduled_task_path(data["scheduledTaskPath"])
+        if err:
+            return None, err
+        fields["scheduledTaskPath"] = task_path
+    elif not partial:
+        fields["scheduledTaskPath"] = None
     for key in ("name", "command"):
         if key in data:
             v = data[key]
             if not isinstance(v, str) or not v.strip():
                 return None, "字段 %s 必须是非空字符串" % key
             fields[key] = v.strip()
-        elif not partial:
+        elif not partial and not (
+                key == "command" and fields.get("dockerResource")):
             return None, "缺少字段 %s" % key
+    if "commandSpec" in data:
+        try:
+            fields["commandSpec"] = normalize_command_spec(
+                data["commandSpec"])
+        except CommandSpecError as exc:
+            return None, "commandSpec 无效: %s" % exc
+    elif "command" in fields:
+        # Legacy clients remain valid, but a changed display command must not
+        # leave an older structured command attached to the app.
+        fields["commandSpec"] = legacy_command_spec(fields["command"])
     if "cwd" in data:
         v = data["cwd"]
         if v is not None and not isinstance(v, str):
@@ -2696,14 +4455,50 @@ def validate_app_fields(data, partial):
         fields["glyph"] = (v or None)
     elif not partial:
         fields["glyph"] = None
+    if "elevated" in data:
+        if not isinstance(data["elevated"], bool):
+            return None, "elevated 必须是布尔值"
+        fields["elevated"] = data["elevated"]
+    elif not partial:
+        fields["elevated"] = False
     if "kind" in data:
-        if data["kind"] not in ("service", "task"):
-            return None, "kind 必须是 service/task"
+        if data["kind"] not in ("service", "task", "program"):
+            return None, "kind 必须是 service/task/program"
         fields["kind"] = data["kind"]
     elif not partial:
         fields["kind"] = "service"
-    if fields.get("kind") == "task":
-        fields["port"] = None  # 批处理任务无端口语义
+    if fields.get("kind") in ("task", "program"):
+        fields["port"] = None  # Tasks and launch-only programs have no port.
+    task_path = fields.get("scheduledTaskPath")
+    resource = fields.get("dockerResource")
+    if task_path and resource:
+        return None, "scheduledTaskPath 与 dockerResource 不能同时设置"
+    if fields.get("elevated") and (task_path or resource):
+        return None, "管理员程序不能同时关联计划任务或 Docker 资源"
+    if task_path:
+        fields["command"] = scheduled_task_command(task_path)
+        fields["commandSpec"] = scheduled_task_command_spec(task_path)
+        fields["cwd"] = None
+        fields["port"] = None
+    elif resource:
+        fields["commandSpec"] = docker_resource_command_spec(resource)
+        fields["command"] = docker_resource_command(resource)
+        fields["cwd"] = (
+            resource["workingDir"] if resource["kind"] == "compose" else None
+        )
+        fields["port"] = None
+        fields["kind"] = "service"
+    elif fields.get("elevated"):
+        spec = fields.get("commandSpec")
+        executable = spec.get("executable") if isinstance(spec, dict) else None
+        if (not isinstance(spec, dict) or spec.get("mode") != "direct"
+                or not isinstance(executable, str)
+                or not is_local_windows_path(executable)
+                or not ntpath.isabs(executable)
+                or not executable.casefold().endswith(".exe")):
+            return None, "管理员程序必须使用绝对路径的 direct EXE"
+        fields["kind"] = "program"
+        fields["port"] = None
     return fields, None
 
 
@@ -2715,7 +4510,12 @@ def serialized_app_operation(fn):
     def wrapped(self, app_id, *args, **kwargs):
         lock = self.server.try_app_operation(app_id)
         if lock is None:
-            self.send_err(409, "该应用正在执行其他操作，请稍后重试")
+            self.discard_body()
+            self.send_err(
+                409,
+                "该应用正在执行其他操作，请稍后重试",
+                "APP_OPERATION_IN_PROGRESS",
+            )
             return None
         try:
             return fn(self, app_id, *args, **kwargs)
@@ -2726,7 +4526,11 @@ def serialized_app_operation(fn):
 
 class ConsoleServer(ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    allow_reuse_address = False
+
+    def server_bind(self):
+        PLATFORM.configure_server_socket(self.socket)
+        super().server_bind()
 
     def __init__(self, addr, handler_cls, cfg, port):
         super().__init__(addr, handler_cls)
@@ -2743,7 +4547,8 @@ class ConsoleServer(ThreadingHTTPServer):
         """空闲连接超时 / 客户端中途断开属正常现象，不刷 traceback。"""
         exc_type, exc, _ = sys.exc_info()
         if exc_type and isinstance(exc, (TimeoutError, BrokenPipeError,
-                                         ConnectionResetError)):
+                                         ConnectionResetError,
+                                         ConnectionAbortedError)):
             return
         super().handle_error(request, client_address)
 
@@ -2798,6 +4603,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         sys.stderr.write("%s - %s\n" % (self.client_address[0], fmt % args))
+
+    def _require_capability(self, name, message):
+        if getattr(PLATFORM.capabilities, name, False):
+            return True
+        self.send_err(409, message, "CAPABILITY_DISABLED")
+        return False
 
     def _parsed_request_host(self):
         """Return (hostname, port) only for the exact local console origin."""
@@ -2940,8 +4751,11 @@ class Handler(BaseHTTPRequestHandler):
         self._send(json.dumps(obj, ensure_ascii=False).encode("utf-8"),
                    status, "application/json; charset=utf-8")
 
-    def send_err(self, status, msg):
-        self.send_json({"ok": False, "error": msg}, status)
+    def send_err(self, status, msg, code=None):
+        payload = {"ok": False, "error": msg}
+        if code:
+            payload["code"] = code
+        self.send_json(payload, status)
 
     def discard_body(self):
         """读掉并丢弃请求体。keep-alive 连接复用前必须清空，
@@ -2984,6 +4798,62 @@ class Handler(BaseHTTPRequestHandler):
             return None, None
         return cfg, app
 
+    def _read_json_request(self):
+        data, error = self.read_json_body()
+        if error:
+            self.send_err(400, error, "INVALID_REQUEST")
+            return None
+        return data
+
+    def _expected_generation(self, data):
+        expected, error = normalize_expected_generation(
+            data, required=PLATFORM.name == "windows")
+        if error:
+            self.send_err(400, error, "GENERATION_REQUIRED")
+            return False, None
+        return True, expected
+
+    def _generation_matches(self, app, expected_generation):
+        if PLATFORM.name != "windows":
+            return True
+        if runtime_generation(app) == expected_generation:
+            return True
+        self.send_err(
+            409,
+            "应用运行代次已变化，请刷新状态后重试",
+            "GENERATION_MISMATCH",
+        )
+        return False
+
+    def _send_app_cas_failure(self, status):
+        if status == "not_found":
+            self.send_err(404, "应用不存在")
+        else:
+            self.send_err(
+                409,
+                "应用运行代次已变化，请刷新状态后重试",
+                "GENERATION_MISMATCH",
+            )
+
+    def _send_windows_lifecycle_result(self, result):
+        if result.get("ok"):
+            self.send_json(result)
+            return
+        code = result.get("code") or "RUNTIME_CONTROL_FAILED"
+        status = {
+            "GENERATION_REQUIRED": 400,
+            "GENERATION_MISMATCH": 409,
+            "RUNTIME_IDENTITY_INVALID": 409,
+            "RUNTIME_IDENTITY_UNVERIFIED": 409,
+            "RUNTIME_RECORD_INSECURE": 409,
+            "LAUNCH_PREPARE_FAILED": 500,
+            "LAUNCH_COMMIT_FAILED": 409,
+            "LAUNCH_ACTIVATE_FAILED": 500,
+            "STOP_TIMEOUT": 409,
+            "RUNTIME_CONTROL_FAILED": 500,
+        }.get(code, 500)
+        self.send_json(result, status)
+
     # ---------- GET ----------
 
     def do_GET(self):
@@ -3001,6 +4871,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/state":
                 self.send_json(get_state_snapshot(self.server.cfg,
                                                   self.server.console_port))
+                return
+            if path == "/api/windows/scheduled-tasks":
+                self.handle_scheduled_tasks_list(parsed.query)
+                return
+            if path == "/api/docker/resources":
+                self.handle_docker_resources_list()
                 return
             if path == "/api/console/log":
                 self.handle_console_log(parsed.query)
@@ -3047,6 +4923,55 @@ class Handler(BaseHTTPRequestHandler):
             self._send(b"404 Not Found", 404, set_cookie=False)
             return
         self._send(data, 200, ctype, set_cookie=False)
+
+    def handle_scheduled_tasks_list(self, query):
+        if not self._require_capability(
+                "monitor_scheduled_tasks",
+                "当前平台未启用 Windows 计划任务监控"):
+            return
+        snapshot = PLATFORM.scheduled_tasks(None)
+        if snapshot.status is ScanStatus.FAILED:
+            message = (
+                snapshot.issues[0].message if snapshot.issues
+                else "Windows 计划任务读取失败"
+            )
+            self.send_err(503, message, "SCHEDULED_TASK_QUERY_FAILED")
+            return
+        params = urllib.parse.parse_qs(query or "", keep_blank_values=True)
+        include_system = (params.get("includeSystem") or [""])[0] == "1"
+        tasks = [
+            dict(task) for task in snapshot.tasks.values()
+            if include_system or not str(task.get("path") or "").casefold().startswith(
+                "\\microsoft\\"
+            )
+        ]
+        tasks.sort(key=lambda item: str(item.get("path") or "").casefold())
+        self.send_json({
+            "ok": True,
+            "tasks": tasks,
+            "partial": snapshot.status is ScanStatus.PARTIAL,
+            "issues": [issue.message for issue in snapshot.issues],
+        })
+
+    def handle_docker_resources_list(self):
+        if not self._require_capability(
+                "monitor_docker", "当前平台未启用 Docker 资源监控"):
+            return
+        snapshot = DOCKER.discover()
+        if snapshot.status is ScanStatus.FAILED:
+            message = (
+                snapshot.issues[0].message if snapshot.issues
+                else "Docker 资源读取失败"
+            )
+            self.send_err(503, message, "DOCKER_QUERY_FAILED")
+            return
+        self.send_json({
+            "ok": True,
+            "containers": list(snapshot.containers),
+            "projects": list(snapshot.projects),
+            "partial": snapshot.status is ScanStatus.PARTIAL,
+            "issues": [issue.message for issue in snapshot.issues],
+        })
 
     def serve_icon(self, path):
         name = os.path.basename(urllib.parse.unquote(path[len("/icons/"):]))
@@ -3116,6 +5041,24 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/project/detect":
                 self.handle_project_detect()
                 return
+            if path == "/api/config/import/preview":
+                self.handle_config_import_preview()
+                return
+            if path == "/api/config/import/commit":
+                self.handle_config_import_commit()
+                return
+            if path == "/api/config/import/rollback":
+                self.handle_config_import_rollback()
+                return
+            if path == "/api/windows/elevation-broker/install":
+                self.handle_elevation_broker_install()
+                return
+            if path == "/api/windows/elevation-broker/unlock":
+                self.handle_elevation_broker_unlock()
+                return
+            if path == "/api/windows/elevation-broker/lock":
+                self.handle_elevation_broker_lock()
+                return
             if path == "/api/console/restart":
                 self.discard_body()
                 self.handle_console_restart()
@@ -3134,15 +5077,12 @@ class Handler(BaseHTTPRequestHandler):
             if m:
                 app_id, action = m.group(1), m.group(2)
                 if action == "start":
-                    self.discard_body()
                     self.handle_app_start(app_id)
                     return
                 if action == "stop":
-                    self.discard_body()
                     self.handle_app_stop(app_id)
                     return
                 if action == "restart":
-                    self.discard_body()
                     self.handle_app_restart(app_id)
                     return
                 if action == "diagnose":
@@ -3151,6 +5091,9 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if action == "attach":
                     self.handle_app_attach(app_id)
+                    return
+                if action == "scheduled-enabled":
+                    self.handle_scheduled_task_enabled(app_id)
                     return
                 if action == "icon":
                     self.handle_icon_upload(app_id)
@@ -3168,31 +5111,127 @@ class Handler(BaseHTTPRequestHandler):
     def handle_pick(self):
         data, err = self.read_json_body()
         if err:
-            self.send_err(400, err)
+            self.send_err(400, err, "INVALID_REQUEST")
+            return
+        if not self._require_capability(
+                "pick_path", "当前平台未启用系统路径选择器"):
             return
         what = data.get("what")
         if what not in ("dir", "script"):
-            self.send_err(400, "what 必须是 dir/script")
+            self.send_err(400, "what 必须是 dir/script", "INVALID_REQUEST")
             return
-        path, canceled = pick_path(what)
-        if canceled:  # 用户取消不是错误，前端静默
+        result = pick_path(what)
+        if result.issue:
+            LOG.warning("系统选择框失败（%s）", result.issue.code)
+            self.send_err(500, "无法打开系统选择框", "PICKER_UNAVAILABLE")
+        elif result.canceled:  # 用户取消不是错误，前端静默
             self.send_json({"ok": True, "canceled": True})
-        elif not path:
-            self.send_json({"ok": False, "error": "无法打开系统选择框"})
+        elif not result.path:
+            self.send_err(500, "无法打开系统选择框", "PICKER_UNAVAILABLE")
         else:
-            result = {"ok": True, "path": path}
-            if what == "script":
-                result["command"] = command_for_script(path)
-            self.send_json(result)
+            self.send_json(picker_payload(result.path, what))
 
     def handle_project_detect(self):
         data, err = self.read_json_body()
         if err:
-            self.send_err(400, err)
+            self.send_err(400, err, "INVALID_REQUEST")
             return
         result, err = detect_project(data.get("cwd"))
         if err:
-            self.send_err(400, err)
+            self.send_err(400, err, "INVALID_PATH")
+            return
+        self.send_json(result)
+
+    def _import_available(self):
+        if PLATFORM.name == "windows":
+            return True
+        self.send_err(
+            409,
+            "当前平台不提供 macOS 到 Windows 的配置导入",
+            "CAPABILITY_DISABLED",
+        )
+        return False
+
+    def _read_import_request(self):
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err, "INVALID_REQUEST")
+            return None
+        return data
+
+    def _send_import_error(self, exc):
+        self.send_err(exc.http_status, exc.message, exc.code)
+
+    def handle_config_import_preview(self):
+        data = self._read_import_request()
+        if data is None or not self._import_available():
+            return
+        try:
+            result = preview_import(
+                data.get("sourcePath"),
+                data.get("pathMappings", []),
+                self.server.cfg.snapshot(),
+                normalize_config=normalize_import_config,
+            )
+        except ConfigImportError as exc:
+            self._send_import_error(exc)
+            return
+        self.send_json(result)
+
+    def handle_config_import_commit(self):
+        data = self._read_import_request()
+        if data is None or not self._import_available():
+            return
+        if not self.server.cfg.health_info().get("writable"):
+            self.send_err(
+                409,
+                "配置处于只读保护状态，请先恢复配置或权限",
+                "CONFIG_READ_ONLY",
+            )
+            return
+        try:
+            _ensure_private_dir(IMPORT_RECORDS_DIR)
+            result = commit_import(
+                data.get("sourcePath"),
+                data.get("pathMappings", []),
+                data.get("previewId"),
+                data.get("selectedAppIds"),
+                records_dir=IMPORT_RECORDS_DIR,
+                get_target=self.server.cfg.snapshot,
+                replace_target=self.server.cfg.replace_normalized_if_hash,
+                normalize_config=normalize_import_config,
+                ensure_private_file=PLATFORM.ensure_private_file,
+            )
+        except ConfigImportError as exc:
+            self._send_import_error(exc)
+            return
+        except OSError:
+            self.send_err(500, "无法写入私有导入记录", "IMPORT_COMMIT_FAILED")
+            return
+        self.send_json(result)
+
+    def handle_config_import_rollback(self):
+        data = self._read_import_request()
+        if data is None or not self._import_available():
+            return
+        if not self.server.cfg.health_info().get("writable"):
+            self.send_err(
+                409,
+                "配置处于只读保护状态，请先恢复配置或权限",
+                "CONFIG_READ_ONLY",
+            )
+            return
+        try:
+            result = rollback_import(
+                data.get("importId"),
+                records_dir=IMPORT_RECORDS_DIR,
+                get_target=self.server.cfg.snapshot,
+                replace_target=self.server.cfg.replace_normalized_if_hash,
+                normalize_config=normalize_import_config,
+                ensure_private_file=PLATFORM.ensure_private_file,
+            )
+        except ConfigImportError as exc:
+            self._send_import_error(exc)
             return
         self.send_json(result)
 
@@ -3218,6 +5257,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"ok": True, "theme": theme_id})
 
     def handle_console_restart(self):
+        if not self._require_capability(
+                "restart_console", "当前平台或阶段未启用总控台重启"):
+            return
         reserved, current, helper_pid = self.server.reserve_console_action("restart")
         if not reserved:
             if current == "restart":
@@ -3242,6 +5284,9 @@ class Handler(BaseHTTPRequestHandler):
                         "port": self.server.console_port})
 
     def handle_console_stop(self):
+        if not self._require_capability(
+                "restart_console", "当前平台或阶段未启用总控台停止"):
+            return
         reserved, current, _ = self.server.reserve_console_action("stop")
         if not reserved:
             if current == "stop":
@@ -3260,6 +5305,9 @@ class Handler(BaseHTTPRequestHandler):
         data, err = self.read_json_body()
         if err:
             self.send_err(400, err)
+            return
+        if not self._require_capability(
+                "kill_external", "当前平台或阶段禁止结束外部进程"):
             return
         pid = data.get("pid")
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
@@ -3333,9 +5381,15 @@ class Handler(BaseHTTPRequestHandler):
                 or attach_pid <= 0):
             self.send_err(400, "attachPid 必须是正整数")
             return
+        if attach_pid is not None and not self._require_capability(
+                "attach_external", "当前平台或阶段禁止认领外部进程"):
+            return
         fields, err = validate_app_fields(data, partial=False)
         if err:
-            self.send_err(400, err)
+            self.send_err(
+                400, err,
+                "COMMAND_SPEC_INVALID"
+                if err.startswith("commandSpec 无效:") else None)
             return
 
         snapshot = self.server.cfg.snapshot()
@@ -3344,6 +5398,17 @@ class Handler(BaseHTTPRequestHandler):
             new_id = secrets.token_hex(4)
         app = {"id": new_id, "name": fields["name"],
                "command": fields["command"], "cwd": fields["cwd"],
+               "commandSpec": fields["commandSpec"],
+               "runtimeIdentity": None,
+               "scheduledTaskPath": fields["scheduledTaskPath"],
+               "dockerResource": fields["dockerResource"],
+               "elevated": fields["elevated"],
+               "importStatus": (
+                   "ready" if (
+                       fields["scheduledTaskPath"] or fields["dockerResource"]
+                   ) else "needs_review" if fields["elevated"] else
+                   command_import_status(fields["commandSpec"], fields["cwd"])
+               ),
                "port": fields["port"], "emoji": fields["emoji"],
                "glyph": fields["glyph"], "kind": fields["kind"],
                "icon": None, "favicon": None, "lastPid": None,
@@ -3466,10 +5531,73 @@ class Handler(BaseHTTPRequestHandler):
 
     @serialized_app_operation
     def handle_app_start(self, app_id):
+        if (PLATFORM.name != "windows"
+                and int(self.headers.get("Content-Length") or 0) == 0):
+            data = {}
+        else:
+            data = self._read_json_request()
+            if data is None:
+                return
+        valid, expected_generation = self._expected_generation(data)
+        if not valid:
+            return
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
-        if app_alive_sign(app):
+        if not self._generation_matches(app, expected_generation):
+            return
+        if elevated_favorite(app):
+            if not self._require_capability(
+                    "launch_elevated", "当前平台未启用管理员程序启动"):
+                return
+            result = launch_elevated_program_app(PLATFORM, app)
+            if result.get("ok"):
+                invalidate_state_cache()
+            self.send_json(result, 200 if result.get("ok") else 409)
+            return
+        if docker_resource(app):
+            if not self._require_capability(
+                    "control_docker", "当前平台未启用 Docker 资源控制"):
+                return
+            result = control_docker_app(DOCKER, app, True)
+            if result.get("ok"):
+                invalidate_state_cache()
+            self.send_json(result, 200 if result.get("ok") else 409)
+            return
+        if scheduled_task_path(app):
+            if not self._require_capability(
+                    "run_scheduled_tasks", "当前平台未启用 Windows 计划任务运行"):
+                return
+            if expected_generation is not None:
+                self.send_err(
+                    409, "计划任务监控不使用受管运行代次",
+                    "GENERATION_MISMATCH",
+                )
+                return
+            result = start_scheduled_task_app(PLATFORM, app)
+            if result.get("ok"):
+                invalidate_state_cache()
+            self.send_json(result, 200 if result.get("ok") else 409)
+            return
+        if not self._require_capability(
+                "launch_managed", "当前平台或阶段未启用应用启动"):
+            return
+        if PLATFORM.name == "windows" and expected_generation is not None:
+            self.send_err(
+                409,
+                "应用已有受管运行代次，请刷新状态后重试",
+                "GENERATION_MISMATCH",
+            )
+            return
+        if (PLATFORM.name == "windows"
+                and app.get("runtimeIdentity") is not None):
+            self.send_err(
+                409,
+                "应用已有受管运行代次，请刷新状态后重试",
+                "GENERATION_MISMATCH",
+            )
+            return
+        if PLATFORM.name != "windows" and app_alive_sign(app):
             self.send_json({"ok": False, "error": "应用已在运行"})
             return
         health = inspect_app_health(app)
@@ -3486,6 +5614,11 @@ class Handler(BaseHTTPRequestHandler):
         if occupied:
             self.send_json({"ok": False, "error": "端口 %d 已被 PID %d 占用" %
                             (port, occupied[0][0])}, 409)
+            return
+        if PLATFORM.name == "windows":
+            self._send_windows_lifecycle_result(
+                start_windows_app(self.server.cfg, app)
+            )
             return
         ok, err, proc, pgid, token = start_app(app)
         if not ok:
@@ -3513,8 +5646,90 @@ class Handler(BaseHTTPRequestHandler):
 
     @serialized_app_operation
     def handle_app_stop(self, app_id):
+        if (PLATFORM.name != "windows"
+                and int(self.headers.get("Content-Length") or 0) == 0):
+            data = {}
+        else:
+            data = self._read_json_request()
+            if data is None:
+                return
+        force = data.get("force", False)
+        if not isinstance(force, bool):
+            self.send_err(400, "force 必须是布尔值", "INVALID_REQUEST")
+            return
+        valid, expected_generation = self._expected_generation(data)
+        if not valid:
+            return
         _, app = self._get_app_or_404(app_id)
         if app is None:
+            return
+        if elevated_favorite(app):
+            self.send_err(
+                409, "管理员程序收藏只提供启动入口",
+                "ELEVATED_STOP_UNSUPPORTED",
+            )
+            return
+        if docker_resource(app):
+            if expected_generation is not None:
+                self.send_err(
+                    409, "Docker 资源不使用受管运行代次", "GENERATION_MISMATCH"
+                )
+                return
+            if force:
+                self.send_err(
+                    409, "Docker 资源停止不支持强制模式",
+                    "DOCKER_FORCE_UNSUPPORTED",
+                )
+                return
+            if not self._require_capability(
+                    "control_docker", "当前平台未启用 Docker 资源控制"):
+                return
+            result = control_docker_app(DOCKER, app, False)
+            if result.get("ok"):
+                invalidate_state_cache()
+            self.send_json(result, 200 if result.get("ok") else 409)
+            return
+        if scheduled_task_path(app):
+            if not self._require_capability(
+                    "stop_scheduled_tasks", "当前平台未启用 Windows 计划任务停止"):
+                return
+            if expected_generation is not None:
+                self.send_err(
+                    409, "计划任务监控不使用受管运行代次",
+                    "GENERATION_MISMATCH",
+                )
+                return
+            if force:
+                self.send_err(
+                    409, "Windows 计划任务停止不支持强制模式",
+                    "SCHEDULED_TASK_FORCE_UNSUPPORTED",
+                )
+                return
+            result = stop_scheduled_task_app(PLATFORM, app)
+            if result.get("ok"):
+                invalidate_state_cache()
+            self.send_json(result, 200 if result.get("ok") else 409)
+            return
+        if not self._require_capability(
+                "stop_managed", "当前平台或阶段未启用应用停止"):
+            return
+        if force and not self._require_capability(
+                "force_stop_managed", "当前平台或阶段未启用强制停止"):
+            return
+        if not self._generation_matches(app, expected_generation):
+            return
+        if PLATFORM.name == "windows":
+            if app.get("runtimeIdentity") is None:
+                self.send_err(409, "应用未在运行")
+                return
+            self._send_windows_lifecycle_result(
+                stop_windows_app(
+                    self.server.cfg,
+                    app,
+                    force=force,
+                    timeout=APP_STOP_TIMEOUT_SEC,
+                )
+            )
             return
         if not app_alive_sign(app):
             self.send_json({"ok": False, "error": "应用未在运行"})
@@ -3526,7 +5741,109 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"ok": True})
 
     @serialized_app_operation
+    def handle_scheduled_task_enabled(self, app_id):
+        data = self._read_json_request()
+        if data is None:
+            return
+        enabled = data.get("enabled")
+        if not isinstance(enabled, bool):
+            self.send_err(400, "enabled 必须是布尔值", "INVALID_REQUEST")
+            return
+        _, app = self._get_app_or_404(app_id)
+        if app is None:
+            return
+        if not scheduled_task_path(app):
+            self.send_err(
+                409, "应用没有关联 Windows 计划任务",
+                "SCHEDULED_TASK_NOT_CONFIGURED",
+            )
+            return
+        if not self._require_capability(
+                "toggle_scheduled_tasks", "当前平台未启用 Windows 计划任务启禁用"):
+            return
+        result = set_scheduled_task_enabled_app(PLATFORM, app, enabled)
+        if result.get("ok"):
+            invalidate_state_cache()
+        self.send_json(result, 200 if result.get("ok") else 409)
+
+    def handle_elevation_broker_install(self):
+        data = self._read_json_request()
+        if data is None:
+            return
+        password = data.get("password")
+        if not isinstance(password, str):
+            self.send_err(400, "password 必须是字符串", "INVALID_REQUEST")
+            return
+        if not self._require_capability(
+                "manage_elevation_broker", "当前平台未启用管理员启动代理"):
+            return
+        try:
+            password_record = new_password_record(password)
+        except ValueError as exc:
+            self.send_err(400, str(exc), "BROKER_PASSWORD_INVALID")
+            return
+        result = PLATFORM.install_elevation_broker(password_record)
+        payload = {
+            "ok": bool(getattr(result, "ok", False)),
+            "code": getattr(result, "code", None),
+        }
+        if not payload["ok"]:
+            payload["error"] = getattr(result, "error", None) or "管理员启动代理安装失败"
+        else:
+            invalidate_state_cache()
+        self.send_json(payload, 200 if payload["ok"] else 409)
+
+    def handle_elevation_broker_unlock(self):
+        data = self._read_json_request()
+        if data is None:
+            return
+        password = data.get("password")
+        if not isinstance(password, str):
+            self.send_err(400, "password 必须是字符串", "INVALID_REQUEST")
+            return
+        if not self._require_capability(
+                "manage_elevation_broker", "当前平台未启用管理员启动代理"):
+            return
+        result = PLATFORM.unlock_elevation_broker(password)
+        payload = {
+            "ok": bool(getattr(result, "ok", False)),
+            "code": getattr(result, "code", None),
+        }
+        if not payload["ok"]:
+            payload["error"] = getattr(result, "error", None) or "管理员启动解锁失败"
+        else:
+            invalidate_state_cache()
+        self.send_json(payload, 200 if payload["ok"] else 409)
+
+    def handle_elevation_broker_lock(self):
+        data = self._read_json_request()
+        if data is None:
+            return
+        if data:
+            self.send_err(400, "锁定请求不接受额外字段", "INVALID_REQUEST")
+            return
+        if not self._require_capability(
+                "manage_elevation_broker", "当前平台未启用管理员启动代理"):
+            return
+        result = PLATFORM.lock_elevation_broker()
+        payload = {
+            "ok": bool(getattr(result, "ok", False)),
+            "code": getattr(result, "code", None),
+        }
+        if not payload["ok"]:
+            payload["error"] = getattr(result, "error", None) or "管理员启动锁定失败"
+        else:
+            invalidate_state_cache()
+        self.send_json(payload, 200 if payload["ok"] else 409)
+
+    @serialized_app_operation
     def handle_app_attach(self, app_id):
+        if not getattr(PLATFORM.capabilities, "attach_external", False):
+            self.discard_body()
+            self._require_capability(
+                "attach_external", "当前平台或阶段禁止认领外部进程"
+            )
+            return
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
@@ -3548,10 +5865,52 @@ class Handler(BaseHTTPRequestHandler):
 
     @serialized_app_operation
     def handle_app_restart(self, app_id):
+        if (PLATFORM.name != "windows"
+                and int(self.headers.get("Content-Length") or 0) == 0):
+            data = {}
+        else:
+            data = self._read_json_request()
+            if data is None:
+                return
+        if not (self._require_capability(
+                "stop_managed", "当前平台或阶段未启用应用重启")
+                and self._require_capability(
+                    "launch_managed", "当前平台或阶段未启用应用重启")):
+            return
+        valid, expected_generation = self._expected_generation(data)
+        if not valid:
+            return
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
-        if not app_alive_sign(app):
+        if elevated_favorite(app):
+            self.send_err(
+                409,
+                "管理员程序不提供重启；请分别执行停止和启动",
+                "ELEVATED_RESTART_UNSUPPORTED",
+            )
+            return
+        if docker_resource(app):
+            self.send_err(
+                409,
+                "Docker 资源不提供重启；请分别执行停止和启动",
+                "DOCKER_RESTART_UNSUPPORTED",
+            )
+            return
+        if scheduled_task_path(app):
+            self.send_err(
+                409,
+                "Windows 计划任务监控不提供重启；请等待任务结束后重新运行",
+                "SCHEDULED_TASK_MONITOR_ONLY",
+            )
+            return
+        if not self._generation_matches(app, expected_generation):
+            return
+        if (PLATFORM.name == "windows"
+                and app.get("runtimeIdentity") is None):
+            self.send_err(409, "应用未在运行")
+            return
+        if PLATFORM.name != "windows" and not app_alive_sign(app):
             self.send_err(409, "应用未在运行")
             return
         # 必须在停止旧服务前预检；配置已失效时保留仍在工作的旧进程。
@@ -3564,6 +5923,38 @@ class Handler(BaseHTTPRequestHandler):
                          (issue["title"], issue["detail"]),
                 "health": health,
             }, 422)
+            return
+
+        if PLATFORM.name == "windows":
+            stopped = stop_windows_app(
+                self.server.cfg,
+                app,
+                force=False,
+                timeout=APP_STOP_TIMEOUT_SEC,
+            )
+            if not stopped.get("ok"):
+                self._send_windows_lifecycle_result(stopped)
+                return
+            port = app.get("port")
+            occupied = [
+                (pid, item_port)
+                for pid, item_port in scan_listeners()
+                if item_port == port
+            ] if port else []
+            if occupied:
+                self.send_err(
+                    409,
+                    "端口 %d 已被 PID %d 占用，旧应用已停止" %
+                    (port, occupied[0][0]),
+                )
+                return
+            current = find_app(self.server.cfg.snapshot(), app_id)
+            if current is None:
+                self.send_err(404, "应用已被删除")
+                return
+            self._send_windows_lifecycle_result(
+                start_windows_app(self.server.cfg, current)
+            )
             return
 
         stopped, error = stop_app_and_clear(self.server.cfg, app)
@@ -3653,11 +6044,18 @@ class Handler(BaseHTTPRequestHandler):
                 return
             operation_lock = self.server.try_app_operation(m.group(1))
             if operation_lock is None:
-                self.send_err(409, "该应用正在执行其他操作，请稍后重试")
+                self.discard_body()
+                self.send_err(
+                    409,
+                    "该应用正在执行其他操作，请稍后重试",
+                    "APP_OPERATION_IN_PROGRESS",
+                )
                 return
-            data, err = self.read_json_body()
-            if err:
-                self.send_err(400, err)
+            data = self._read_json_request()
+            if data is None:
+                return
+            valid, expected_generation = self._expected_generation(data)
+            if not valid:
                 return
             stop_before_update = data.get("stopBeforeUpdate", False)
             if not isinstance(stop_before_update, bool):
@@ -3666,19 +6064,59 @@ class Handler(BaseHTTPRequestHandler):
             _, app = self._get_app_or_404(m.group(1))
             if app is None:
                 return
+            if not self._generation_matches(app, expected_generation):
+                return
             fields, err = validate_app_fields(data, partial=True)
             if err:
-                self.send_err(400, err)
+                self.send_err(
+                    400, err,
+                    "COMMAND_SPEC_INVALID"
+                    if err.startswith("commandSpec 无效:") else None)
                 return
             if not fields:
                 self.send_err(400, "没有可更新的字段")
                 return
-            lifecycle_fields = {"command", "cwd", "port", "kind"}
+            lifecycle_fields = {
+                "command", "commandSpec", "cwd", "port", "kind",
+                "scheduledTaskPath", "dockerResource", "elevated",
+            }
             lifecycle_changed = any(
                 key in fields and fields[key] != app.get(key)
                 for key in lifecycle_fields)
             stopped_for_update = False
-            if lifecycle_changed and app_alive_sign(app):
+            if (PLATFORM.name == "windows" and lifecycle_changed
+                    and app.get("runtimeIdentity") is not None):
+                if not self._require_capability(
+                        "stop_managed",
+                        "当前平台或阶段禁止修改运行中应用的生命周期配置"):
+                    return
+                if not stop_before_update:
+                    stop_label = ("中止任务"
+                                  if (app.get("kind") or "service") == "task"
+                                  else "停止服务")
+                    self.send_json({
+                        "ok": False,
+                        "error": "应用正在运行，请先在当前编辑面板%s；填写内容会保留" %
+                                 stop_label,
+                        "requiresStop": True,
+                    }, 409)
+                    return
+                stopped = stop_windows_app(
+                    self.server.cfg,
+                    app,
+                    force=False,
+                    timeout=APP_STOP_TIMEOUT_SEC,
+                )
+                if not stopped.get("ok"):
+                    self._send_windows_lifecycle_result(stopped)
+                    return
+                stopped_for_update = True
+            elif (PLATFORM.name != "windows" and lifecycle_changed
+                  and app_alive_sign(app)):
+                if not self._require_capability(
+                        "stop_managed",
+                        "当前平台或阶段禁止修改运行中应用的生命周期配置"):
+                    return
                 if not stop_before_update:
                     stop_label = ("中止任务"
                                   if (app.get("kind") or "service") == "task"
@@ -3696,12 +6134,41 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_err(409, stop_error)
                     return
 
-            def op(c):
-                target = find_app(c, m.group(1))
+            def op(c, target):
                 target.update(fields)
+                if ("commandSpec" in fields or "cwd" in fields
+                        or "scheduledTaskPath" in fields
+                        or "dockerResource" in fields
+                        or "elevated" in fields):
+                    target["importStatus"] = (
+                        "ready" if (
+                            target.get("scheduledTaskPath")
+                            or target.get("dockerResource")
+                        ) else "needs_review" if target.get("elevated") else
+                        command_import_status(
+                            target["commandSpec"], target.get("cwd")
+                        )
+                    )
                 return dict(target)
 
-            updated = self.server.cfg.update(op)
+            mutation_generation = (
+                None
+                if PLATFORM.name == "windows" and stopped_for_update
+                else expected_generation
+            )
+            if PLATFORM.name == "windows":
+                cas_status, updated, _ = (
+                    self.server.cfg.mutate_app_if_generation(
+                        m.group(1), mutation_generation, op
+                    )
+                )
+                if cas_status != "applied":
+                    self._send_app_cas_failure(cas_status)
+                    return
+            else:
+                updated = self.server.cfg.update(
+                    lambda c: op(c, find_app(c, m.group(1)))
+                )
             if stopped_for_update:
                 updated = dict(updated)
                 updated["stoppedForUpdate"] = True
@@ -3718,14 +6185,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         try:
-            if not self.authorize_request(mutating=True):
-                return
             path = urllib.parse.urlparse(self.path).path
             m = APP_ROUTE_RE.match(path)
             if not m:
+                if not self.authorize_request(mutating=True):
+                    return
                 self.send_err(404, "接口不存在")
                 return
             app_id, action = m.group(1), m.group(2)
+            content_kind = (
+                "json"
+                if action is None and PLATFORM.name == "windows" else None
+            )
+            if not self.authorize_request(
+                    mutating=True, content_kind=content_kind):
+                return
             if action is None:
                 self.handle_app_delete(app_id)
                 return
@@ -3745,25 +6219,97 @@ class Handler(BaseHTTPRequestHandler):
 
     @serialized_app_operation
     def handle_app_delete(self, app_id):
+        if (PLATFORM.name != "windows"
+                and int(self.headers.get("Content-Length") or 0) == 0):
+            data = {}
+        else:
+            data = self._read_json_request()
+            if data is None:
+                return
+        valid, expected_generation = self._expected_generation(data)
+        if not valid:
+            return
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
-        if app_running(app):
+        if not self._generation_matches(app, expected_generation):
+            return
+        stopped_for_delete = False
+        terminal_identity = None
+        if (PLATFORM.name == "windows"
+                and app.get("runtimeIdentity") is not None):
+            try:
+                identity = native_runtime_identity(app)
+            except (ConfigSchemaError, TypeError, ValueError):
+                identity = None
+            inspection = None
+            if identity is not None:
+                try:
+                    inspection = PLATFORM.inspect_managed(identity)
+                except Exception:
+                    inspection = None
+            terminal = None
+            if (inspection is not None
+                    and _windows_inspection_matches(identity, inspection)
+                    and not bool(getattr(inspection, "running", False))
+                    and not tuple(getattr(inspection, "members", ()) or ())
+                    and getattr(inspection, "status", None) in ("exited", "failed")):
+                terminal = inspection
+            if terminal is not None:
+                # The signed receipt proves that no workload remains. Card
+                # deletion does not wait for or terminate a stale runner; the
+                # background exact-generation release owns record cleanup.
+                terminal_identity = identity
+            else:
+                if not self._require_capability(
+                        "stop_managed", "当前平台或阶段禁止删除运行中的应用"):
+                    return
+                stopped = stop_windows_app(
+                    self.server.cfg,
+                    app,
+                    force=False,
+                    timeout=APP_STOP_TIMEOUT_SEC,
+                    initial_inspection=inspection,
+                )
+                if not stopped.get("ok"):
+                    self._send_windows_lifecycle_result(stopped)
+                    return
+                stopped_for_delete = True
+        elif PLATFORM.name != "windows" and app_running(app):
+            if not self._require_capability(
+                    "stop_managed", "当前平台或阶段禁止删除运行中的应用"):
+                return
             stopped, error = stop_app_and_clear(self.server.cfg, app)
             if not stopped:
                 self.send_err(409, "删除已取消：%s" %
                               (error or "应用未能正常退出"))
                 return
+            stopped_for_delete = True
 
-        def op(c):
+        def op(c, target):
             before = len(c["apps"])
             c["apps"] = [a for a in c["apps"] if a.get("id") != app_id]
             return len(c["apps"]) != before
 
-        if not self.server.cfg.update(op):
-            self.send_err(404, "应用不存在")
-            return
+        if PLATFORM.name == "windows":
+            cas_status, deleted, _ = self.server.cfg.mutate_app_if_generation(
+                app_id,
+                None if stopped_for_delete else expected_generation,
+                op,
+            )
+            if cas_status != "applied":
+                self._send_app_cas_failure(cas_status)
+                return
+        else:
+            deleted = self.server.cfg.update(
+                lambda c: op(c, find_app(c, app_id))
+            )
+            if not deleted:
+                self.send_err(404, "应用不存在")
+                return
         self.server.forget_app_lock(app_id)
+        if terminal_identity is not None:
+            _defer_windows_release(terminal_identity)
 
         for ext in ICON_EXTS:
             for fname in (app_id + ext, "fav-" + app_id + ext):
@@ -3779,7 +6325,10 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
-        self.send_json({"ok": True})
+        self.send_json({
+            "ok": True,
+            "cleanupPending": terminal_identity is not None,
+        })
 
     @serialized_app_operation
     def handle_icon_delete(self, app_id):
@@ -3807,7 +6356,7 @@ def open_browser_later(port, delay=0.8):
     def _open():
         try:
             time.sleep(delay)
-            webbrowser.open("http://%s:%d/" % (HOST, port))
+            PLATFORM.open_browser("http://%s:%d/" % (HOST, port))
         except Exception:
             pass
     threading.Thread(target=_open, daemon=True).start()
@@ -3819,7 +6368,7 @@ def find_console_instances():
     candidates = []
     for pid, info in snap.items():
         args = info.get("args") or ""
-        if (pid == SELF_PID or info.get("uid") != SELF_UID
+        if (pid == SELF_PID or not process_owned_by_current(info)
                 or "server.py" not in args
                 or "--restart-helper" in args):
             continue
@@ -3849,29 +6398,11 @@ def find_console_instances():
 
 
 def _launcher_dialog(message):
-    script = """on run argv
-set messageText to item 1 of argv
-display dialog messageText with title "总控台" buttons {"取消", "重新启动", "打开控制台"} default button "打开控制台" cancel button "取消" with icon note
-return button returned of result
-end run"""
-    try:
-        result = subprocess.run(
-            ["osascript", "-e", script, message], capture_output=True,
-            text=True, timeout=180)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return result.stdout.strip() if result.returncode == 0 else None
+    return PLATFORM.launcher_dialog(message)
 
 
 def _launcher_alert(message):
-    script = """on run argv
-display alert "总控台" message (item 1 of argv) as critical
-end run"""
-    try:
-        subprocess.run(["osascript", "-e", script, message],
-                       capture_output=True, timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    PLATFORM.launcher_alert(message)
 
 
 def launcher_main():
@@ -3895,7 +6426,7 @@ def launcher_main():
     if choice == "打开控制台":
         ports = [p for item in instances for p in item["ports"]]
         port = min(ports) if ports else PORT_START
-        webbrowser.open("http://%s:%d/" % (HOST, port))
+        PLATFORM.open_browser("http://%s:%d/" % (HOST, port))
         return
     if choice != "重新启动":
         return
@@ -3904,11 +6435,8 @@ def launcher_main():
     preferred = min(preferred_ports) if preferred_ports else PORT_START
     targets = [item["pid"] for item in instances]
     for pid in targets:
-        if process_uid(pid) == SELF_UID:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+        if process_uid(pid) in (SELF_UID, SELF_PRINCIPAL.identifier):
+            PLATFORM.stop_external_process(pid, force=False)
     deadline = time.monotonic() + 8.0
     while time.monotonic() < deadline and any(pid_alive(pid) for pid in targets):
         time.sleep(0.1)
@@ -3926,16 +6454,15 @@ def launcher_main():
 
 def schedule_console_restart(server, preferred_port):
     """启动独立 helper，响应发出后关闭当前 HTTP 服务。"""
-    helper = subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), "--restart-helper",
-         str(SELF_PID), str(int(preferred_port))],
-        cwd=BASE_DIR, start_new_session=True, close_fds=True)
+    result = PLATFORM.restart_console(preferred_port)
+    if not result.ok:
+        raise OSError(result.error or "无法启动重启程序")
 
     def _shutdown():
         time.sleep(0.25)
         server.shutdown()
     threading.Thread(target=_shutdown, daemon=True).start()
-    return helper.pid
+    return result.helper_pid
 
 
 def schedule_console_stop(server):
@@ -3947,26 +6474,25 @@ def schedule_console_stop(server):
 
 
 def restart_helper(old_pid, preferred_port):
-    """等旧进程释放端口后，在 helper 原地 exec 新总控台。"""
-    deadline = time.monotonic() + 12.0
-    while time.monotonic() < deadline and pid_alive(old_pid):
-        time.sleep(0.1)
-    if pid_alive(old_pid):
-        return 1
-    args = [sys.executable, os.path.abspath(__file__),
-            "--preferred-port", str(int(preferred_port)), "--no-browser"]
-    os.execv(sys.executable, args)
-    return 0
+    """Complete a native console restart from the detached helper."""
+    return PLATFORM.complete_console_restart(old_pid, preferred_port)
 
 
-def _run_console(preferred_port=None, open_browser=True):
+def _run_console(preferred_port=None, open_browser=True, storage_issues=None):
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    for private_dir in (DATA_DIR, ICONS_DIR, LOGS_DIR):
-        _ensure_private_dir(private_dir)
-    start_log_maintenance()
-    cfg = Config(CONFIG_PATH)
+    storage_issues = list(storage_issues or [])
+    if not storage_issues:
+        start_log_maintenance()
+    cfg = Config(
+        CONFIG_PATH,
+        force_read_only_reason=(
+            "Windows 存储安全验证失败，已进入只读保护: "
+            + "; ".join(storage_issues)
+            if storage_issues else None
+        ),
+    )
 
     server, port = None, None
     candidates = list(range(PORT_START, PORT_START + PORT_TRIES))
@@ -3986,6 +6512,7 @@ def _run_console(preferred_port=None, open_browser=True):
         sys.exit(1)
 
     print("总控台已启动: http://%s:%d/  (Ctrl+C 停止)" % (HOST, port), flush=True)
+    reconcile_stop = start_windows_runtime_reconciler(cfg)
     if open_browser:
         open_browser_later(port)
     try:
@@ -3993,6 +6520,12 @@ def _run_console(preferred_port=None, open_browser=True):
     except KeyboardInterrupt:
         pass
     finally:
+        reconcile_stop.set()
+        if getattr(PLATFORM.capabilities, "manage_elevation_broker", False):
+            try:
+                PLATFORM.lock_elevation_broker()
+            except Exception:
+                LOG.exception("锁定管理员启动代理失败")
         server.server_close()
         print("已停止", flush=True)
 
@@ -4019,10 +6552,20 @@ def redirect_console_output():
             pass
 
 
+def configure_console_output():
+    """Keep localized CLI output safe when Windows redirects legacy stdio."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(
+                encoding="utf-8", errors="backslashreplace", line_buffering=True)
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 def main(preferred_port=None, open_browser=True, log_to_file=False):
     """Run exactly one console for this project/data directory."""
     migration = prepare_runtime_storage()
-    if log_to_file:
+    if log_to_file and not migration.get("securityIssues"):
         redirect_console_output()
     if migration["dataMigrated"]:
         print("已将项目内旧配置和图标复制到: %s" % DATA_DIR,
@@ -4037,19 +6580,24 @@ def main(preferred_port=None, open_browser=True, log_to_file=False):
             instances = find_console_instances()
             ports = [port for item in instances for port in item.get("ports", [])]
             if ports:
-                webbrowser.open("http://%s:%d/" % (HOST, min(ports)))
+                PLATFORM.open_browser("http://%s:%d/" % (HOST, min(ports)))
         return False
     try:
-        _run_console(preferred_port, open_browser)
+        _run_console(preferred_port, open_browser, migration.get("securityIssues"))
         return True
     finally:
         release_instance_lock(instance_lock)
 
 
 if __name__ == "__main__":
+    configure_console_output()
     if "--prepare-storage" in sys.argv:
         # 供安装/诊断流程预先验证迁移和目录权限，不启动 HTTP。
-        prepare_runtime_storage()
+        storage = prepare_runtime_storage()
+        if storage.get("securityIssues"):
+            for issue in storage["securityIssues"]:
+                print(issue, file=sys.stderr)
+            sys.exit(1)
     elif "--launcher" in sys.argv:
         launcher_main()
     elif "--restart-helper" in sys.argv:

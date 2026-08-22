@@ -23,6 +23,73 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "static"
 INFO_PLIST = ROOT / "总控台.app" / "Contents" / "Info.plist"
+COMMON_REQUIRED_FILES = (
+    "VERSION",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md",
+    "ASSET_PROVENANCE.md",
+    "THIRD_PARTY_NOTICES.md",
+    "RELEASE_CHECKLIST.md",
+    ".github/workflows/ci.yml",
+    ".github/ISSUE_TEMPLATE/config.yml",
+    ".github/ISSUE_TEMPLATE/bug_report.yml",
+    ".github/ISSUE_TEMPLATE/feature_request.yml",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    "requirements-dev.txt",
+    "Makefile",
+    "server.py",
+    "localops/command_spec.py",
+    "localops/config_import.py",
+    "localops/platform/contracts.py",
+    "localops/platform/loader.py",
+    "tools/check_platform_leaks.py",
+    "tests/test_server.py",
+    "tests/test_frontend.py",
+    "tests/test_hardening.py",
+    "tests/test_project_checks.py",
+    "tests/test_release.py",
+    "tests/contract/test_config_import.py",
+    "docs/windows-port/API-CONTRACT-v2.md",
+    "docs/windows-port/API-CONTRACT-v3.md",
+    "docs/screenshots/ops-launchpad.jpg",
+    "docs/screenshots/ops-services.jpg",
+    "static/index.html",
+    "static/app.js",
+    "static/js/lifecycle.js",
+    "tests/js/lifecycle.test.mjs",
+)
+MACOS_REQUIRED_FILES = (
+    "localops/platform/macos.py",
+    "start.command",
+    "总控台.app/Contents/Info.plist",
+    "总控台.app/Contents/MacOS/launcher",
+)
+WINDOWS_REQUIRED_FILES = (
+    "requirements-windows.txt",
+    "requirements-build-windows.txt",
+    "localops/platform/windows.py",
+    "localops/windows/__init__.py",
+    "localops/windows/job_object.py",
+    "localops/windows/packaged_entry.py",
+    "localops/windows/runner.py",
+    "localops/windows/runner_protocol.py",
+    "tools/build_windows.py",
+    "tests/windows/test_command_spec.py",
+    "tests/windows/test_runner.py",
+    "tests/windows/test_runner_protocol.py",
+    "tests/windows/test_windows_job_object.py",
+    "tests/windows/test_windows_lifecycle.py",
+    "tests/windows/test_windows_lifecycle_http.py",
+    "tests/windows/test_windows_package_smoke.py",
+    "tests/windows/test_windows_packaging.py",
+    "tests/windows/test_windows_phase3_contract.py",
+    "tests/windows/test_windows_security_matrix.py",
+    "tests/windows/test_windows_server.py",
+)
 SEMVER_RE = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
     r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
@@ -91,41 +158,28 @@ def command_output(args: list[str], cwd: Path = ROOT) -> str:
     return output
 
 
-def check_required_files() -> str:
-    required = (
-        "VERSION",
-        "README.md",
-        "CHANGELOG.md",
-        "LICENSE",
-        "SECURITY.md",
-        "CONTRIBUTING.md",
-        "CODE_OF_CONDUCT.md",
-        "ASSET_PROVENANCE.md",
-        "THIRD_PARTY_NOTICES.md",
-        "RELEASE_CHECKLIST.md",
-        ".github/workflows/ci.yml",
-        ".github/ISSUE_TEMPLATE/config.yml",
-        ".github/ISSUE_TEMPLATE/bug_report.yml",
-        ".github/ISSUE_TEMPLATE/feature_request.yml",
-        ".github/PULL_REQUEST_TEMPLATE.md",
-        "requirements-dev.txt",
-        "Makefile",
-        "server.py",
-        "start.command",
-        "tests/test_server.py",
-        "docs/screenshots/ops-launchpad.jpg",
-        "docs/screenshots/ops-services.jpg",
-        "static/index.html",
-        "static/app.js",
-        "总控台.app/Contents/Info.plist",
-        "总控台.app/Contents/MacOS/launcher",
-    )
+def required_files_for_scope(scope: str) -> tuple[str, ...]:
+    groups = {
+        "common": COMMON_REQUIRED_FILES,
+        "macos": MACOS_REQUIRED_FILES,
+        "windows": WINDOWS_REQUIRED_FILES,
+    }
+    if scope == "all":
+        names = COMMON_REQUIRED_FILES + MACOS_REQUIRED_FILES + WINDOWS_REQUIRED_FILES
+    else:
+        require(scope in groups, f"未知检查范围: {scope}")
+        names = groups[scope]
+    return tuple(dict.fromkeys(names))
+
+
+def check_required_files(scope: str = "all") -> str:
+    required = required_files_for_scope(scope)
     missing = [name for name in required if not (ROOT / name).is_file()]
     require(not missing, "缺少必要文件: " + ", ".join(missing))
-    return f"{len(required)} 个必要文件"
+    return f"{scope}: {len(required)} 个必要文件"
 
 
-def check_asset_provenance() -> str:
+def check_asset_provenance(include_macos: bool = True) -> str:
     path = ROOT / "ASSET_PROVENANCE.md"
     require(path.is_file(), "ASSET_PROVENANCE.md 不存在")
     text = path.read_text(encoding="utf-8")
@@ -135,7 +189,10 @@ def check_asset_provenance() -> str:
         for item in sorted(folder.rglob("*"))
         if item.is_file()
     ]
-    tracked.append(ROOT / "总控台.app" / "Contents" / "Resources" / "AppIcon.icns")
+    if include_macos:
+        tracked.append(
+            ROOT / "总控台.app" / "Contents" / "Resources" / "AppIcon.icns"
+        )
     missing = [
         item.relative_to(ROOT).as_posix()
         for item in tracked
@@ -193,6 +250,10 @@ def read_version() -> str:
     return value
 
 
+def check_common_version() -> str:
+    return f"VERSION={read_version()}"
+
+
 def check_version() -> str:
     version = read_version()
     with INFO_PLIST.open("rb") as handle:
@@ -212,8 +273,9 @@ def check_version() -> str:
 
 def check_python_syntax() -> str:
     paths = [ROOT / "server.py"]
-    paths.extend(sorted((ROOT / "tools").glob("*.py")))
-    paths.extend(sorted((ROOT / "tests").glob("test_*.py")))
+    paths.extend(sorted((ROOT / "localops").rglob("*.py")))
+    paths.extend(sorted((ROOT / "tools").rglob("*.py")))
+    paths.extend(sorted((ROOT / "tests").rglob("test_*.py")))
     for path in paths:
         try:
             source = path.read_text(encoding="utf-8")
@@ -404,20 +466,32 @@ def check_shell_and_plist() -> str:
     return "2 个启动脚本 + Info.plist"
 
 
-def check_dev_requirements() -> str:
-    path = ROOT / "requirements-dev.txt"
-    lines = [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
-    require(bool(lines), "requirements-dev.txt 为空")
-    unpinned = [
-        line for line in lines
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+==[A-Za-z0-9_.+!-]+", line)
-    ]
-    require(not unpinned, "开发依赖必须精确锁定: " + ", ".join(unpinned))
-    return f"{len(lines)} 个锁定依赖"
+def check_dev_requirements(scope: str = "all") -> str:
+    files_by_scope = {
+        "common": ("requirements-dev.txt",),
+        "windows": ("requirements-windows.txt", "requirements-build-windows.txt"),
+    }
+    if scope == "all":
+        filenames = files_by_scope["common"] + files_by_scope["windows"]
+    else:
+        require(scope in files_by_scope, f"未知依赖检查范围: {scope}")
+        filenames = files_by_scope[scope]
+    total = 0
+    for filename in filenames:
+        path = ROOT / filename
+        lines = [
+            line.strip()
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        require(bool(lines), f"{filename} 为空")
+        unpinned = [
+            line for line in lines
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+==[A-Za-z0-9_.+!-]+", line)
+        ]
+        require(not unpinned, f"{filename} 依赖必须精确锁定: " + ", ".join(unpinned))
+        total += len(lines)
+    return f"{scope}: {total} 个锁定依赖"
 
 
 def check_themes() -> str:
@@ -524,18 +598,7 @@ def check_generated_icons() -> str:
     return f"{count} 个 Lucide 图标"
 
 
-def check_tests() -> str:
-    args = [
-        sys.executable,
-        "-m",
-        "unittest",
-        "discover",
-        "-s",
-        "tests",
-        "-p",
-        "test_*.py",
-        "-v",
-    ]
+def check_unittests(args: list[str]) -> str:
     output = command_output(args)
     match = re.search(r"Ran\s+(\d+)\s+tests?\b", output)
     require(match is not None, "无法确认 unittest 实际运行的测试数")
@@ -547,13 +610,55 @@ def check_tests() -> str:
     return f"{count} 个测试"
 
 
+def check_tests() -> str:
+    return check_unittests([
+        sys.executable,
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_*.py",
+        "-v",
+    ])
+
+
+def check_common_tests() -> str:
+    return check_unittests([
+        sys.executable,
+        "-m",
+        "unittest",
+        "tests.contract.test_baseline_golden",
+        "tests.contract.test_config_import",
+        "tests.contract.test_platform_contract",
+        "tests.test_frontend",
+        "tests.test_project_checks",
+        "-v",
+    ])
+
+
+def check_windows_tests() -> str:
+    return check_unittests([
+        sys.executable,
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests/windows",
+        "-p",
+        "test_*.py",
+        "-v",
+    ])
+
+
 def check_javascript_tests() -> str:
     """运行前端纯函数行为测试（node --test，零依赖）。"""
     node = shutil.which("node")
     require(bool(node), "未找到 node，无法运行 JavaScript 测试")
     files = sorted(str(path) for path in (ROOT / "tests" / "js").glob("*.test.mjs"))
     require(bool(files), "tests/js/ 下没有 .test.mjs 测试文件")
-    output = command_output([node, "--test", *files])
+    output = command_output([node, "--test", "--test-reporter=tap", *files])
     match = re.search(r"# (pass)\s+(\d+)", output)
     require(match is not None, "无法确认 node --test 结果")
     passed = int(match.group(2))
@@ -597,32 +702,75 @@ def check_release_git() -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="检查总控台项目")
+    parser.add_argument(
+        "--scope",
+        choices=("auto", "common", "macos", "windows", "all"),
+        default="auto",
+        help="检查公共层、指定平台层，或按当前平台自动组合（默认 auto）",
+    )
     parser.add_argument("--skip-tests", action="store_true", help="只检查语法/结构，不运行测试")
     parser.add_argument("--release", action="store_true", help="额外检查 Git 发布边界")
     return parser.parse_args()
 
 
+def scopes_for_request(scope: str, platform_name: str | None = None) -> tuple[str, ...]:
+    if scope == "all":
+        return ("common", "macos", "windows")
+    if scope != "auto":
+        return (scope,)
+    native = platform_name or sys.platform
+    if native == "darwin":
+        return ("common", "macos")
+    if native == "win32":
+        return ("common", "windows")
+    return ("common",)
+
+
 def main() -> int:
     args = parse_args()
     report = Report()
-    checks = [
-        ("必要文件", check_required_files),
-        ("版本一致性", check_version),
-        ("Python 语法", check_python_syntax),
-        ("JavaScript 语法", check_javascript_syntax),
-        ("JavaScript 模块绑定", check_javascript_bindings),
-        ("启动脚本与 plist", check_shell_and_plist),
-        ("开发依赖锁定", check_dev_requirements),
-        ("素材来源台账", check_asset_provenance),
-        ("主题注册表", check_themes),
-        ("静态资源与模块", check_static_references),
-        ("生成图标同步", check_generated_icons),
-    ]
+    scopes = scopes_for_request(args.scope)
+    checks = []
+    if "common" in scopes:
+        checks.extend([
+            ("Common 必要文件", lambda: check_required_files("common")),
+            ("Common 版本", check_common_version),
+            ("Common Python 语法", check_python_syntax),
+            ("Common JavaScript 语法", check_javascript_syntax),
+            ("Common JavaScript 模块绑定", check_javascript_bindings),
+            ("Common 开发依赖锁定", lambda: check_dev_requirements("common")),
+            (
+                "Common 素材来源台账",
+                lambda: check_asset_provenance(include_macos=False),
+            ),
+            ("Common 主题注册表", check_themes),
+            ("Common 静态资源与模块", check_static_references),
+            ("Common 生成图标同步", check_generated_icons),
+        ])
+    if "macos" in scopes:
+        checks.extend([
+            ("macOS 必要文件", lambda: check_required_files("macos")),
+            ("macOS 版本一致性", check_version),
+            ("macOS 启动脚本与 plist", check_shell_and_plist),
+            ("macOS App Icon 来源台账", check_asset_provenance),
+        ])
+    if "windows" in scopes:
+        checks.extend([
+            ("Windows 必要文件", lambda: check_required_files("windows")),
+            ("Windows 依赖锁定", lambda: check_dev_requirements("windows")),
+        ])
     for label, fn in checks:
         report.check(label, fn)
     if not args.skip_tests:
-        report.check("后端测试", check_tests)
-        report.check("JavaScript 行为测试", check_javascript_tests)
+        if "macos" in scopes:
+            report.check("macOS 完整 Python 回归", check_tests)
+        else:
+            if "common" in scopes:
+                report.check("Common Python 测试", check_common_tests)
+            if "windows" in scopes:
+                report.check("Windows Python 测试", check_windows_tests)
+        if "common" in scopes:
+            report.check("Common JavaScript 行为测试", check_javascript_tests)
     if args.release:
         report.check("素材发布状态", check_asset_release_status)
         report.check("Git 发布边界", check_release_git)

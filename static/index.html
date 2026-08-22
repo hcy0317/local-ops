@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>总控台｜本地服务与批处理启动监测</title>
-<meta name="description" content="macOS 本地服务与批处理任务的快速启动、运行监测工具">
+<meta name="description" content="本地服务与批处理任务的快速启动、运行监测工具">
 <link rel="icon" href="/assets/favicon-32.png" type="image/png" sizes="32x32">
 <link rel="icon" href="/assets/favicon.ico" sizes="any">
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png" sizes="180x180">
@@ -109,17 +109,18 @@
             <div class="vh-left">
               <div class="vh-overline" id="viewOverline">Launchpad</div>
               <h2 id="viewTitle">启动台</h2>
-              <p class="vh-sub" id="viewSub">一键启动与管理你的本地服务和批处理任务</p>
+              <p class="vh-sub" id="viewSub">一键启动与管理你的本地服务、程序和批处理任务</p>
             </div>
             <div class="vh-right">
               <button class="cmdk-trigger" id="cmdkTrigger" type="button" aria-label="打开命令面板">
                 <span class="cmdk-ic" id="cmdkIcon" aria-hidden="true"></span>
                 <span class="cmdk-placeholder">搜索服务、端口、命令或输入操作…</span>
-                <kbd>⌘K</kbd>
+                <kbd id="cmdkShortcut">Ctrl/⌘+K</kbd>
               </button>
               <div class="quick-actions" id="quickActions">
                 <button class="qa-chip" type="button" data-qa="add-svc"><span class="qa-ic" data-qa-icon="plus" aria-hidden="true"></span>添加服务</button>
                 <button class="qa-chip" type="button" data-qa="add-task"><span class="qa-ic" data-qa-icon="terminal" aria-hidden="true"></span>添加任务</button>
+                <button class="qa-chip" type="button" data-qa="add-program"><span class="qa-ic" data-qa-icon="rocket" aria-hidden="true"></span>收藏程序</button>
                 <button class="qa-chip" type="button" data-qa="refresh"><span class="qa-ic" data-qa-icon="refresh-cw" aria-hidden="true"></span>刷新状态</button>
               </div>
             </div>
@@ -187,6 +188,17 @@
                 <button class="app-card add-card" id="addSvcCard" type="button">
                   <span class="add-plus" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14" /><path d="M12 5v14" /></svg></span>
                   <span class="add-text">添加服务</span>
+                </button>
+              </div>
+            </section>
+
+            <!-- 程序收藏 -->
+            <section class="panel">
+              <div class="sec-label"><span>Programs · 程序收藏</span><span class="sec-count" id="programSecCount"></span><i></i></div>
+              <div class="app-grid" id="programGrid">
+                <button class="app-card add-card" id="addProgramCard" type="button">
+                  <span class="add-plus" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14" /><path d="M12 5v14" /></svg></span>
+                  <span class="add-text">收藏程序</span>
                 </button>
               </div>
             </section>
@@ -368,8 +380,8 @@
             <section class="widget" aria-labelledby="quickTitle">
               <div class="widget-head"><h3 id="quickTitle">快捷操作</h3></div>
               <div class="quick-list">
-                <button class="quick-item" type="button" data-qa="logs"><span class="qa-ic" data-qa-icon="file-text" aria-hidden="true"></span>打开日志中心<kbd>⌘J</kbd></button>
-                <button class="quick-item" type="button" data-qa="batch-stop"><span class="qa-ic" data-qa-icon="power" aria-hidden="true"></span>批量停止服务</button>
+                <button class="quick-item" type="button" data-qa="logs"><span class="qa-ic" data-qa-icon="file-text" aria-hidden="true"></span>打开日志中心<kbd id="logsShortcut">Ctrl/⌘+J</kbd></button>
+                <button class="quick-item" id="batchStopAction" type="button" data-qa="batch-stop"><span class="qa-ic" data-qa-icon="power" aria-hidden="true"></span>批量停止服务</button>
                 <button class="quick-item" type="button" data-qa="refresh"><span class="qa-ic" data-qa-icon="refresh-cw" aria-hidden="true"></span>刷新所有状态</button>
               </div>
             </section>
@@ -435,12 +447,33 @@
     <div class="kind-row" id="kindRow" role="group" aria-label="应用类型">
       <button class="kind-btn active" type="button" data-kind="service">长期服务</button>
       <button class="kind-btn" type="button" data-kind="task">批处理任务</button>
+      <button class="kind-btn" type="button" data-kind="program">程序收藏</button>
     </div>
     <div class="field">
       <label for="fName">名称 <span class="req">*</span></label>
       <input id="fName" placeholder="如：我的博客" autocomplete="off" required aria-required="true">
     </div>
-    <div class="field">
+    <div class="field" id="scheduledTaskField" hidden>
+      <div class="field-head">
+        <label for="fScheduledTaskPath">Windows 计划任务</label>
+        <button class="link-btn" id="btnRefreshScheduledTasks" type="button">刷新列表</button>
+      </div>
+      <select id="fScheduledTaskPath">
+        <option value="">不关联计划任务（使用本地命令）</option>
+      </select>
+      <p class="hint">关联后读取任务计划程序的真实状态；运行中的 Guard 请保留“长期服务”，执行后退出的任务请选择“批处理任务”。</p>
+    </div>
+    <div class="field" id="dockerResourceField" hidden>
+      <div class="field-head">
+        <label for="fDockerResource">Docker 资源</label>
+        <button class="link-btn" id="btnRefreshDockerResources" type="button">刷新列表</button>
+      </div>
+      <select id="fDockerResource">
+        <option value="">不关联 Docker 资源（使用本地命令）</option>
+      </select>
+      <p class="hint">可收藏整个 Compose 项目或 exact container ID；停止只执行 compose stop 或 container stop，不删除容器、卷和网络。</p>
+    </div>
+    <div class="field" id="cwdField">
       <div class="field-head">
         <label for="fCwd">工作区文件夹</label>
         <button class="link-btn" id="btnDetectProject" type="button">重新识别</button>
@@ -457,13 +490,22 @@
       </div>
       <div class="detect-list" id="detectList"></div>
     </div>
-    <div class="field">
+    <div class="field" id="commandField">
       <div class="field-head">
         <label for="fCmd"><span id="fCmdLabel">启动命令</span> <span class="req">*</span></label>
         <button class="link-btn" id="btnPickScript" type="button">选择脚本…</button>
       </div>
       <textarea id="fCmd" rows="3" placeholder="选择项目或脚本后自动生成命令，也可以手动填写" required aria-required="true"></textarea>
+      <p class="command-compatibility" id="commandCompatibility" role="status" aria-live="polite" hidden></p>
     </div>
+    <div class="field" id="programArgsField" hidden>
+      <label for="fProgramArgs">程序参数</label>
+      <textarea id="fProgramArgs" rows="3" placeholder="每行一个参数；包含空格的参数无需额外引号"></textarea>
+      <p class="hint">参数按行作为独立值传给 EXE，不经过 cmd、PowerShell 或其他 Shell。</p>
+    </div>
+    <label class="force-row" id="elevatedField" hidden>
+      <input type="checkbox" id="fElevated" checked> 使用管理员启动代理
+    </label>
     <div class="field" id="portField">
       <label for="fPort">端口</label>
       <input id="fPort" type="number" min="1" max="65535" step="1" inputmode="numeric"
@@ -495,7 +537,7 @@
               <button class="btn" id="btnPickIcon" type="button">上传图片</button>
               <button class="btn" id="btnRemoveIcon" type="button" hidden>清除</button>
             </div>
-            <p class="hint">png / jpg / webp，也可直接 ⌘V 粘贴剪贴板图片；未选择时显示名称首字</p>
+            <p class="hint">png / jpg / webp，也可直接 <span id="pasteShortcut">Ctrl/⌘+V</span> 粘贴剪贴板图片；未选择时显示名称首字</p>
           </div>
         </div>
         <input type="file" id="iconFile" accept="image/png,image/jpeg,image/webp" hidden>
@@ -508,6 +550,26 @@
       <button class="btn" id="appCancel" type="button">取消</button>
       <button class="btn btn-stop" id="appStopEdit" type="button" hidden>停止</button>
       <button class="btn btn-accent" id="appSave" type="button">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 管理员启动代理密码 ===== -->
+<div class="modal-mask" id="brokerPasswordMask" aria-hidden="true" inert>
+  <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="brokerPasswordTitle">
+    <h3 class="modal-title" id="brokerPasswordTitle">解锁管理员启动</h3>
+    <p class="diag-note" id="brokerPasswordNote"></p>
+    <div class="field">
+      <label for="brokerPassword">解锁密码 <span class="req">*</span></label>
+      <input id="brokerPassword" type="password" autocomplete="current-password" required>
+    </div>
+    <div class="field" id="brokerPasswordConfirmField" hidden>
+      <label for="brokerPasswordConfirm">再次输入密码 <span class="req">*</span></label>
+      <input id="brokerPasswordConfirm" type="password" autocomplete="new-password">
+    </div>
+    <div class="modal-actions">
+      <button class="btn" id="brokerPasswordCancel" type="button">取消</button>
+      <button class="btn btn-accent" id="brokerPasswordSubmit" type="button">解锁</button>
     </div>
   </div>
 </div>
@@ -560,7 +622,7 @@
     <h3 class="modal-title" id="confirmTitle">确认</h3>
     <div class="confirm-body" id="confirmBody"></div>
     <label class="force-row" id="forceRow" hidden>
-      <input type="checkbox" id="forceCheck"> 强制结束 (kill -9)
+      <input type="checkbox" id="forceCheck"> 强制结束
     </label>
     <div class="modal-actions">
       <button class="btn" id="confirmCancel" type="button">取消</button>
@@ -602,14 +664,54 @@
         <button class="mini-tab" type="button" data-appearance="dark">深色</button>
       </div>
     </div>
+    <div class="set-row" id="setImportRow" hidden>
+      <div class="set-copy">
+        <div class="set-name">导入 macOS 配置</div>
+        <div class="set-hint">先预览并映射路径，再选择性提交；不会自动覆盖现有应用</div>
+      </div>
+      <button class="btn" id="setImportOpen" type="button">开始导入</button>
+    </div>
     <div class="set-info-list">
+      <div class="set-info"><span>平台</span><span class="mono" id="setPlatform">—</span></div>
       <div class="set-info"><span>版本</span><span class="mono" id="setVersion">—</span></div>
       <div class="set-info"><span>端口</span><span class="mono" id="setPort">—</span></div>
-      <div class="set-info"><span>工作目录</span><span class="mono set-path" id="setCwd">—</span></div>
-      <div class="set-info"><span>数据目录</span><span class="mono set-path">~/Library/Application Support/总控台</span></div>
+      <div class="set-info"><span>工作目录</span><button class="set-path-copy mono set-path" id="setCwd" type="button">—</button></div>
+      <div class="set-info"><span>数据目录</span><button class="set-path-copy mono set-path" id="setDataDir" type="button">—</button></div>
+      <div class="set-info"><span>日志目录</span><button class="set-path-copy mono set-path" id="setLogsDir" type="button">—</button></div>
+      <div class="set-info set-info-wide"><span>启动方式</span><span id="setLaunchInstruction">请使用当前平台提供的启动入口。</span></div>
+      <div class="set-info set-info-wide"><span>能力说明</span><span id="setLifecycleNotice">当前平台仅开放已验证的操作。</span></div>
     </div>
     <div class="modal-actions">
       <button class="btn" id="settingsMaskClose" type="button">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== macOS 配置导入 ===== -->
+<div class="modal-mask" id="importMask" aria-hidden="true" inert>
+  <div class="modal import-modal" role="dialog" aria-modal="true" aria-labelledby="importTitle">
+    <h3 class="modal-title" id="importTitle">导入 macOS 配置</h3>
+    <p class="import-intro">导入只读取你明确指定的配置文件。先预览、映射路径并核对每个应用，提交后可在本次会话中回滚。</p>
+    <div class="field">
+      <label for="importSourcePath">源配置文件 <span class="req">*</span></label>
+      <input class="mono" id="importSourcePath" placeholder="输入或粘贴 config.json 的完整路径" autocomplete="off" required aria-required="true" aria-describedby="importStatus">
+    </div>
+    <div class="import-mapping-head">
+      <strong>路径映射</strong>
+      <button class="link-btn" id="importAddMapping" type="button">添加映射</button>
+    </div>
+    <p class="hint" id="importMappingHint">仅按明确映射把 macOS 项目根目录转换为 Windows 目录；留空的映射不会提交。</p>
+    <div class="import-mapping-list" id="importMappingList"></div>
+    <div class="import-result" id="importResult" hidden>
+      <div class="import-summary" id="importSummary" role="status" aria-live="polite"></div>
+      <div class="import-app-list" id="importAppList" role="group" aria-label="选择要导入的应用"></div>
+    </div>
+    <p class="diag-note" id="importStatus" role="status" aria-live="polite"></p>
+    <div class="modal-actions import-actions">
+      <button class="btn" id="importClose" type="button">关闭</button>
+      <button class="btn" id="importRollback" type="button" hidden>回滚本次导入</button>
+      <button class="btn btn-accent" id="importPreview" type="button">生成预览</button>
+      <button class="btn btn-accent" id="importCommit" type="button" hidden>提交所选应用</button>
     </div>
   </div>
 </div>

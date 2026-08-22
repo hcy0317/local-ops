@@ -8,17 +8,22 @@ import { $, el, setText, setChildren, icon, escapeHtml,
   currentUiTheme, reconcilePendingUiTheme, trapLayerFocus,
   openLayer, closeLayer, activeLayer,
   currentMutationEpoch, taskNotificationsEnabled, toggleTaskNotifications,
-  localServiceUrl } from './js/core.js';
+  localServiceUrl, platformPresentation, shortcutLabel,
+  hasCapability, currentPlatform } from './js/core.js';
 import { renderLaunchpad, toggleApp, closePortDiagnostic, closeAppDiagnosis } from './js/launchpad.js';
 import { renderServices, observePortDiscovery,
   suspendPortDiscovery } from './js/services.js';
 import { initWidgets, renderWidgets, openLogsCenter, closeLogsCenter,
-  openSettingsCenter, closeSettingsCenter, resetFeedBaseline } from './js/widgets.js';
+  openSettingsCenter, closeSettingsCenter, closeImportWizard,
+  resetFeedBaseline } from './js/widgets.js';
 import { buildGlyphGrid, initAppModal, initLogDrawer, openConfirm,
   openAppModal, closeAppModal, closeConfirm, openLogs, closeLogs,
-  openConsoleLog } from './js/overlays.js';
+  openConsoleLog, openBrokerPassword, closeBrokerPassword,
+  refreshLifecycleState,
+  offerForceStopAfterTimeout } from './js/overlays.js';
 import { configuredPort, actualPorts, portIsOpenable,
   preferredOpenPort } from './js/ports.js';
+import { lifecyclePayload, lifecycleSnapshot, runLifecycleMutation } from './js/lifecycle.js';
 
 /* ---------------- DOM 引用 ---------------- */
 const banner = $('#banner');
@@ -45,6 +50,23 @@ const sideLaunch = $('#sideLaunch');
 const sideSvc = $('#sideSvc');
 
 let firstRender = true;          // 首屏渲染（stagger 入场）
+let brokerPromptedConsolePid = null;
+
+function promptForElevationSession(data) {
+  const broker = data && data.elevationBroker;
+  const consolePid = Number(data && data.consolePid);
+  const hasElevatedFavorite = Array.isArray(data && data.apps)
+    && data.apps.some(app => app && app.elevated === true);
+  if (data && data.platform === 'windows' && broker
+      && broker.installed && broker.verified && !broker.unlocked
+      && hasElevatedFavorite && Number.isInteger(consolePid) && consolePid > 0
+      && brokerPromptedConsolePid !== consolePid) {
+    brokerPromptedConsolePid = consolePid;
+    queueMicrotask(() => {
+      if (!activeLayer()) openBrokerPassword();
+    });
+  }
+}
 
 /* ---------------- 视图切换 ---------------- */
 function switchView(v) {
@@ -82,7 +104,7 @@ function applyView() {
   document.documentElement.dataset.view = v;
   setText(viewOverline, v === 'launchpad' ? 'Launchpad' : 'Services');
   setText(viewSub, v === 'launchpad'
-    ? '一键启动与管理你的本地服务和批处理任务'
+    ? '一键启动与管理你的本地服务、程序和批处理任务'
     : '实时掌握本机监听端口与进程负载');
 }
 navBtns.forEach(b => b.addEventListener('click', () => switchView(b.dataset.view)));
@@ -110,7 +132,7 @@ let pollTimer = null;
 let restartDeadlineTimer = null;
 
 function poll(force = false) {
-  if (document.hidden && !force) return Promise.resolve();
+  if (document.hidden && !force) return Promise.resolve(false);
   if (pollPromise) return pollPromise;
   const controller = new AbortController();
   pollController = controller;
@@ -136,7 +158,7 @@ function poll(force = false) {
          丢弃并立即补一轮，避免卡片短暂回退到旧状态。 */
       if (epochAtStart !== currentMutationEpoch()) {
         schedulePoll(0);
-        return;
+        return false;
       }
       reconcilePendingUiTheme(data);
       if (state.restartingFrom) {
@@ -159,6 +181,8 @@ function poll(force = false) {
         setConnected(true);
       }
       render();
+      promptForElevationSession(data);
+      return true;
     } catch (e) {
       suspendPortDiscovery();
       resetFeedBaseline();
@@ -168,6 +192,7 @@ function poll(force = false) {
         const denied = e.status === 401 || e.status === 403;
         setConnected(false, denied ? '控制台拒绝了当前页面的访问，请重新打开总控台。' : '');
       }
+      return false;
     } finally {
       clearTimeout(timeout);
       if (pollController === controller) pollController = null;
@@ -187,7 +212,12 @@ function schedulePoll(delay = POLL_INTERVAL_MS) {
   }, delay);
 }
 
-window.__poll = () => poll(true);   // 模块间共享轮询入口
+/* 写操作后的调用方必须拿到一份真正晚于在途旧请求的新快照。 */
+window.__poll = async () => {
+  const pending = pollPromise;
+  if (pending) await pending;
+  return poll(true);
+};
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     suspendPortDiscovery();
@@ -206,6 +236,7 @@ const HEALTH_COMPONENT_NAMES = {
   apps: '启动台',
   version: '版本',
   config: '配置',
+  scheduled_tasks: 'Windows 计划任务',
 };
 function stateHealthNotice(data) {
   if (!data) return '';
@@ -228,6 +259,7 @@ function stateHealthNotice(data) {
   return messages.length ? messages.join('；') + '。' : '';
 }
 function setConnected(ok, message = '') {
+  banner.dataset.connection = ok ? 'up' : 'down';
   if (!ok) {
     if (!state.restartingFrom && !state.stopping) {
       banner.textContent = message || DISCONNECTED_TEXT;
@@ -242,23 +274,32 @@ function setConnected(ok, message = '') {
   banner.classList.toggle('show', !!notice);
   banner.setAttribute('aria-hidden', String(!notice));
 }
+function consoleLifecycleSupported() {
+  return hasCapability('restart_console');
+}
 function render() {
   if (!state.data) return;
   const consolePid = Number(state.data.consolePid);
-  const restartSupported = Number.isInteger(consolePid) && consolePid > 0;
+  const lifecycleSupported = consoleLifecycleSupported();
+  const restartSupported = lifecycleSupported &&
+    Number.isInteger(consolePid) && consolePid > 0;
   setText(consolePortLabel, state.data.consolePort ? ':' + state.data.consolePort : ':----');
-  setText(restartConsoleLabel, state.restartingFrom
+  setText(restartConsoleLabel, !lifecycleSupported ? '不可用' : state.restartingFrom
     ? '重启中' : restartSupported ? '重启' : '启用');
-  setText(stopConsoleLabel, state.stopping ? '停止中' : '停止');
-  restartConsoleBtn.disabled = !!state.restartingFrom || state.stopping;
-  stopConsoleBtn.disabled = !!state.restartingFrom || state.stopping;
+  setText(stopConsoleLabel, !lifecycleSupported ? '不可用' : state.stopping ? '停止中' : '停止');
+  restartConsoleBtn.disabled = !lifecycleSupported || !!state.restartingFrom || state.stopping;
+  stopConsoleBtn.disabled = !lifecycleSupported || !!state.restartingFrom || state.stopping;
   restartConsoleBtn.classList.toggle('needs-activation', !restartSupported);
   restartConsoleBtn.classList.toggle('restarting', !!state.restartingFrom);
-  restartConsoleBtn.setAttribute('aria-label', restartSupported ? '重启总控台' : '启用一键重启');
-  restartConsoleBtn.title = restartSupported
+  const unavailableTitle = platformPresentation().lifecycleNotice;
+  restartConsoleBtn.setAttribute('aria-label', !lifecycleSupported
+    ? unavailableTitle : restartSupported ? '重启总控台' : '启用一键重启');
+  restartConsoleBtn.title = !lifecycleSupported ? unavailableTitle : restartSupported
     ? '重启总控台 · PID ' + consolePid +
       (state.data.consoleCwd ? ' · ' + state.data.consoleCwd : '')
     : '当前是旧版后台，点击查看启用方法';
+  stopConsoleBtn.setAttribute('aria-label', lifecycleSupported ? '停止总控台' : unavailableTitle);
+  stopConsoleBtn.title = lifecycleSupported ? '停止总控台' : unavailableTitle;
   /* 侧栏计数：启动台 = 运行中应用数；服务监控 = 我的服务数 */
   const apps = state.data.apps || [];
   const runningApps = apps.filter(a => a.running).length;
@@ -276,11 +317,12 @@ function render() {
 }
 
 function showConsoleActivationInfo(action) {
+  const launchInstruction = platformPresentation().launchInstruction;
   openConfirm({
     title: '先启用后台控制',
     bodyHtml: '当前 <b>' + escapeHtml(consolePortLabel.textContent || '总控台') +
       '</b> 是修改前启动的旧后台，所以页面还不能直接' + escapeHtml(action) + '。' +
-      '<div class="confirm-detail">请双击项目里的 <b>总控台.app</b>，在弹窗中选择“重新启动”。只需做这一次；以后就能直接在页面里重启或停止。</div>',
+      '<div class="confirm-detail">' + escapeHtml(launchInstruction) + '</div>',
     okText: '知道了',
     tone: 'primary',
     onOk: () => {},
@@ -288,6 +330,7 @@ function showConsoleActivationInfo(action) {
 }
 
 restartConsoleBtn.addEventListener('click', () => {
+  if (!consoleLifecycleSupported()) return;
   const consolePid = Number(state.data && state.data.consolePid);
   if (state.restartingFrom) return;
   if (!Number.isInteger(consolePid) || consolePid <= 0) {
@@ -301,8 +344,13 @@ restartConsoleBtn.addEventListener('click', () => {
     okText: '重新启动',
     tone: 'primary',
     onOk: async () => {
+      if (!consoleLifecycleSupported()) {
+        toast(platformPresentation().lifecycleNotice);
+        return;
+      }
       suspendPortDiscovery();
       state.restartingFrom = consolePid;
+      banner.dataset.connection = 'down';
       banner.textContent = '总控台正在重新启动，页面会自动恢复…';
       banner.classList.add('show');
       banner.setAttribute('aria-hidden', 'false');
@@ -320,7 +368,7 @@ restartConsoleBtn.addEventListener('click', () => {
       restartDeadlineTimer = setTimeout(() => {
         if (!state.restartingFrom) return;
         state.restartingFrom = null;
-        setConnected(false, '总控台重启超时，请双击“总控台.app”重新打开。');
+        setConnected(false, '总控台重启超时。' + platformPresentation().launchInstruction);
         render();
       }, 25000);
     },
@@ -328,6 +376,7 @@ restartConsoleBtn.addEventListener('click', () => {
 });
 
 stopConsoleBtn.addEventListener('click', () => {
+  if (!consoleLifecycleSupported()) return;
   const consolePid = Number(state.data && state.data.consolePid);
   if (state.restartingFrom || state.stopping) return;
   if (!Number.isInteger(consolePid) || consolePid <= 0) {
@@ -337,11 +386,17 @@ stopConsoleBtn.addEventListener('click', () => {
   openConfirm({
     title: '停止总控台',
     bodyHtml: '确定要停止总控台吗？' +
-      '<div class="confirm-detail">当前页面会断开；启动台里已经运行的应用不会被停止。再次使用时，双击“总控台.app”即可。</div>',
+      '<div class="confirm-detail">当前页面会断开；启动台里已经运行的应用不会被停止。' +
+      escapeHtml(platformPresentation().launchInstruction) + '</div>',
     okText: '停止运行',
     onOk: async () => {
+      if (!consoleLifecycleSupported()) {
+        toast(platformPresentation().lifecycleNotice);
+        return;
+      }
       state.stopping = true;
-      banner.textContent = '总控台正在停止…再次启动请双击“总控台.app”。';
+      banner.dataset.connection = 'down';
+      banner.textContent = '总控台正在停止…' + platformPresentation().launchInstruction;
       banner.classList.add('show');
       banner.setAttribute('aria-hidden', 'false');
       render();
@@ -352,13 +407,13 @@ stopConsoleBtn.addEventListener('click', () => {
         render();
         return;
       }
-      banner.textContent = '总控台已停止。再次启动请双击“总控台.app”。';
+      banner.textContent = '总控台已停止。' + platformPresentation().launchInstruction;
     },
   });
 });
 
 /* ============================================================
-   命令面板（⌘K）
+   命令面板
    ============================================================ */
 const paletteMask = $('#paletteMask'), paletteInput = $('#paletteInput');
 const paletteList = $('#paletteList');
@@ -378,6 +433,21 @@ function appPortHint(app) {
 function openableAppPort(app) {
   return app && app.running && portIsOpenable(app)
     ? preferredOpenPort(app) : null;
+}
+
+async function restartAppFromPalette(id, intent, appName) {
+  if (!intent || !intent.canManage
+      || !hasCapability('stop_managed') || !hasCapability('launch_managed')) {
+    toast(platformPresentation().lifecycleNotice);
+    return;
+  }
+  const { result, stateIsFresh } = await runLifecycleMutation(
+    () => act(post('/api/apps/' + id + '/restart', lifecyclePayload(intent))),
+    refreshLifecycleState,
+  );
+  offerForceStopAfterTimeout(result, intent, id, appName, stateIsFresh, () => {
+    toast('已强制停止，请再次启动应用');
+  });
 }
 
 function paletteActions() {
@@ -400,25 +470,50 @@ function paletteActions() {
         openAppModal(null, 'task');
       },
     },
+    {
+      icon: 'rocket',
+      title: '收藏程序',
+      hint: '启动台 · 管理员启动',
+      run: () => {
+        switchView('launchpad');
+        openAppModal(null, 'program');
+      },
+    },
   ];
   const apps = (state.data && state.data.apps) || [];
   for (const a of apps) {
     const running = !!a.running;
+    const intent = lifecycleSnapshot(a, currentPlatform());
     const isTask = (a.kind || 'service') === 'task';
+    const isScheduled = a.runtimeSource === 'windowsTaskScheduler';
+    const isDocker = a.runtimeSource === 'dockerCompose'
+      || a.runtimeSource === 'dockerContainer';
+    const isElevated = a.runtimeSource === 'windowsElevationBroker';
     const port = openableAppPort(a);
     const name = a.name || '未命名';
-    items.push({
-      icon: running ? 'square' : 'play',
-      title: (running ? (isTask ? '中止 ' : '停止 ')
-        : (isTask ? '运行 ' : '启动 ')) + name,
-      hint: isTask ? '任务' : appPortHint(a),
-      on: running,
-      run: () => toggleApp(a.id),
-    });
-    if (running && !isTask) {
+    const canToggle = intent.canManage
+      ? hasCapability(isElevated ? 'launch_elevated' : isDocker ? 'control_docker'
+        : isScheduled ? 'stop_scheduled_tasks' : 'stop_managed')
+      : intent.canStart && hasCapability(
+        isElevated ? 'launch_elevated' : isDocker ? 'control_docker'
+          : isScheduled ? 'run_scheduled_tasks' : 'launch_managed'
+      );
+    if (canToggle) {
+      items.push({
+        icon: running ? 'square' : 'play',
+        title: (running ? (isTask ? '中止 ' : '停止 ')
+          : (isTask ? '运行 ' : '启动 ')) + name,
+        hint: isTask ? '任务' : appPortHint(a),
+        on: running,
+        run: () => toggleApp(a.id, null, intent),
+      });
+    }
+    if (intent.canManage && !isTask && !isScheduled && !isDocker && !isElevated
+        && hasCapability('stop_managed') &&
+        hasCapability('launch_managed')) {
       items.push({
         icon: 'refresh-cw', title: '重启 ' + name, hint: '重新启动', on: true,
-        run: () => act(post('/api/apps/' + a.id + '/restart', {})),
+        run: () => restartAppFromPalette(a.id, intent, name),
       });
     }
     if (running && port) {
@@ -435,7 +530,7 @@ function paletteActions() {
   items.push({
     icon: 'file-text',
     title: '打开日志中心',
-    hint: '日志 · ⌘J',
+    hint: '日志 · ' + shortcutLabel('J'),
     run: openLogsCenter,
   });
   items.push({
@@ -455,7 +550,7 @@ function paletteActions() {
   items.push({
     icon: 'terminal',
     title: '总控台日志',
-    hint: '系统 · data/logs/console.log',
+    hint: platformPresentation().logsDir || '系统日志',
     run: openConsoleLog,
   });
   return items;
@@ -560,7 +655,7 @@ paletteInput.addEventListener('keydown', e => {
 });
 paletteMask.addEventListener('mousedown', e => { if (e.target === paletteMask) closePalette(); });
 
-/* ⌘K / Ctrl+K 呼出命令面板 */
+/* 使用平台对应的修饰键呼出命令面板。 */
 document.addEventListener('keydown', e => {
   if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k') {
     e.preventDefault();
@@ -568,7 +663,7 @@ document.addEventListener('keydown', e => {
     else if (!activeLayer()) openPalette();
   }
 });
-/* ⌘J / Ctrl+J 呼出日志中心（⌘L 是浏览器地址栏保留键，无法拦截） */
+/* 使用平台对应的修饰键呼出日志中心。 */
 document.addEventListener('keydown', e => {
   if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'j') {
     e.preventDefault();
@@ -583,6 +678,8 @@ document.addEventListener('keydown', e => {
   trapLayerFocus(e);
   if (e.key === 'Escape') {
     if ($('#confirmMask').classList.contains('open')) closeConfirm();
+    else if ($('#brokerPasswordMask').classList.contains('open')) closeBrokerPassword();
+    else if ($('#importMask').classList.contains('open')) closeImportWizard();
     else if ($('#logsMask').classList.contains('open')) closeLogsCenter();
     else if ($('#settingsMask').classList.contains('open')) closeSettingsCenter();
     else if ($('#portDiagMask').classList.contains('open')) closePortDiagnostic();
@@ -606,7 +703,11 @@ setChildren($('#railIconSvc'), icon('activity', 19));
 setChildren($('#cmdkIcon'), icon('search', 14));
 setChildren($('#paletteIcon'), icon('search', 15));
 buildGlyphGrid();
-initAppModal({ onAddService: $('#addSvcCard'), onAddTask: $('#addTaskCard') });
+initAppModal({
+  onAddService: $('#addSvcCard'),
+  onAddTask: $('#addTaskCard'),
+  onAddProgram: $('#addProgramCard'),
+});
 initLogDrawer();
 initThemeToggle();
 initWidgets();

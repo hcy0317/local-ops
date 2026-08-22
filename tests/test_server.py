@@ -11,6 +11,9 @@ import unittest
 from unittest import mock
 
 import server
+from localops.platform.contracts import ListenerSnapshot, ProcessSnapshot, ScanStatus
+from localops.platform.fake import FakePlatform
+from localops.platform.macos import MacOSPlatform
 
 
 class ParsingTests(unittest.TestCase):
@@ -27,12 +30,15 @@ class ParsingTests(unittest.TestCase):
         self.assertIsNotNone(server.validate_port(70000)[1])
 
     def test_listener_scan_preserves_ipv6_loopback_for_open_links(self):
-        output = """COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
-node 101 user 1u IPv6 0x0 0t0 TCP [::1]:5173 (LISTEN)
-node 202 user 2u IPv4 0x0 0t0 TCP 127.0.0.1:8000 (LISTEN)
-node 303 user 3u IPv6 0x0 0t0 TCP *:3000 (LISTEN)
-"""
-        with mock.patch.object(server, "run_cmd", return_value=output):
+        fake = FakePlatform(listeners=ListenerSnapshot(
+            ScanStatus.OK,
+            {
+                (101, 5173): {"::1"},
+                (202, 8000): {"127.0.0.1"},
+                (303, 3000): {"*"},
+            },
+        ))
+        with mock.patch.object(server, "PLATFORM", fake):
             listeners = server.scan_listeners()
 
         self.assertEqual(listeners[(101, 5173)], {"::1"})
@@ -330,7 +336,12 @@ class ProjectDetectionTests(unittest.TestCase):
             result, error = server.detect_project(td)
 
         self.assertIsNone(error)
-        self.assertEqual(result["candidates"], [
+        legacy_fields = (
+            "command", "label", "source", "port", "kind", "detail")
+        self.assertEqual([
+            {key: item[key] for key in legacy_fields}
+            for item in result["candidates"]
+        ], [
             {"command": "hexo s", "label": "Hexo 本地服务",
              "source": "Hexo 项目结构", "port": 4000,
              "kind": "service", "detail": "等同于 hexo server"},
@@ -338,6 +349,10 @@ class ProjectDetectionTests(unittest.TestCase):
              "source": "Hexo 项目结构", "port": None,
              "kind": "task", "detail": "清除缓存和已生成文件，不启动服务"},
         ])
+        for candidate in result["candidates"]:
+            self.assertEqual(candidate["commandSpec"]["version"], 1)
+            self.assertIn(candidate["platformCompatibility"]["status"],
+                          ("ready", "needs_review", "blocked"))
 
     def test_hexo_server_script_is_not_duplicated(self):
         with tempfile.TemporaryDirectory() as td:
@@ -378,6 +393,98 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(oct(os.stat(path + ".bak").st_mode & 0o777),
                              "0o600")
 
+    def test_post_replace_acl_failure_keeps_memory_and_disk_consistent(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            cfg = server.Config(path)
+            replacement = cfg.snapshot()
+            replacement["watchedKeywords"] = ["import-applied"]
+            expected_hash = server.config_hash(cfg.snapshot())
+            original_ensure = server.PLATFORM.ensure_private_file
+
+            def fail_final_main_verification(candidate):
+                if os.path.abspath(candidate) == os.path.abspath(path):
+                    raise OSError("final ACL verification failed")
+                return original_ensure(candidate)
+
+            with mock.patch.object(
+                server.PLATFORM,
+                "ensure_private_file",
+                side_effect=fail_final_main_verification,
+            ):
+                replaced = cfg.replace_if_hash(expected_hash, replacement)
+
+            with open(path, encoding="utf-8") as handle:
+                disk = json.load(handle)
+            self.assertTrue(replaced)
+            self.assertEqual(cfg.snapshot(), disk)
+            self.assertEqual(disk["watchedKeywords"], ["import-applied"])
+            self.assertFalse(cfg.health_info()["writable"])
+            self.assertIn(
+                "配置文件提交后权限验证失败，已进入只读保护",
+                cfg.health_info()["issues"],
+            )
+
+    def test_post_replace_backup_acl_failure_stops_before_main_write(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            cfg = server.Config(path)
+            before = cfg.snapshot()
+            original_ensure = server.PLATFORM.ensure_private_file
+
+            def fail_final_backup_verification(candidate):
+                if os.path.abspath(candidate) == os.path.abspath(path + ".bak"):
+                    raise OSError("backup ACL verification failed")
+                return original_ensure(candidate)
+
+            with mock.patch.object(
+                server.PLATFORM,
+                "ensure_private_file",
+                side_effect=fail_final_backup_verification,
+            ), self.assertRaises(OSError):
+                cfg.update(
+                    lambda data: data["watchedKeywords"].append("must-not-commit")
+                )
+
+            with open(path, encoding="utf-8") as handle:
+                disk = json.load(handle)
+            self.assertEqual(cfg.snapshot(), before)
+            self.assertEqual(disk, before)
+            self.assertFalse(cfg.health_info()["writable"])
+
+    def test_import_cas_writes_the_validated_payload_without_reprobing(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            cfg = server.Config(path)
+            replacement = cfg.snapshot()
+            replacement["apps"] = [{
+                **server.Config.APP_DEFAULT,
+                "id": "deadbeef",
+                "name": "Already validated",
+                "command": "display only",
+                "commandSpec": server.direct_command_spec("runtime.exe"),
+                "importStatus": "ready",
+            }]
+            expected_hash = server.config_hash(cfg.snapshot())
+
+            with mock.patch.object(
+                cfg,
+                "_normalize",
+                side_effect=AssertionError("must not probe twice"),
+            ):
+                replaced = cfg.replace_normalized_if_hash(
+                    expected_hash, replacement
+                )
+
+            with open(path, encoding="utf-8") as handle:
+                disk = json.load(handle)
+            self.assertTrue(replaced)
+            self.assertEqual(cfg.snapshot(), replacement)
+            self.assertEqual(disk, replacement)
+            self.assertEqual(
+                server.config_hash(disk), server.config_hash(replacement)
+            )
+
     def test_load_falls_back_to_backup(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "config.json")
@@ -409,7 +516,7 @@ class ConfigTests(unittest.TestCase):
                 migrated = json.load(f)
             with open(path + ".bak", "r", encoding="utf-8") as f:
                 previous = json.load(f)
-            self.assertEqual(migrated["schemaVersion"], 1)
+            self.assertEqual(migrated["schemaVersion"], server.CURRENT_SCHEMA_VERSION)
             self.assertNotIn("schemaVersion", previous)
 
             # 第二次读取已是当前 schema，不再改写备份。
@@ -419,6 +526,41 @@ class ConfigTests(unittest.TestCase):
             self.assertIsNone(cfg2.health_info()["migratedFromSchema"])
             with open(path + ".bak", "rb") as f:
                 self.assertEqual(f.read(), previous_bytes)
+
+    def test_schema_v1_to_v2_is_additive_and_idempotent(self):
+        legacy_app = {
+            "id": "deadbeef",
+            "name": "Legacy service",
+            "command": "python3 -m http.server 8000",
+            "cwd": "/Users/example/Project",
+            "port": 8000,
+            "lastPid": 123,
+            "lastPgid": 123,
+            "runToken": "legacy-token",
+            "attached": False,
+        }
+        schema_v1 = {
+            **server.Config.DEFAULT,
+            "schemaVersion": 1,
+            "apps": [legacy_app],
+        }
+
+        migrated, source_version = server.migrate_config(schema_v1)
+        migrated_again, current_source = server.migrate_config(migrated)
+
+        self.assertEqual(source_version, 1)
+        self.assertEqual(current_source, server.CURRENT_SCHEMA_VERSION)
+        self.assertEqual(migrated_again, migrated)
+        app = migrated["apps"][0]
+        self.assertEqual(app["command"], legacy_app["command"])
+        self.assertEqual(app["lastPid"], 123)
+        self.assertEqual(app["runToken"], "legacy-token")
+        self.assertEqual(app["commandSpec"]["mode"], "legacy-posix")
+        self.assertTrue(app["commandSpec"]["needsReview"])
+        self.assertIsNone(app["runtimeIdentity"])
+        self.assertEqual(app["importStatus"], "needs_review")
+        self.assertIsNone(app["dockerResource"])
+        self.assertFalse(app["elevated"])
 
     def test_future_schema_is_not_silently_overwritten(self):
         with tempfile.TemporaryDirectory() as td:
@@ -527,7 +669,7 @@ class RuntimeStorageTests(unittest.TestCase):
                        CONSOLE_LOG_DIR=logs)
             result = subprocess.run(
                 [sys.executable, server.__file__, "--prepare-storage"],
-                cwd=td, env=env, capture_output=True, text=True, timeout=5)
+                cwd=td, env=env, capture_output=True, encoding="utf-8", timeout=5)
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(os.path.isdir(target))
@@ -547,7 +689,7 @@ class RuntimeStorageTests(unittest.TestCase):
                        CONSOLE_LOG_DIR=os.path.join(td, "logs"))
             result = subprocess.run(
                 [sys.executable, server.__file__, "--prepare-storage"],
-                cwd=td, env=env, capture_output=True, text=True, timeout=5)
+                cwd=td, env=env, capture_output=True, encoding="utf-8", timeout=5)
             self.assertNotEqual(result.returncode, 0)
             self.assertNotIn("总控台已启动", result.stdout + result.stderr)
 
@@ -574,6 +716,30 @@ class RuntimeStorageTests(unittest.TestCase):
             with open(log_path, encoding="utf-8") as f:
                 self.assertEqual(f.read(), "launcher-log-ready\n")
             self.assertEqual(os.stat(log_path).st_mode & 0o777, 0o600)
+
+    def test_redirected_legacy_stdio_does_not_crash_localized_startup(self):
+        with tempfile.TemporaryDirectory() as td:
+            script = "\n".join((
+                "import runpy, sys",
+                "path = sys.argv[1]",
+                "sys.argv = [path, '--prepare-storage']",
+                "runpy.run_path(path, run_name='__main__')",
+                "print('总控台已启动', flush=True)",
+            ))
+            environment = dict(
+                os.environ,
+                CONSOLE_DATA_DIR=os.path.join(td, "data"),
+                CONSOLE_LOG_DIR=os.path.join(td, "logs"),
+                PYTHONIOENCODING="cp1252:strict",
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-c", script, server.__file__],
+                cwd=server.BASE_DIR, env=environment, capture_output=True,
+                timeout=5)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("总控台已启动", result.stdout.decode("utf-8"))
 
 
 class ProcessIdentityTests(unittest.TestCase):
@@ -806,14 +972,16 @@ class ProcessIdentityTests(unittest.TestCase):
 
 class LaunchEnvironmentTests(unittest.TestCase):
     def test_headless_launch_path_includes_common_user_node_locations(self):
-        with mock.patch.object(server.os.path, "expanduser", return_value="/Users/example"), \
-                mock.patch.object(server.glob, "glob", side_effect=[
+        with mock.patch("localops.platform.macos.os.path.expanduser",
+                        return_value="/Users/example"), \
+                mock.patch("localops.platform.macos.glob.glob", side_effect=[
                     ["/Users/example/.nvm/versions/node/v22/bin"],
                     ["/Users/example/.fnm/node-versions/v20/installation/bin"],
                 ]):
-            env = server.build_launch_env("secret", {"PATH": "/usr/bin:/bin"})
+            env = MacOSPlatform.launch_environment(
+                "secret", {"PATH": "/usr/bin:/bin"})
 
-        paths = env["PATH"].split(os.pathsep)
+        paths = [path.replace("\\", "/") for path in env["PATH"].split(os.pathsep)]
         self.assertIn("/Users/example/.local/bin", paths)
         self.assertIn("/usr/local/bin", paths)
         self.assertIn("/opt/homebrew/bin", paths)
@@ -966,14 +1134,17 @@ class StateTests(unittest.TestCase):
         self.assertNotIn("status", task["lastExit"])
 
     def test_watched_processes_are_current_user_only(self):
+        current_owner = server.SELF_PRINCIPAL.identifier
         snap = {
-            10: {"uid": server.SELF_UID, "comm": "ffmpeg",
+            10: {"owner": current_owner, "comm": "ffmpeg",
                  "args": "ffmpeg -i render-worker.mov",
                  "cpu": 1.0, "mem": 2.0, "etime": 3},
-            11: {"uid": server.SELF_UID + 1, "comm": "ffmpeg", "args": "ffmpeg -i b",
+            11: {"owner": current_owner + "-other", "comm": "ffmpeg",
+                 "args": "ffmpeg -i b",
                  "cpu": 1.0, "mem": 2.0, "etime": 3},
         }
-        with mock.patch.object(server, "ps_snapshot", return_value=snap):
+        platform = FakePlatform(processes=ProcessSnapshot(ScanStatus.OK, snap))
+        with mock.patch.object(server, "PLATFORM", platform):
             rows = server.build_watched(
                 ["ffmpeg", "render-worker", "FFMPEG"])
         self.assertEqual([row["pid"] for row in rows], [10])

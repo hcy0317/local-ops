@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 import server
-from localops.platform.contracts import ListenerSnapshot, ScanStatus
+from localops.platform.contracts import ListenerSnapshot, ProcessSnapshot, ScanStatus
 from localops.platform.fake import FakePlatform
 from localops.platform.macos import MacOSPlatform
 
@@ -1134,14 +1134,17 @@ class StateTests(unittest.TestCase):
         self.assertNotIn("status", task["lastExit"])
 
     def test_watched_processes_are_current_user_only(self):
+        current_owner = server.SELF_PRINCIPAL.identifier
         snap = {
-            10: {"uid": server.SELF_UID, "comm": "ffmpeg",
+            10: {"owner": current_owner, "comm": "ffmpeg",
                  "args": "ffmpeg -i render-worker.mov",
                  "cpu": 1.0, "mem": 2.0, "etime": 3},
-            11: {"uid": server.SELF_UID + 1, "comm": "ffmpeg", "args": "ffmpeg -i b",
+            11: {"owner": current_owner + "-other", "comm": "ffmpeg",
+                 "args": "ffmpeg -i b",
                  "cpu": 1.0, "mem": 2.0, "etime": 3},
         }
-        with mock.patch.object(server, "ps_snapshot", return_value=snap):
+        platform = FakePlatform(processes=ProcessSnapshot(ScanStatus.OK, snap))
+        with mock.patch.object(server, "PLATFORM", platform):
             rows = server.build_watched(
                 ["ffmpeg", "render-worker", "FFMPEG"])
         self.assertEqual([row["pid"] for row in rows], [10])

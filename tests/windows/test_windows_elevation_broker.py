@@ -1,3 +1,4 @@
+import sys
 import unittest
 from unittest import mock
 
@@ -12,7 +13,10 @@ from localops.platform.contracts import (
 )
 from localops.platform.fake import FakePlatform
 from tests.windows.test_windows_server import HttpHarness
-from localops.windows import elevation_broker as broker_runtime
+if sys.platform == "win32":
+    from localops.windows import elevation_broker as broker_runtime
+else:
+    broker_runtime = None
 
 
 APP_ID = "deadbeef"
@@ -171,6 +175,7 @@ class ElevationBrokerHttpTests(unittest.TestCase):
         self.assertEqual(self.harness.cfg.snapshot()["apps"], [])
 
 
+@unittest.skipUnless(sys.platform == "win32", "Windows installer helper only")
 class ElevationBrokerInstallerTests(unittest.TestCase):
     def test_elevated_helper_rejects_a_modified_install_transaction(self):
         request = {

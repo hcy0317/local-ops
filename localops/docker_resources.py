@@ -40,10 +40,10 @@ class DockerActionResult:
 def _absolute_path(value: object, label: str) -> str:
     if not isinstance(value, str) or not value or "\x00" in value:
         raise ValueError(f"{label} must be a non-empty absolute path")
-    if ntpath.isabs(value):
-        return ntpath.normpath(value)
     if posixpath.isabs(value):
         return posixpath.normpath(value)
+    if ntpath.isabs(value):
+        return ntpath.normpath(value)
     raise ValueError(f"{label} must be an absolute path")
 
 

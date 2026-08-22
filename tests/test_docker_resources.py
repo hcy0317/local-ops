@@ -57,6 +57,19 @@ class DockerResourceTests(unittest.TestCase):
             [os.path.abspath(first), os.path.abspath(second)],
         )
 
+    def test_compose_identity_preserves_posix_paths_on_any_host(self):
+        resource = normalize_docker_resource({
+            "kind": "compose",
+            "projectName": "sample",
+            "workingDir": "/var/lib/sample",
+            "configFiles": ["/var/lib/sample/compose.yml"],
+        })
+
+        self.assertEqual(resource["workingDir"], "/var/lib/sample")
+        self.assertEqual(
+            resource["configFiles"], ["/var/lib/sample/compose.yml"]
+        )
+
     def test_discovery_groups_compose_project_and_preserves_all_containers(self):
         inspect_payload = [{
             "Id": CONTAINER_A,

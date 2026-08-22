@@ -237,6 +237,8 @@ def pyinstaller_command(temp: Path, version_file: Path) -> list[str]:
         "--hidden-import",
         "localops.windows.runner",
         "--hidden-import",
+        "localops.windows.elevation_broker",
+        "--hidden-import",
         "win32timezone",
     ]
     for source, destination in DATA_INPUTS:
@@ -330,6 +332,7 @@ def _write_build_metadata(bundle: Path, version: str) -> None:
             for name in ("psutil", "pywin32")
         },
         "runnerDispatch": "-m localops.windows.runner",
+        "elevationBrokerDispatch": "-m localops.windows.elevation_broker",
         "schemaVersion": 1,
         "signingStatus": SIGNING_STATUS,
         "version": version,
@@ -357,6 +360,7 @@ def _validate_build_info(value: object, version: str) -> None:
             "pywin32": REQUIRED_DISTRIBUTIONS["pywin32"],
         },
         "runnerDispatch": "-m localops.windows.runner",
+        "elevationBrokerDispatch": "-m localops.windows.elevation_broker",
         "schemaVersion": 1,
         "signingStatus": SIGNING_STATUS,
         "version": version,

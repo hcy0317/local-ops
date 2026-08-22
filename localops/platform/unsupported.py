@@ -7,6 +7,8 @@ from typing import Literal, Mapping
 
 from .contracts import (
     CwdSnapshot,
+    ElevationBrokerResult,
+    ElevationBrokerStatus,
     ListenerSnapshot,
     ManagedInspection,
     ManagedRuntime,
@@ -129,6 +131,32 @@ class UnsupportedPlatform:
         return ScheduledTaskRunResult(
             False, path, self._issue.message, self._issue.code
         )
+
+    def set_scheduled_task_enabled(
+            self, path: str, enabled: bool) -> ScheduledTaskRunResult:
+        return ScheduledTaskRunResult(
+            False, path, self._issue.message, self._issue.code
+        )
+
+    @staticmethod
+    def elevation_broker_status() -> ElevationBrokerStatus:
+        return ElevationBrokerStatus()
+
+    def install_elevation_broker(
+            self, password_record: Mapping[str, object]) -> ElevationBrokerResult:
+        return ElevationBrokerResult(False, self._issue.message, self._issue.code)
+
+    def unlock_elevation_broker(self, password: str) -> ElevationBrokerResult:
+        return ElevationBrokerResult(False, self._issue.message, self._issue.code)
+
+    @staticmethod
+    def lock_elevation_broker() -> ElevationBrokerResult:
+        return ElevationBrokerResult(True)
+
+    def launch_elevated(
+            self, command_spec: Mapping[str, object], cwd: str | None,
+    ) -> ElevationBrokerResult:
+        return ElevationBrokerResult(False, self._issue.message, self._issue.code)
 
     def pick_path(self, kind: Literal["dir", "script"]) -> PickResult:
         return PickResult(issue=self._issue)

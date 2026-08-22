@@ -757,7 +757,7 @@ body.dragging-on { cursor: grabbing; user-select: none; -webkit-user-select: non
 
 /* kind 切换 */
 .kind-row {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 4px;
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px;
   padding: 3px; margin-bottom: 20px;
   border: 1px solid var(--line); border-radius: 10px; background: var(--room);
 }

@@ -653,7 +653,7 @@ class ConfigImportContractTests(unittest.TestCase):
         before_path = self.records / committed["importId"] / "before.json"
 
         for malformed in (
-            {"schemaVersion": 3, "apps": []},
+            {"schemaVersion": server.CURRENT_SCHEMA_VERSION + 1, "apps": []},
             {"schemaVersion": 2, "apps": {}},
             {"schemaVersion": 2, "apps": [None]},
         ):

@@ -11,6 +11,7 @@ import functools
 import errno
 import json
 import logging
+import ntpath
 import os
 import re
 import secrets
@@ -58,11 +59,18 @@ from localops.config_import import (
     preview_import,
     rollback_import,
 )
+from localops.docker_resources import (
+    DockerController,
+    DockerSnapshot,
+    normalize_docker_resource,
+)
+from localops.elevation_broker import new_password_record
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_PATH = os.path.join(BASE_DIR, "VERSION")
 LEGACY_DATA_DIR = os.path.join(BASE_DIR, "data")
 PLATFORM = load_platform(BASE_DIR, __file__)
+DOCKER = DockerController()
 PLATFORM_PATHS = PLATFORM.runtime_paths()
 DEFAULT_DATA_DIR = PLATFORM_PATHS.data_dir
 DEFAULT_LOGS_DIR = PLATFORM_PATHS.logs_dir
@@ -99,7 +107,7 @@ CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 INSTANCE_LOCK_PATH = os.path.join(DATA_DIR, "console.lock")
 IMPORT_RECORDS_DIR = os.path.join(DATA_DIR, "imports")
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 4
 
 # 默认 UI 主题：新安装与无偏好回退均使用它，主题清单中固定排首位。
 DEFAULT_UI_THEME = "ops"
@@ -248,7 +256,7 @@ code{background:#f5f5f7;border:1px solid rgba(0,0,0,.05);border-radius:6px;paddi
 </div></body></html>"""
 
 APP_ROUTE_RE = re.compile(
-    r"^/api/apps/([0-9a-fA-F]{8})(?:/(start|stop|restart|icon|logs|favicon|diagnose|attach))?$")
+    r"^/api/apps/([0-9a-fA-F]{8})(?:/(start|stop|restart|icon|logs|favicon|diagnose|attach|scheduled-enabled))?$")
 
 
 # ---------------------------------------------------------------- 运行目录
@@ -752,9 +760,35 @@ def migrate_config_v1_to_v2(raw):
     return migrated
 
 
+def migrate_config_v2_to_v3(raw):
+    """Add explicit external-resource identity without changing managed apps."""
+    migrated = json.loads(json.dumps(raw, ensure_ascii=False))
+    apps = migrated.get("apps")
+    if isinstance(apps, list):
+        for app in apps:
+            if isinstance(app, dict):
+                app.setdefault("dockerResource", None)
+    migrated["schemaVersion"] = 3
+    return migrated
+
+
+def migrate_config_v3_to_v4(raw):
+    """Add explicit per-app elevation intent; existing apps remain standard."""
+    migrated = json.loads(json.dumps(raw, ensure_ascii=False))
+    apps = migrated.get("apps")
+    if isinstance(apps, list):
+        for app in apps:
+            if isinstance(app, dict):
+                app.setdefault("elevated", False)
+    migrated["schemaVersion"] = 4
+    return migrated
+
+
 CONFIG_MIGRATIONS = {
     0: migrate_config_v0_to_v1,
     1: migrate_config_v1_to_v2,
+    2: migrate_config_v2_to_v3,
+    3: migrate_config_v3_to_v4,
 }
 
 
@@ -793,6 +827,8 @@ class Config:
                    "commandSpec": None, "runtimeIdentity": None,
                    "importStatus": "needs_review",
                    "scheduledTaskPath": None,
+                   "dockerResource": None,
+                   "elevated": False,
                    "port": None, "emoji": None, "glyph": None, "icon": None,
                    "favicon": None, "kind": "service", "lastPid": None,
                    "lastPgid": None, "runToken": None,
@@ -833,6 +869,7 @@ class Config:
             for key in app:
                 if key in item:
                     app[key] = item[key]
+            invalid_external_resource = False
             try:
                 app["runtimeIdentity"] = normalize_runtime_identity(
                     app.get("runtimeIdentity"),
@@ -849,6 +886,21 @@ class Config:
                 # later; an untrusted PID-only source must never survive that
                 # pipeline or become a Windows ownership claim.
                 app["runtimeIdentity"] = None
+            try:
+                resource = app.get("dockerResource")
+                app["dockerResource"] = (
+                    normalize_docker_resource(resource)
+                    if resource is not None else None
+                )
+            except ValueError as exc:
+                if strict_runtime:
+                    raise ConfigSchemaError(
+                        "dockerResource 无效: %s" % exc
+                    ) from exc
+                app["dockerResource"] = None
+                app["importStatus"] = "blocked"
+                invalid_external_resource = True
+            app["elevated"] = app.get("elevated") is True
             invalid_command_spec = False
             try:
                 command_spec = app.get("commandSpec")
@@ -870,7 +922,7 @@ class Config:
                     safe_command)
                 app["importStatus"] = "blocked"
                 invalid_command_spec = True
-            if not invalid_command_spec:
+            if not invalid_command_spec and not invalid_external_resource:
                 app["importStatus"] = command_import_status(
                     app["commandSpec"], app.get("cwd"))
             apps.append(app)
@@ -1037,7 +1089,9 @@ class Config:
                         or replacement.get("schemaVersion")
                         != CURRENT_SCHEMA_VERSION
                         or not isinstance(replacement.get("apps"), list)):
-                    raise ValueError("导入配置不是已规范化的 schema v2")
+                    raise ValueError(
+                        "导入配置不是已规范化的当前 schema"
+                    )
                 normalized = json.loads(json.dumps(
                     replacement, ensure_ascii=False
                 ))
@@ -1583,6 +1637,10 @@ def scheduled_task_path(app):
     return value if isinstance(value, str) and value else None
 
 
+def elevated_favorite(app):
+    return bool(isinstance(app, dict) and app.get("elevated") is True)
+
+
 def build_scheduled_task_index(cfg):
     paths = {
         value for value in (
@@ -1686,6 +1744,14 @@ def scheduled_task_app_row(app, task):
         "runtimeSource": "windowsTaskScheduler",
         "scheduledTask": task,
         "scheduledTaskPath": scheduled_task_path(app),
+        "scheduledTaskControlAvailable": (
+            state != "missing"
+            and bool(getattr(
+                PLATFORM.capabilities, "toggle_scheduled_tasks", False
+            ))
+        ),
+        "dockerResource": None,
+        "docker": None,
         "lifecycleStatus": lifecycle_status,
         "controlAvailable": can_run or can_stop,
         "deleteAvailable": True,
@@ -1717,7 +1783,206 @@ def scheduled_task_app_row(app, task):
     }
 
 
-def build_apps(cfg, listeners, groups=None, scheduled_tasks=None):
+def elevation_broker_public(status):
+    if status is None:
+        return {
+            "installed": False, "verified": False,
+            "running": False, "unlocked": False,
+            "issue": None,
+        }
+    issue = getattr(status, "issue", None)
+    return {
+        "installed": bool(getattr(status, "installed", False)),
+        "verified": bool(getattr(status, "verified", False)),
+        "running": bool(getattr(status, "running", False)),
+        "unlocked": bool(getattr(status, "unlocked", False)),
+        "issue": ({
+            "code": issue.code, "message": issue.message,
+        } if issue is not None else None),
+    }
+
+
+def elevated_program_app_row(app, broker_status):
+    broker = elevation_broker_public(broker_status)
+    try:
+        command_spec = normalize_command_spec(app.get("commandSpec"))
+        executable = command_spec.get("executable")
+        spec_valid = (
+            command_spec.get("mode") == "direct"
+            and isinstance(executable, str)
+            and ntpath.isabs(executable)
+            and executable.casefold().endswith(".exe")
+        )
+    except CommandSpecError:
+        spec_valid = False
+    unlocked = (
+        spec_valid and broker["installed"]
+        and broker["verified"] and broker["unlocked"]
+    )
+    if not spec_valid:
+        detail = "收藏的程序不是有效的 absolute EXE。"
+        action = "edit-command"
+    elif not broker["installed"]:
+        detail = "管理员启动代理尚未安装。"
+        action = "install-elevation-broker"
+    elif not broker["verified"]:
+        detail = "管理员启动代理定义无法验证，需要重新安装。"
+        action = "install-elevation-broker"
+    else:
+        detail = "本次 Local Ops 会话尚未输入解锁密码。"
+        action = "unlock-elevation-broker"
+    issues = [] if unlocked else [{
+        "kind": "elevation-broker-locked",
+        "severity": "error",
+        "title": "管理员启动未解锁",
+        "detail": detail,
+        "fix": "请完成代理安装或输入本次会话的解锁密码。",
+        "action": action,
+    }]
+    return {
+        "id": app["id"], "name": app["name"], "command": app["command"],
+        "commandSpec": app.get("commandSpec"),
+        "runtimeIdentity": None,
+        "runtimeSource": "windowsElevationBroker",
+        "scheduledTask": None,
+        "scheduledTaskPath": None,
+        "scheduledTaskControlAvailable": False,
+        "dockerResource": None, "docker": None,
+        "elevated": True,
+        "elevationBroker": broker,
+        "lifecycleStatus": "stopped",
+        "controlAvailable": bool(
+            unlocked and getattr(PLATFORM.capabilities, "launch_elevated", False)
+        ),
+        "deleteAvailable": True,
+        "runtimeIssue": None if unlocked else {
+            "code": "ELEVATION_BROKER_LOCKED", "message": detail,
+        },
+        "importStatus": "ready",
+        "platformCompatibility": {"status": "ready", "reasons": []},
+        "cwd": app.get("cwd"), "port": None,
+        "emoji": app.get("emoji"), "glyph": app.get("glyph"),
+        "icon": app.get("icon"), "favicon": app.get("favicon"),
+        "running": False, "pid": None,
+        "uptimeSec": None, "kind": "program", "attached": False,
+        "lastExit": app.get("lastExit"),
+        "health": {
+            "status": "ok" if unlocked else "error",
+            "blocking": not unlocked, "issues": issues,
+        },
+        "ports": [], "openHosts": {}, "listening": False,
+        "portOccupied": False, "portOccupiedPid": None, "portOwner": None,
+        "portConflict": False, "portConflictApps": [], "legacyManaged": False,
+    }
+
+
+def docker_resource(app):
+    value = app.get("dockerResource") if isinstance(app, dict) else None
+    return value if isinstance(value, dict) else None
+
+
+def build_docker_snapshot(cfg):
+    if not any(docker_resource(app) for app in (cfg.get("apps") or [])):
+        return None
+    return DOCKER.discover()
+
+
+def docker_app_row(app, snapshot):
+    resource = docker_resource(app)
+    containers = {
+        row.get("id"): row for row in (snapshot.containers if snapshot else ())
+        if isinstance(row, dict) and row.get("id")
+    }
+    projects = {
+        row.get("projectName"): row for row in (snapshot.projects if snapshot else ())
+        if isinstance(row, dict) and row.get("projectName")
+    }
+    kind = resource.get("kind") if resource else None
+    observed = (
+        containers.get(resource.get("containerId"))
+        if kind == "container" else projects.get(resource.get("projectName"))
+    ) if resource else None
+    snapshot_ok = snapshot is not None and snapshot.status is not ScanStatus.FAILED
+    issues = []
+    if not snapshot_ok:
+        detail = (
+            snapshot.issues[0].message
+            if snapshot is not None and snapshot.issues else "Docker 状态不可用"
+        )
+        issues.append({
+            "kind": "docker-unavailable", "severity": "error",
+            "title": "Docker 不可用", "detail": detail,
+            "fix": "请启动 Docker Desktop 并确认 docker CLI 可以连接本机 daemon。",
+            "action": None,
+        })
+    elif kind == "container" and observed is None:
+        issues.append({
+            "kind": "docker-container-missing", "severity": "error",
+            "title": "容器不存在", "detail": "收藏的 exact container ID 已不存在。",
+            "fix": "请删除该收藏并重新选择当前容器。", "action": None,
+        })
+    elif kind == "compose":
+        missing = [
+            path for path in (resource.get("configFiles") or [])
+            if not os.path.isfile(path)
+        ]
+        if not os.path.isdir(resource.get("workingDir") or "") or missing:
+            issues.append({
+                "kind": "docker-compose-config-missing", "severity": "error",
+                "title": "Compose 配置不存在",
+                "detail": "工作目录或 Compose 配置文件已移动。",
+                "fix": "请重新收藏当前 Compose 项目。", "action": None,
+            })
+    running = bool(observed and observed.get("running"))
+    blocking = bool(issues)
+    control = (
+        not blocking
+        and bool(getattr(PLATFORM.capabilities, "control_docker", False))
+    )
+    runtime_source = (
+        "dockerContainer" if kind == "container" else "dockerCompose"
+    )
+    issue = None
+    if issues:
+        issue = {"code": issues[0]["kind"], "message": issues[0]["detail"]}
+    return {
+        "id": app["id"], "name": app["name"], "command": app["command"],
+        "commandSpec": app.get("commandSpec"),
+        "runtimeIdentity": None,
+        "runtimeSource": runtime_source,
+        "scheduledTask": None,
+        "scheduledTaskPath": None,
+        "scheduledTaskControlAvailable": False,
+        "dockerResource": resource,
+        "docker": observed,
+        "lifecycleStatus": "unknown" if not snapshot_ok else (
+            "running" if running else "stopped"
+        ),
+        "controlAvailable": control,
+        "deleteAvailable": True,
+        "runtimeIssue": issue,
+        "importStatus": "ready",
+        "platformCompatibility": {"status": "ready", "reasons": []},
+        "cwd": resource.get("workingDir") if kind == "compose" else None,
+        "port": None,
+        "emoji": app.get("emoji"), "glyph": app.get("glyph"),
+        "icon": app.get("icon"), "favicon": app.get("favicon"),
+        "running": running, "pid": None, "uptimeSec": None,
+        "kind": "service", "attached": False,
+        "lastExit": app.get("lastExit"),
+        "health": {
+            "status": "error" if blocking else "ok",
+            "blocking": blocking, "issues": issues,
+        },
+        "ports": [], "openHosts": {}, "listening": False,
+        "portOccupied": False, "portOccupiedPid": None, "portOwner": None,
+        "portConflict": False, "portConflictApps": [], "legacyManaged": False,
+    }
+
+
+def build_apps(
+        cfg, listeners, groups=None, scheduled_tasks=None, docker_snapshot=None,
+        broker_status=None):
     """token 校验通过或严格命中旧版身份的进程才算 running。
 
     多张卡片可共享配置端口；只有当前真实监听者不属于本卡片时才返回
@@ -1730,7 +1995,9 @@ def build_apps(cfg, listeners, groups=None, scheduled_tasks=None):
     scheduled_tasks = scheduled_tasks or {}
     runtime_states = (
         {app["id"]: inspect_windows_runtime(app) for app in apps_cfg
-         if not scheduled_task_path(app)}
+         if not scheduled_task_path(app)
+         and not docker_resource(app)
+         and not elevated_favorite(app)}
         if PLATFORM.name == "windows" else {}
     )
     if PLATFORM.name == "windows":
@@ -1764,6 +2031,12 @@ def build_apps(cfg, listeners, groups=None, scheduled_tasks=None):
 
     apps = []
     for app in apps_cfg:
+        if elevated_favorite(app):
+            apps.append(elevated_program_app_row(app, broker_status))
+            continue
+        if docker_resource(app):
+            apps.append(docker_app_row(app, docker_snapshot))
+            continue
         task_path = scheduled_task_path(app)
         if task_path:
             apps.append(scheduled_task_app_row(
@@ -1855,6 +2128,9 @@ def build_apps(cfg, listeners, groups=None, scheduled_tasks=None):
             "runtimeSource": "managed",
             "scheduledTask": None,
             "scheduledTaskPath": None,
+            "scheduledTaskControlAvailable": False,
+            "dockerResource": None,
+            "docker": None,
             "lifecycleStatus": (
                 runtime_state["status"]
                 if runtime_state is not None
@@ -1936,7 +2212,39 @@ def build_state(cfg, console_port, config_health=None):
         if any(scheduled_task_path(app) for app in (cfg.get("apps") or [])):
             degraded_reasons.append({"component": "scheduled_tasks"})
     try:
-        apps = build_apps(cfg, listeners, groups, scheduled_tasks)
+        docker_snapshot = build_docker_snapshot(cfg)
+        if (docker_snapshot is not None
+                and docker_snapshot.status is ScanStatus.FAILED):
+            degraded_reasons.append({
+                "component": "docker",
+                "error": (
+                    docker_snapshot.issues[0].message
+                    if docker_snapshot.issues else "Docker 状态不可用"
+                ),
+            })
+    except Exception as exc:
+        LOG.exception("构建 Docker 状态失败")
+        docker_snapshot = DockerSnapshot(ScanStatus.FAILED)
+        if any(docker_resource(app) for app in (cfg.get("apps") or [])):
+            degraded_reasons.append({"component": "docker", "error": str(exc)})
+    try:
+        broker_status = (
+            PLATFORM.elevation_broker_status()
+            if getattr(PLATFORM.capabilities, "manage_elevation_broker", False)
+            else None
+        )
+    except Exception as exc:
+        LOG.exception("构建管理员启动代理状态失败")
+        broker_status = None
+        if any(elevated_favorite(app) for app in (cfg.get("apps") or [])):
+            degraded_reasons.append({
+                "component": "elevation_broker", "error": str(exc),
+            })
+    try:
+        apps = build_apps(
+            cfg, listeners, groups, scheduled_tasks, docker_snapshot,
+            broker_status,
+        )
     except Exception:
         LOG.exception("构建启动台状态失败")
         apps = []
@@ -1988,6 +2296,7 @@ def build_state(cfg, console_port, config_health=None):
         "schemaVersion": cfg.get("schemaVersion", CURRENT_SCHEMA_VERSION),
         "platform": platform_name,
         "capabilities": dict(platform_metadata.get("capabilities") or {}),
+        "elevationBroker": elevation_broker_public(broker_status),
         "platformInfo": {
             "shortcutModifier": shortcut_modifier,
             "dataDir": DATA_DIR,
@@ -2632,6 +2941,67 @@ def stop_scheduled_task_app(platform, app):
         payload["code"] = (
             getattr(result, "code", None) or "SCHEDULED_TASK_STOP_FAILED"
         )
+    return payload
+
+
+def set_scheduled_task_enabled_app(platform, app, enabled):
+    path = scheduled_task_path(app)
+    if not path:
+        return {
+            "ok": False,
+            "error": "应用没有关联 Windows 计划任务",
+            "code": "SCHEDULED_TASK_NOT_CONFIGURED",
+        }
+    result = platform.set_scheduled_task_enabled(path, enabled)
+    payload = {
+        "ok": bool(getattr(result, "ok", False)),
+        "taskPath": getattr(result, "task_path", path) or path,
+        "enabled": enabled,
+        "runtimeSource": "windowsTaskScheduler",
+    }
+    if not payload["ok"]:
+        payload["error"] = (
+            getattr(result, "error", None) or "Windows 计划任务状态修改失败"
+        )
+        payload["code"] = (
+            getattr(result, "code", None) or "SCHEDULED_TASK_TOGGLE_FAILED"
+        )
+    return payload
+
+
+def control_docker_app(controller, app, start):
+    resource = docker_resource(app)
+    if not resource:
+        return {
+            "ok": False, "error": "应用没有关联 Docker 资源",
+            "code": "DOCKER_RESOURCE_NOT_CONFIGURED",
+        }
+    result = controller.start(resource) if start else controller.stop(resource)
+    payload = {
+        "ok": bool(getattr(result, "ok", False)),
+        "runtimeSource": (
+            "dockerContainer" if resource.get("kind") == "container"
+            else "dockerCompose"
+        ),
+    }
+    if not payload["ok"]:
+        payload["error"] = getattr(result, "error", None) or "Docker 操作失败"
+        payload["code"] = getattr(result, "code", None) or "DOCKER_CONTROL_FAILED"
+    return payload
+
+
+def launch_elevated_program_app(platform, app):
+    result = platform.launch_elevated(
+        app.get("commandSpec"), app.get("cwd")
+    )
+    payload = {
+        "ok": bool(getattr(result, "ok", False)),
+        "pid": getattr(result, "process_id", None),
+        "runtimeSource": "windowsElevationBroker",
+    }
+    if not payload["ok"]:
+        payload["error"] = getattr(result, "error", None) or "管理员程序启动失败"
+        payload["code"] = getattr(result, "code", None) or "ELEVATED_LAUNCH_FAILED"
     return payload
 
 
@@ -3998,10 +4368,39 @@ def scheduled_task_command_spec(path):
     return direct_command_spec(executable, ["/Run", "/TN", path])
 
 
+def docker_resource_command_spec(resource):
+    if resource["kind"] == "container":
+        args = ["container", "start", resource["containerId"]]
+    else:
+        args = [
+            "compose", "--project-name", resource["projectName"],
+            "--project-directory", resource["workingDir"],
+        ]
+        for path in resource["configFiles"]:
+            args.extend(["--file", path])
+        args.extend(["up", "--detach"])
+    return direct_command_spec("docker", args)
+
+
+def docker_resource_command(resource):
+    return display_command(docker_resource_command_spec(resource))
+
+
 def validate_app_fields(data, partial):
     """校验/规范化应用字段。partial=True 时仅校验出现的字段。
     返回 (fields, error)：fields 为规范化后的字段子集。"""
     fields = {}
+    if "dockerResource" in data:
+        value = data["dockerResource"]
+        if value is None:
+            fields["dockerResource"] = None
+        else:
+            try:
+                fields["dockerResource"] = normalize_docker_resource(value)
+            except ValueError as exc:
+                return None, "dockerResource 无效: %s" % exc
+    elif not partial:
+        fields["dockerResource"] = None
     if "scheduledTaskPath" in data:
         task_path, err = normalize_scheduled_task_path(data["scheduledTaskPath"])
         if err:
@@ -4015,7 +4414,8 @@ def validate_app_fields(data, partial):
             if not isinstance(v, str) or not v.strip():
                 return None, "字段 %s 必须是非空字符串" % key
             fields[key] = v.strip()
-        elif not partial:
+        elif not partial and not (
+                key == "command" and fields.get("dockerResource")):
             return None, "缺少字段 %s" % key
     if "commandSpec" in data:
         try:
@@ -4055,19 +4455,49 @@ def validate_app_fields(data, partial):
         fields["glyph"] = (v or None)
     elif not partial:
         fields["glyph"] = None
+    if "elevated" in data:
+        if not isinstance(data["elevated"], bool):
+            return None, "elevated 必须是布尔值"
+        fields["elevated"] = data["elevated"]
+    elif not partial:
+        fields["elevated"] = False
     if "kind" in data:
-        if data["kind"] not in ("service", "task"):
-            return None, "kind 必须是 service/task"
+        if data["kind"] not in ("service", "task", "program"):
+            return None, "kind 必须是 service/task/program"
         fields["kind"] = data["kind"]
     elif not partial:
         fields["kind"] = "service"
-    if fields.get("kind") == "task":
-        fields["port"] = None  # 批处理任务无端口语义
+    if fields.get("kind") in ("task", "program"):
+        fields["port"] = None  # Tasks and launch-only programs have no port.
     task_path = fields.get("scheduledTaskPath")
+    resource = fields.get("dockerResource")
+    if task_path and resource:
+        return None, "scheduledTaskPath 与 dockerResource 不能同时设置"
+    if fields.get("elevated") and (task_path or resource):
+        return None, "管理员程序不能同时关联计划任务或 Docker 资源"
     if task_path:
         fields["command"] = scheduled_task_command(task_path)
         fields["commandSpec"] = scheduled_task_command_spec(task_path)
         fields["cwd"] = None
+        fields["port"] = None
+    elif resource:
+        fields["commandSpec"] = docker_resource_command_spec(resource)
+        fields["command"] = docker_resource_command(resource)
+        fields["cwd"] = (
+            resource["workingDir"] if resource["kind"] == "compose" else None
+        )
+        fields["port"] = None
+        fields["kind"] = "service"
+    elif fields.get("elevated"):
+        spec = fields.get("commandSpec")
+        executable = spec.get("executable") if isinstance(spec, dict) else None
+        if (not isinstance(spec, dict) or spec.get("mode") != "direct"
+                or not isinstance(executable, str)
+                or not is_local_windows_path(executable)
+                or not ntpath.isabs(executable)
+                or not executable.casefold().endswith(".exe")):
+            return None, "管理员程序必须使用绝对路径的 direct EXE"
+        fields["kind"] = "program"
         fields["port"] = None
     return fields, None
 
@@ -4445,6 +4875,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/windows/scheduled-tasks":
                 self.handle_scheduled_tasks_list(parsed.query)
                 return
+            if path == "/api/docker/resources":
+                self.handle_docker_resources_list()
+                return
             if path == "/api/console/log":
                 self.handle_console_log(parsed.query)
                 return
@@ -4516,6 +4949,26 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({
             "ok": True,
             "tasks": tasks,
+            "partial": snapshot.status is ScanStatus.PARTIAL,
+            "issues": [issue.message for issue in snapshot.issues],
+        })
+
+    def handle_docker_resources_list(self):
+        if not self._require_capability(
+                "monitor_docker", "当前平台未启用 Docker 资源监控"):
+            return
+        snapshot = DOCKER.discover()
+        if snapshot.status is ScanStatus.FAILED:
+            message = (
+                snapshot.issues[0].message if snapshot.issues
+                else "Docker 资源读取失败"
+            )
+            self.send_err(503, message, "DOCKER_QUERY_FAILED")
+            return
+        self.send_json({
+            "ok": True,
+            "containers": list(snapshot.containers),
+            "projects": list(snapshot.projects),
             "partial": snapshot.status is ScanStatus.PARTIAL,
             "issues": [issue.message for issue in snapshot.issues],
         })
@@ -4597,6 +5050,15 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/config/import/rollback":
                 self.handle_config_import_rollback()
                 return
+            if path == "/api/windows/elevation-broker/install":
+                self.handle_elevation_broker_install()
+                return
+            if path == "/api/windows/elevation-broker/unlock":
+                self.handle_elevation_broker_unlock()
+                return
+            if path == "/api/windows/elevation-broker/lock":
+                self.handle_elevation_broker_lock()
+                return
             if path == "/api/console/restart":
                 self.discard_body()
                 self.handle_console_restart()
@@ -4629,6 +5091,9 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if action == "attach":
                     self.handle_app_attach(app_id)
+                    return
+                if action == "scheduled-enabled":
+                    self.handle_scheduled_task_enabled(app_id)
                     return
                 if action == "icon":
                     self.handle_icon_upload(app_id)
@@ -4936,8 +5401,12 @@ class Handler(BaseHTTPRequestHandler):
                "commandSpec": fields["commandSpec"],
                "runtimeIdentity": None,
                "scheduledTaskPath": fields["scheduledTaskPath"],
+               "dockerResource": fields["dockerResource"],
+               "elevated": fields["elevated"],
                "importStatus": (
-                   "ready" if fields["scheduledTaskPath"] else
+                   "ready" if (
+                       fields["scheduledTaskPath"] or fields["dockerResource"]
+                   ) else "needs_review" if fields["elevated"] else
                    command_import_status(fields["commandSpec"], fields["cwd"])
                ),
                "port": fields["port"], "emoji": fields["emoji"],
@@ -5077,6 +5546,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._generation_matches(app, expected_generation):
             return
+        if elevated_favorite(app):
+            if not self._require_capability(
+                    "launch_elevated", "当前平台未启用管理员程序启动"):
+                return
+            result = launch_elevated_program_app(PLATFORM, app)
+            if result.get("ok"):
+                invalidate_state_cache()
+            self.send_json(result, 200 if result.get("ok") else 409)
+            return
+        if docker_resource(app):
+            if not self._require_capability(
+                    "control_docker", "当前平台未启用 Docker 资源控制"):
+                return
+            result = control_docker_app(DOCKER, app, True)
+            if result.get("ok"):
+                invalidate_state_cache()
+            self.send_json(result, 200 if result.get("ok") else 409)
+            return
         if scheduled_task_path(app):
             if not self._require_capability(
                     "run_scheduled_tasks", "当前平台未启用 Windows 计划任务运行"):
@@ -5176,6 +5663,32 @@ class Handler(BaseHTTPRequestHandler):
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
+        if elevated_favorite(app):
+            self.send_err(
+                409, "管理员程序收藏只提供启动入口",
+                "ELEVATED_STOP_UNSUPPORTED",
+            )
+            return
+        if docker_resource(app):
+            if expected_generation is not None:
+                self.send_err(
+                    409, "Docker 资源不使用受管运行代次", "GENERATION_MISMATCH"
+                )
+                return
+            if force:
+                self.send_err(
+                    409, "Docker 资源停止不支持强制模式",
+                    "DOCKER_FORCE_UNSUPPORTED",
+                )
+                return
+            if not self._require_capability(
+                    "control_docker", "当前平台未启用 Docker 资源控制"):
+                return
+            result = control_docker_app(DOCKER, app, False)
+            if result.get("ok"):
+                invalidate_state_cache()
+            self.send_json(result, 200 if result.get("ok") else 409)
+            return
         if scheduled_task_path(app):
             if not self._require_capability(
                     "stop_scheduled_tasks", "当前平台未启用 Windows 计划任务停止"):
@@ -5228,6 +5741,102 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"ok": True})
 
     @serialized_app_operation
+    def handle_scheduled_task_enabled(self, app_id):
+        data = self._read_json_request()
+        if data is None:
+            return
+        enabled = data.get("enabled")
+        if not isinstance(enabled, bool):
+            self.send_err(400, "enabled 必须是布尔值", "INVALID_REQUEST")
+            return
+        _, app = self._get_app_or_404(app_id)
+        if app is None:
+            return
+        if not scheduled_task_path(app):
+            self.send_err(
+                409, "应用没有关联 Windows 计划任务",
+                "SCHEDULED_TASK_NOT_CONFIGURED",
+            )
+            return
+        if not self._require_capability(
+                "toggle_scheduled_tasks", "当前平台未启用 Windows 计划任务启禁用"):
+            return
+        result = set_scheduled_task_enabled_app(PLATFORM, app, enabled)
+        if result.get("ok"):
+            invalidate_state_cache()
+        self.send_json(result, 200 if result.get("ok") else 409)
+
+    def handle_elevation_broker_install(self):
+        data = self._read_json_request()
+        if data is None:
+            return
+        password = data.get("password")
+        if not isinstance(password, str):
+            self.send_err(400, "password 必须是字符串", "INVALID_REQUEST")
+            return
+        if not self._require_capability(
+                "manage_elevation_broker", "当前平台未启用管理员启动代理"):
+            return
+        try:
+            password_record = new_password_record(password)
+        except ValueError as exc:
+            self.send_err(400, str(exc), "BROKER_PASSWORD_INVALID")
+            return
+        result = PLATFORM.install_elevation_broker(password_record)
+        payload = {
+            "ok": bool(getattr(result, "ok", False)),
+            "code": getattr(result, "code", None),
+        }
+        if not payload["ok"]:
+            payload["error"] = getattr(result, "error", None) or "管理员启动代理安装失败"
+        else:
+            invalidate_state_cache()
+        self.send_json(payload, 200 if payload["ok"] else 409)
+
+    def handle_elevation_broker_unlock(self):
+        data = self._read_json_request()
+        if data is None:
+            return
+        password = data.get("password")
+        if not isinstance(password, str):
+            self.send_err(400, "password 必须是字符串", "INVALID_REQUEST")
+            return
+        if not self._require_capability(
+                "manage_elevation_broker", "当前平台未启用管理员启动代理"):
+            return
+        result = PLATFORM.unlock_elevation_broker(password)
+        payload = {
+            "ok": bool(getattr(result, "ok", False)),
+            "code": getattr(result, "code", None),
+        }
+        if not payload["ok"]:
+            payload["error"] = getattr(result, "error", None) or "管理员启动解锁失败"
+        else:
+            invalidate_state_cache()
+        self.send_json(payload, 200 if payload["ok"] else 409)
+
+    def handle_elevation_broker_lock(self):
+        data = self._read_json_request()
+        if data is None:
+            return
+        if data:
+            self.send_err(400, "锁定请求不接受额外字段", "INVALID_REQUEST")
+            return
+        if not self._require_capability(
+                "manage_elevation_broker", "当前平台未启用管理员启动代理"):
+            return
+        result = PLATFORM.lock_elevation_broker()
+        payload = {
+            "ok": bool(getattr(result, "ok", False)),
+            "code": getattr(result, "code", None),
+        }
+        if not payload["ok"]:
+            payload["error"] = getattr(result, "error", None) or "管理员启动锁定失败"
+        else:
+            invalidate_state_cache()
+        self.send_json(payload, 200 if payload["ok"] else 409)
+
+    @serialized_app_operation
     def handle_app_attach(self, app_id):
         if not getattr(PLATFORM.capabilities, "attach_external", False):
             self.discard_body()
@@ -5273,6 +5882,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         _, app = self._get_app_or_404(app_id)
         if app is None:
+            return
+        if elevated_favorite(app):
+            self.send_err(
+                409,
+                "管理员程序不提供重启；请分别执行停止和启动",
+                "ELEVATED_RESTART_UNSUPPORTED",
+            )
+            return
+        if docker_resource(app):
+            self.send_err(
+                409,
+                "Docker 资源不提供重启；请分别执行停止和启动",
+                "DOCKER_RESTART_UNSUPPORTED",
+            )
             return
         if scheduled_task_path(app):
             self.send_err(
@@ -5455,7 +6078,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             lifecycle_fields = {
                 "command", "commandSpec", "cwd", "port", "kind",
-                "scheduledTaskPath",
+                "scheduledTaskPath", "dockerResource", "elevated",
             }
             lifecycle_changed = any(
                 key in fields and fields[key] != app.get(key)
@@ -5514,9 +6137,14 @@ class Handler(BaseHTTPRequestHandler):
             def op(c, target):
                 target.update(fields)
                 if ("commandSpec" in fields or "cwd" in fields
-                        or "scheduledTaskPath" in fields):
+                        or "scheduledTaskPath" in fields
+                        or "dockerResource" in fields
+                        or "elevated" in fields):
                     target["importStatus"] = (
-                        "ready" if target.get("scheduledTaskPath") else
+                        "ready" if (
+                            target.get("scheduledTaskPath")
+                            or target.get("dockerResource")
+                        ) else "needs_review" if target.get("elevated") else
                         command_import_status(
                             target["commandSpec"], target.get("cwd")
                         )
@@ -5893,6 +6521,11 @@ def _run_console(preferred_port=None, open_browser=True, storage_issues=None):
         pass
     finally:
         reconcile_stop.set()
+        if getattr(PLATFORM.capabilities, "manage_elevation_broker", False):
+            try:
+                PLATFORM.lock_elevation_broker()
+            except Exception:
+                LOG.exception("锁定管理员启动代理失败")
         server.server_close()
         print("已停止", flush=True)
 

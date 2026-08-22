@@ -8,12 +8,14 @@ import { $, el, setText, setChildren, setKpi, setKpiUnit, icon, iconBtn, escapeH
   localServiceUrl, hasCapability, platformPresentation,
   currentPlatform } from './core.js';
 import { openConfirm, openAppModal, openLogs, getIconVer,
-  refreshLifecycleState, offerForceStopAfterTimeout } from './overlays.js';
+  refreshLifecycleState, offerForceStopAfterTimeout,
+  openBrokerPassword } from './overlays.js';
 import { configuredPort, actualPorts, hasPortMismatch,
   preferredOpenPort, displayedPorts, portIsOpenable } from './ports.js';
 import { lifecyclePayload, lifecycleSnapshot, runLifecycleMutation } from './lifecycle.js';
 
 const svcGrid = $('#svcGrid'), taskGrid = $('#taskGrid');
+const programGrid = $('#programGrid');
 const reorderStatus = $('#reorderStatus');
 /* ---------------- 图标取色光晕 ---------------- */
 function hueFromString(s) {
@@ -163,15 +165,17 @@ function createAppCard() {
   bDiag.hidden = true;
   const bRestart = iconBtn('refresh-cw', '重启应用');
   bRestart.hidden = true;
+  const bSchedule = iconBtn('power', '启用或禁用计划任务');
+  bSchedule.hidden = true;
   const bEdit = iconBtn('pencil', '编辑');
   const bDel = iconBtn('trash-2', '删除', 'danger');
-  sub.append(bCopy, bLogs, bDiag, bRestart, bEdit, bDel);
+  sub.append(bCopy, bLogs, bDiag, bRestart, bSchedule, bEdit, bDel);
   actions.append(primary, sub);
 
   card.append(head, cmd, actions);
   card._r = { iconBox, iconImg, iconGlyph, iconTxt, name, status, dot,
     stText, stPort, stUp, taskHistory, cmd, primary, copy: bCopy, logs: bLogs,
-    diag: bDiag, restart: bRestart, edit: bEdit, del: bDel };
+    diag: bDiag, restart: bRestart, schedule: bSchedule, edit: bEdit, del: bDel };
 
   const id = () => card.dataset.key;
   primary.addEventListener('click', () => toggleApp(id(), primary));
@@ -205,6 +209,10 @@ function createAppCard() {
     const a = findApp(id());
     if (a) confirmRestartApp(a);
   });
+  bSchedule.addEventListener('click', () => {
+    const a = findApp(id());
+    if (a) setScheduledTaskEnabled(a, bSchedule);
+  });
   bEdit.addEventListener('click', () => { const a = findApp(id()); if (a) openAppModal(a); });
   bDel.addEventListener('click', () => { const a = findApp(id()); if (a) confirmDeleteApp(a); });
   return card;
@@ -217,11 +225,13 @@ function setPrimary(btn, running, kind, lifecycleState = '') {
   btn._sig = sig;
   const label = lifecycleState === 'starting' ? '启动中'
     : lifecycleState === 'stopping' ? '停止中'
-      : lifecycleState === 'unavailable' ? '不可用'
+      : lifecycleState === 'authorize' ? '解锁'
+        : lifecycleState === 'unavailable' ? '不可用'
         : running ? (kind === 'task' ? '中止' : '停止')
           : (kind === 'task' ? '运行' : '启动');
   const glyph = lifecycleState === 'starting' || lifecycleState === 'stopping'
-    ? 'clock' : lifecycleState === 'unavailable' ? 'power'
+    ? 'clock' : lifecycleState === 'authorize' ? 'wrench'
+      : lifecycleState === 'unavailable' ? 'power'
       : running ? 'square' : 'play';
   setChildren(btn, icon(glyph, 13));
   btn.appendChild(document.createTextNode(label));
@@ -279,6 +289,9 @@ function updateAppCard(card, app) {
   const kind = app.kind || 'service';
   const isTask = kind === 'task';
   const isScheduled = app.runtimeSource === 'windowsTaskScheduler';
+  const isDocker = app.runtimeSource === 'dockerCompose'
+    || app.runtimeSource === 'dockerContainer';
+  const isElevated = app.runtimeSource === 'windowsElevationBroker';
   const scheduledState = isScheduled && app.scheduledTask
     ? app.scheduledTask.state : '';
   const lifecycle = lifecycleSnapshot(app, currentPlatform());
@@ -312,6 +325,16 @@ function updateAppCard(card, app) {
     stFail = true;
   } else if (isScheduled && scheduledState === 'missing') {
     stTxt = '计划任务不存在';
+    stFail = true;
+  } else if (isDocker && app.running) {
+    stTxt = '运行中 · ' + (app.runtimeSource === 'dockerCompose'
+      ? 'Docker Compose' : 'Docker 容器');
+  } else if (isDocker && lifecycle.status === 'stopped') {
+    stTxt = '已停止 · ' + (app.runtimeSource === 'dockerCompose'
+      ? 'Docker Compose' : 'Docker 容器');
+  } else if (isElevated && !app.controlAvailable) {
+    stTxt = app.elevationBroker && app.elevationBroker.installed
+      ? '等待本次会话解锁' : '管理员代理未安装';
     stFail = true;
   } else if (lifecycle.status === 'starting') {
     stTxt = '启动中';
@@ -418,14 +441,16 @@ function updateAppCard(card, app) {
     r.stUp.hidden = true;
     setText(r.stUp, '');
   }
-  const primaryState = lifecycle.busy ? lifecycle.status
+  const needsBrokerAccess = isElevated && !lifecycle.canStart;
+  const primaryState = needsBrokerAccess ? 'authorize' : lifecycle.busy ? lifecycle.status
     : lifecycle.uncertain || (!lifecycle.canStart && !lifecycle.canManage)
       ? 'unavailable' : '';
   setPrimary(r.primary, !!app.running, kind, primaryState);
   const appName = app.name || (isTask ? '任务' : '应用');
   const primaryVerb = primaryState === 'starting' ? '启动中'
     : primaryState === 'stopping' ? '停止中'
-      : primaryState === 'unavailable' ? '控制不可用'
+      : primaryState === 'authorize' ? '解锁管理员启动'
+        : primaryState === 'unavailable' ? '控制不可用'
         : app.running ? (isTask ? '中止' : '停止')
           : (isTask ? '运行' : '启动');
   r.primary.setAttribute('aria-label', primaryVerb + ' ' + appName);
@@ -434,23 +459,36 @@ function updateAppCard(card, app) {
   r.diag.setAttribute('aria-label',
     (isTask ? '配置与运行诊断：' : '配置与启动诊断：') + appName);
   r.restart.setAttribute('aria-label', '重启 ' + appName);
+  const scheduledEnabled = !!(app.scheduledTask && app.scheduledTask.enabled);
+  const scheduleVerb = scheduledEnabled ? '禁用' : '启用';
+  r.schedule.setAttribute('aria-label', scheduleVerb + '计划任务 ' + appName);
   r.edit.setAttribute('aria-label', '编辑 ' + appName);
   r.del.setAttribute('aria-label', '删除 ' + appName);
   card.setAttribute('aria-label', appName + '，' + stTxt);
   const canLaunch = hasCapability(
-    isScheduled ? 'run_scheduled_tasks' : 'launch_managed'
+    isElevated ? 'launch_elevated' : isDocker ? 'control_docker'
+      : isScheduled ? 'run_scheduled_tasks' : 'launch_managed'
   );
   const canStop = hasCapability(
-    isScheduled ? 'stop_scheduled_tasks' : 'stop_managed'
+    isElevated ? 'launch_elevated' : isDocker ? 'control_docker'
+      : isScheduled ? 'stop_scheduled_tasks' : 'stop_managed'
   );
-  const canToggle = lifecycle.canManage ? canStop
+  const canBrokerAccess = needsBrokerAccess
+    && hasCapability('manage_elevation_broker');
+  const canToggle = canBrokerAccess ? true : lifecycle.canManage ? canStop
     : lifecycle.canStart ? canLaunch : false;
-  r.restart.hidden = isScheduled || !lifecycle.canManage
+  r.restart.hidden = isScheduled || isDocker || isElevated || !lifecycle.canManage
     || kind !== 'service' || !canStop || !canLaunch;
+  r.schedule.hidden = !isScheduled || scheduledState === 'missing';
+  r.schedule.disabled = !app.scheduledTaskControlAvailable
+    || !hasCapability('toggle_scheduled_tasks');
+  r.schedule.title = r.schedule.disabled
+    ? '当前计划任务不可修改' : scheduleVerb + '计划任务';
+  r.schedule.classList.toggle('active', isScheduled && scheduledEnabled);
   r.del.disabled = !lifecycle.canDelete
-    || (!isScheduled && lifecycle.canManage && !canStop);
+    || (!isScheduled && !isDocker && !isElevated && lifecycle.canManage && !canStop);
   r.del.title = r.del.disabled ? platformPresentation().lifecycleNotice : '删除';
-  const blocked = !canToggle || (!app.running &&
+  const blocked = !canToggle || (!needsBrokerAccess && !app.running &&
     (!!app.portConflict || !!app.portOccupied || !!healthIssue || platformBlocked));
   r.primary.disabled = blocked;
   const compatibilityReason = compatibility && Array.isArray(compatibility.reasons)
@@ -475,15 +513,46 @@ function updateAppCard(card, app) {
   maybeFetchFavicon(card, app);
 }
 
+async function setScheduledTaskEnabled(app, button) {
+  if (!app.scheduledTaskControlAvailable
+      || !hasCapability('toggle_scheduled_tasks')) {
+    toast('当前平台未启用 Windows 计划任务启禁用');
+    return;
+  }
+  const enabled = !(app.scheduledTask && app.scheduledTask.enabled);
+  button.disabled = true;
+  try {
+    const result = await act(post(
+      '/api/apps/' + app.id + '/scheduled-enabled', { enabled },
+    ));
+    await refreshLifecycleState(result);
+    if (result && result.ok !== false) {
+      toast((enabled ? '已启用 ' : '已禁用 ') + (app.name || '计划任务'));
+    }
+  } finally {
+    const latest = findApp(app.id);
+    button.disabled = !latest || !latest.scheduledTaskControlAvailable
+      || !hasCapability('toggle_scheduled_tasks');
+  }
+}
+
 async function toggleApp(id, button, capturedIntent) {
   const app = findApp(id);
   if (!app) return;
   const isTask = (app.kind || 'service') === 'task';
   const isScheduled = app.runtimeSource === 'windowsTaskScheduler';
+  const isDocker = app.runtimeSource === 'dockerCompose'
+    || app.runtimeSource === 'dockerContainer';
+  const isElevated = app.runtimeSource === 'windowsElevationBroker';
   const intent = capturedIntent || lifecycleSnapshot(app, currentPlatform());
   const starting = intent.status === 'stopped';
+  if (isElevated && !intent.canStart) {
+    openBrokerPassword();
+    return;
+  }
   const capability = starting ? 'launch_managed' : 'stop_managed';
-  const effectiveCapability = isScheduled
+  const effectiveCapability = isElevated ? 'launch_elevated'
+    : isDocker ? 'control_docker' : isScheduled
     ? (starting ? 'run_scheduled_tasks' : 'stop_scheduled_tasks')
     : capability;
   if ((!starting && !intent.canManage) || (starting && !intent.canStart)
@@ -518,11 +587,15 @@ async function toggleApp(id, button, capturedIntent) {
     );
     if (result && result.ok !== false) {
       if (starting) {
-        toast(isTask
-          ? targetName + '已开始运行'
-          : '启动命令已执行，正在等待' + (app.port ? ' :' + app.port : '服务'));
-        setTimeout(window.__poll, 700);
-        setTimeout(window.__poll, 1800);
+        toast(isElevated
+          ? '已通过管理员代理启动 ' + targetName
+          : isTask
+            ? targetName + '已开始运行'
+            : '启动命令已执行，正在等待' + (app.port ? ' :' + app.port : '服务'));
+        if (!isElevated) {
+          setTimeout(window.__poll, 700);
+          setTimeout(window.__poll, 1800);
+        }
       } else {
         toast((isTask ? '已中止 ' : '已停止 ') + targetName);
       }
@@ -536,7 +609,14 @@ async function toggleApp(id, button, capturedIntent) {
       const latestLifecycle = lifecycleSnapshot(latest, currentPlatform());
       const latestScheduled = latest
         && latest.runtimeSource === 'windowsTaskScheduler';
-      const latestCapability = latestScheduled
+      const latestDocker = latest && (
+        latest.runtimeSource === 'dockerCompose'
+        || latest.runtimeSource === 'dockerContainer'
+      );
+      const latestElevated = latest
+        && latest.runtimeSource === 'windowsElevationBroker';
+      const latestCapability = latestElevated ? 'launch_elevated'
+        : latestDocker ? 'control_docker' : latestScheduled
         ? (latestLifecycle.canManage ? 'stop_scheduled_tasks' : 'run_scheduled_tasks')
         : latestLifecycle.canManage ? 'stop_managed' : 'launch_managed';
       const latestCompatibility = latest && latest.platformCompatibility;
@@ -585,7 +665,10 @@ function confirmRestartApp(app) {
 function confirmDeleteApp(app) {
   const intent = lifecycleSnapshot(app, currentPlatform());
   const isScheduled = app.runtimeSource === 'windowsTaskScheduler';
-  if (!intent.canDelete || (!isScheduled && intent.canManage
+  const isDocker = app.runtimeSource === 'dockerCompose'
+    || app.runtimeSource === 'dockerContainer';
+  const isElevated = app.runtimeSource === 'windowsElevationBroker';
+  if (!intent.canDelete || (!isScheduled && !isDocker && !isElevated && intent.canManage
       && !hasCapability('stop_managed'))) {
     toast(platformPresentation().lifecycleNotice);
     return;
@@ -595,10 +678,12 @@ function confirmDeleteApp(app) {
     bodyHtml: '确定要删除 <b>' + escapeHtml(app.name || '') + '</b> 吗？' +
       '<div class="confirm-detail">' + (isScheduled
         ? '只删除监控卡片，不会停止或删除 Windows 计划任务。'
+        : isDocker ? '只删除收藏卡片，不会停止或删除 Docker 资源。'
+        : isElevated ? '只删除程序收藏，不会卸载管理员启动代理。'
         : (app.running ? '将先停止该应用，并' : '将') + '删除其图标与日志。') + '</div>',
     okText: '删除',
     onOk: async () => {
-      if (!intent.canDelete || (!isScheduled && intent.canManage
+      if (!intent.canDelete || (!isScheduled && !isDocker && !isElevated && intent.canManage
           && !hasCapability('stop_managed'))) {
         toast(platformPresentation().lifecycleNotice);
         return;
@@ -607,7 +692,7 @@ function confirmDeleteApp(app) {
         () => act(del('/api/apps/' + app.id, lifecyclePayload(intent))),
         refreshLifecycleState,
       );
-      if (intent.canManage) {
+      if (intent.canManage && !isScheduled && !isDocker && !isElevated) {
         offerForceStopAfterTimeout(result, intent, app.id, app.name, stateIsFresh, () => {
           toast('已强制停止，请再次确认删除');
         });
@@ -1159,16 +1244,21 @@ function finishKeyboardSort(commit) {
 
 export function renderLaunchpad(apps, firstRender) {
   if (drag || keyboardSort) return;  // 排序中轮询不打乱 DOM
-  const svcs = apps.filter(a => (a.kind || 'service') !== 'task');
+  const svcs = apps.filter(a => (a.kind || 'service') === 'service');
   const tasks = apps.filter(a => a.kind === 'task');
+  const programs = apps.filter(a => a.kind === 'program');
   const addSvc = $('#addSvcCard');
   const addTask = $('#addTaskCard');
+  const addProgram = $('#addProgramCard');
   addSvc.remove();
   addTask.remove();
+  addProgram.remove();
   reconcile(svcGrid, svcs, a => a.id, createAppCard, updateAppCard, firstRender);
   svcGrid.prepend(addSvc);                  // 新增入口始终优先可见
   reconcile(taskGrid, tasks, a => a.id, createAppCard, updateAppCard, firstRender);
   taskGrid.prepend(addTask);                // 批处理新增入口始终优先可见
+  reconcile(programGrid, programs, a => a.id, createAppCard, updateAppCard, firstRender);
+  programGrid.prepend(addProgram);
   renderLpKpi(apps, svcs, tasks);
   latestSvcs = svcs;
   latestTasks = tasks;
@@ -1176,6 +1266,7 @@ export function renderLaunchpad(apps, firstRender) {
   syncTaskFilterUI();
   setText($('#svcSecCount'), svcs.length ? String(svcs.length) : '');
   setText($('#taskSecCount'), tasks.length ? String(tasks.length) : '');
+  setText($('#programSecCount'), programs.length ? String(programs.length) : '');
 }
 
 function syncSvcFilterUI() {

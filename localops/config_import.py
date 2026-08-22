@@ -29,7 +29,7 @@ from localops.command_spec import (
 
 MAX_SOURCE_BYTES = 1 * 1024 * 1024
 MAX_RECORD_BYTES = 16 * 1024 * 1024
-SUPPORTED_SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSION = 4
 _HASH_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 _PREVIEW_PATTERN = re.compile(
     r"sha256:([0-9a-f]{64})\.([0-9a-f]{64})"
@@ -86,7 +86,7 @@ def _validated_snapshot_hash(
     code: str,
     message: str,
 ) -> tuple[dict[str, object], str]:
-    """Validate an already-normalized v2 snapshot without environment probes."""
+    """Validate an already-normalized current snapshot without probes."""
     try:
         snapshot = _clone(value)
     except Exception:
@@ -277,11 +277,12 @@ def _normalize_config(
             "IMPORT_COMMIT_FAILED", 500,
             "The target configuration could not be validated."
         ) from None
-    if not isinstance(normalized, dict) or normalized.get("schemaVersion") != 2:
+    version = normalized.get("schemaVersion") if isinstance(normalized, dict) else None
+    if type(version) is not int or version < 2:
         if source:
             raise _error(
                 "IMPORT_SOURCE_INVALID", 400,
-                "The source configuration could not be normalized to schema v2."
+                "The source configuration could not be normalized to a supported schema."
             )
         raise _error(
             "IMPORT_COMMIT_FAILED", 500,
@@ -845,7 +846,7 @@ def commit_import(
         statuses[imported["id"]] = app["status"]
         staged_apps.append(imported)
     staged["apps"] = staged_apps
-    staged["schemaVersion"] = 2
+    staged["schemaVersion"] = target["schemaVersion"]
     staged = _normalize_config(staged, normalize_config, source=False)
     staged_by_id = {
         app.get("id"): app for app in staged["apps"] if isinstance(app, dict)

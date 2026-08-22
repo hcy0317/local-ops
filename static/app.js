@@ -18,7 +18,8 @@ import { initWidgets, renderWidgets, openLogsCenter, closeLogsCenter,
   resetFeedBaseline } from './js/widgets.js';
 import { buildGlyphGrid, initAppModal, initLogDrawer, openConfirm,
   openAppModal, closeAppModal, closeConfirm, openLogs, closeLogs,
-  openConsoleLog, refreshLifecycleState,
+  openConsoleLog, openBrokerPassword, closeBrokerPassword,
+  refreshLifecycleState,
   offerForceStopAfterTimeout } from './js/overlays.js';
 import { configuredPort, actualPorts, portIsOpenable,
   preferredOpenPort } from './js/ports.js';
@@ -49,6 +50,23 @@ const sideLaunch = $('#sideLaunch');
 const sideSvc = $('#sideSvc');
 
 let firstRender = true;          // 首屏渲染（stagger 入场）
+let brokerPromptedConsolePid = null;
+
+function promptForElevationSession(data) {
+  const broker = data && data.elevationBroker;
+  const consolePid = Number(data && data.consolePid);
+  const hasElevatedFavorite = Array.isArray(data && data.apps)
+    && data.apps.some(app => app && app.elevated === true);
+  if (data && data.platform === 'windows' && broker
+      && broker.installed && broker.verified && !broker.unlocked
+      && hasElevatedFavorite && Number.isInteger(consolePid) && consolePid > 0
+      && brokerPromptedConsolePid !== consolePid) {
+    brokerPromptedConsolePid = consolePid;
+    queueMicrotask(() => {
+      if (!activeLayer()) openBrokerPassword();
+    });
+  }
+}
 
 /* ---------------- 视图切换 ---------------- */
 function switchView(v) {
@@ -86,7 +104,7 @@ function applyView() {
   document.documentElement.dataset.view = v;
   setText(viewOverline, v === 'launchpad' ? 'Launchpad' : 'Services');
   setText(viewSub, v === 'launchpad'
-    ? '一键启动与管理你的本地服务和批处理任务'
+    ? '一键启动与管理你的本地服务、程序和批处理任务'
     : '实时掌握本机监听端口与进程负载');
 }
 navBtns.forEach(b => b.addEventListener('click', () => switchView(b.dataset.view)));
@@ -163,6 +181,7 @@ function poll(force = false) {
         setConnected(true);
       }
       render();
+      promptForElevationSession(data);
       return true;
     } catch (e) {
       suspendPortDiscovery();
@@ -451,6 +470,15 @@ function paletteActions() {
         openAppModal(null, 'task');
       },
     },
+    {
+      icon: 'rocket',
+      title: '收藏程序',
+      hint: '启动台 · 管理员启动',
+      run: () => {
+        switchView('launchpad');
+        openAppModal(null, 'program');
+      },
+    },
   ];
   const apps = (state.data && state.data.apps) || [];
   for (const a of apps) {
@@ -458,12 +486,17 @@ function paletteActions() {
     const intent = lifecycleSnapshot(a, currentPlatform());
     const isTask = (a.kind || 'service') === 'task';
     const isScheduled = a.runtimeSource === 'windowsTaskScheduler';
+    const isDocker = a.runtimeSource === 'dockerCompose'
+      || a.runtimeSource === 'dockerContainer';
+    const isElevated = a.runtimeSource === 'windowsElevationBroker';
     const port = openableAppPort(a);
     const name = a.name || '未命名';
     const canToggle = intent.canManage
-      ? hasCapability(isScheduled ? 'stop_scheduled_tasks' : 'stop_managed')
+      ? hasCapability(isElevated ? 'launch_elevated' : isDocker ? 'control_docker'
+        : isScheduled ? 'stop_scheduled_tasks' : 'stop_managed')
       : intent.canStart && hasCapability(
-        isScheduled ? 'run_scheduled_tasks' : 'launch_managed'
+        isElevated ? 'launch_elevated' : isDocker ? 'control_docker'
+          : isScheduled ? 'run_scheduled_tasks' : 'launch_managed'
       );
     if (canToggle) {
       items.push({
@@ -475,7 +508,8 @@ function paletteActions() {
         run: () => toggleApp(a.id, null, intent),
       });
     }
-    if (intent.canManage && !isTask && !isScheduled && hasCapability('stop_managed') &&
+    if (intent.canManage && !isTask && !isScheduled && !isDocker && !isElevated
+        && hasCapability('stop_managed') &&
         hasCapability('launch_managed')) {
       items.push({
         icon: 'refresh-cw', title: '重启 ' + name, hint: '重新启动', on: true,
@@ -644,6 +678,7 @@ document.addEventListener('keydown', e => {
   trapLayerFocus(e);
   if (e.key === 'Escape') {
     if ($('#confirmMask').classList.contains('open')) closeConfirm();
+    else if ($('#brokerPasswordMask').classList.contains('open')) closeBrokerPassword();
     else if ($('#importMask').classList.contains('open')) closeImportWizard();
     else if ($('#logsMask').classList.contains('open')) closeLogsCenter();
     else if ($('#settingsMask').classList.contains('open')) closeSettingsCenter();
@@ -668,7 +703,11 @@ setChildren($('#railIconSvc'), icon('activity', 19));
 setChildren($('#cmdkIcon'), icon('search', 14));
 setChildren($('#paletteIcon'), icon('search', 15));
 buildGlyphGrid();
-initAppModal({ onAddService: $('#addSvcCard'), onAddTask: $('#addTaskCard') });
+initAppModal({
+  onAddService: $('#addSvcCard'),
+  onAddTask: $('#addTaskCard'),
+  onAddProgram: $('#addProgramCard'),
+});
 initLogDrawer();
 initThemeToggle();
 initWidgets();

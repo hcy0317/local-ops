@@ -2,7 +2,7 @@
 
 **Preview / Alpha · 源码预览**
 
-总控台是一个本地服务与批处理任务快速启动、运行监测工具。macOS 版本保留完整现有功能；Windows 当前是通过 exact-commit CI 的 Phase 5 unsigned engineering candidate，提供安全的本地监听与进程观察、结构化命令配置、显式 macOS 配置导入，以及仅面向 Local Ops 自己创建的 Job Object 进程树控制。Windows 10、独立干净无 Python VM、Defender/SmartScreen、原生集成、品牌审核与签名门禁尚未完成，因此仍是 Preview / Alpha，而不是 Windows Beta。共享核心只绑定回环地址；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
+总控台是一个本地服务、Docker 资源、批处理任务与常用程序快速启动和运行监测工具。macOS 版本保留完整现有功能；Windows 当前是通过 exact-commit CI 的 Phase 5 unsigned engineering candidate，提供安全的本地监听与进程观察、结构化命令配置、显式 macOS 配置导入，以及仅面向 Local Ops 自己创建的 Job Object 进程树控制。Windows 10、独立干净无 Python VM、Defender/SmartScreen、原生集成、品牌审核与签名门禁尚未完成，因此仍是 Preview / Alpha，而不是 Windows Beta。共享核心只绑定回环地址；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
 
 > 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整；`总控台.app` 目前不是可单独复制的自包含应用，也尚不代表经过签名、公证的最终 macOS 发行版。
 
@@ -11,14 +11,16 @@
 ## 功能
 
 - 每 2 秒查看当前用户的本地监听服务、CPU、内存和运行时长。
-- 保存常用服务或批处理任务，集中启动、停止、重启、查日志和诊断。
-- Windows 可关联现有 Task Scheduler 任务，读取其真实启用、就绪、排队、运行、最近结果和引擎 PID；长期 Guard 归入“服务”，一次性任务归入“批处理任务”。
+- 保存常用服务、程序或批处理任务，集中启动、停止、重启、查日志和诊断。
+- 收藏 Docker Compose 项目或任意单容器，并按保存的精确身份执行启动、停止；不会执行 `down`、删除或 prune。
+- Windows 可关联现有 Task Scheduler 任务，读取其真实状态，并单独启用或禁用该注册项；长期 Guard 归入“服务”，一次性任务归入“批处理任务”。
+- Windows 打包版可一次 UAC 安装固定管理员代理；每次打开 Local Ops 输入一次自定义密码后，可在本次进程存活期间启动收藏的任意绝对路径 EXE。
 - 在当前页面会话中发现新出现的、尚未管理的监听端口。macOS 可原子认领后加入启动台；Windows 只观察或创建未认领配置，不会控制现有进程。
 - 运行前检查工作目录、脚本和运行时；明确失效时直接给出修复入口，不必先失败一次。
 - 从项目文件夹识别常用启动命令，但不安装依赖、不执行项目代码。
 - macOS 通过运行 token、进程组和当前 UID 联合识别受控进程；Windows 通过 SID、generation、PID 创建时间、签名回执和 Job 成员关系识别受管 Job。两个平台都不会因端口相同就结束外部进程。
 - Ops 指挥台单一主题：深空蓝黑/雾灰双色，左侧导航轨、KPI 概览卡、实时动态侧栏，浅色、深色和跟随系统。
-- 全局命令面板可直接添加服务或批处理任务；启动台卡片支持鼠标拖拽和键盘排序。
+- 全局命令面板可直接添加服务、程序或批处理任务；启动台卡片支持鼠标拖拽和键盘排序。
 
 ## 界面预览
 
@@ -34,6 +36,7 @@
 - Python 3.12。运行时仅使用 Python 标准库。
 - macOS 自带的 `ps`、`lsof`、`osascript` 等系统工具。
 - Safari、Chrome 或其他支持 ES Modules 的现代浏览器。
+- Docker 收藏功能需要可用的 Docker CLI；Compose 收藏还需要 Docker Compose v2。
 
 Windows 源码运行要求 Windows 11 x64、Python 3.12，以及 `requirements-windows.txt` 中锁定的依赖；unsigned onedir 候选把 Python 3.12 runtime 和 Windows runtime dependencies 一并打包。Phase 5 implementation commit `5daddece8a06d1fdd382d1814e58be7b777ceae4` 已通过 exact-commit CI run `31780819809`，其 exact-CI engineering candidate 为 `PASS`。完整 Phase 5 Gate 尚未关闭，因此 `phaseStatus=IMPLEMENTED_UNVERIFIED`、`lastGreenPhase=P4`、`windowsBetaReady=false`；状态以 `docs/windows-port/STATE.json` 为准。Windows 10、干净无 Python VM、Defender/SmartScreen、原生选择器/通知、素材审核和签名仍未完成，因此当前不是 Windows Beta 发布。
 
@@ -49,7 +52,7 @@ py -3.12 -m venv .venv
 
 Windows 用户数据固定写入 `%LOCALAPPDATA%\LocalOps\`。最终私有对象必须由当前用户 SID 拥有，并只向当前用户、SYSTEM 和 Administrators 授予受保护 DACL。Windows 新对象 owner 来自 token 的 `TokenOwner`；若管理员 token 的默认 owner 是 Builtin Administrators，只有 creation-time apply 才会在一次安全描述符更新中把 owner 归一为当前用户并同时写入 protected DACL。既有记录是 verify-only，Admin-owned 或其他 owner 一律拒绝。同一用户、同一数据目录通过 Named Mutex 保证只有一个写者。自定义数据或日志目录会拒绝盘符根、用户主目录、项目根目录、UNC 共享根以及 symlink/junction 路径。ACL 验证失败时配置进入只读保护。
 
-本阶段保留 Phase 3 的 IPv4/IPv6 监听、进程信息、Windows picker adapter、schema v2、结构化 `commandSpec`、项目识别和显式导入，并增加受 generation CAS 保护的启动、普通停止、显式强制停止与重启。真实 Windows native picker 与 Notification Center 投递仍是发行前验收项，现有 headless/API 测试不能替代。旧 `command` 字段继续保留；POSIX 命令仍只会标记为 `needs_review`，不会被猜测性转换或执行。
+本阶段保留 Phase 3 的 IPv4/IPv6 监听、进程信息、Windows picker adapter、结构化 `commandSpec`、项目识别和显式导入，并把配置迁移到 schema v4，增加 Docker 收藏、程序收藏与管理员代理字段。真实 Windows native picker 与 Notification Center 投递仍是发行前验收项，现有 headless/API 测试不能替代。旧 `command` 字段继续保留；POSIX 命令仍只会标记为 `needs_review`，不会被猜测性转换或执行。
 
 Windows 不会自动发现或导入项目内旧 `data/` 或 macOS 配置。设置中心的导入向导只接受用户明确选择的本地 JSON 文件，并按“预览 → 路径映射 → 选择 → 提交”执行；预览零写入，提交不覆盖同 ID 应用、清空旧运行身份，并可在目标未发生后续修改时回滚。UNC/设备路径不会被探测或导入。
 
@@ -59,17 +62,36 @@ request/receipt 原子写入会先保护临时文件的 DACL，再替换为公�
 
 Windows 仍不支持外部进程认领、外部进程结束和总控台重启。不要通过修改前端或直接调用接口绕过 capability 与每应用 `controlAvailable` 门禁。破坏性生命周期测试只能设置 `LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS=1` 后在隔离夹具作用域或 hosted runner 中运行，并且只能操作测试夹具创建的进程；禁止控制任何现有用户进程。
 
-### Windows 计划任务监控
+### Windows 计划任务控制
 
 添加或编辑卡片时可以选择一个现有 Windows 计划任务。总控台保存规范化的 `scheduledTaskPath`，状态刷新时只查询已经关联的任务；任务选择器按需读取非 Microsoft 系统任务，因此不会在每次轮询时遍历完整任务库。
 
 - 持续运行的 Guard、守护器和常驻服务应选择“长期服务”；运行中的卡片显示 Task Scheduler 的真实运行态和引擎 PID。
 - 同步、导入、备份等执行后退出的入口应选择“批处理任务”；卡片显示最近运行时间与 Task Scheduler 的结果码。
 - “运行”调用 Task Scheduler COM API，由原任务自身的账号、提权级别和 `MultipleInstances` 策略决定行为。总控台不会复制任务动作，也不会绕开 `IgnoreNew`。
+- 卡片上的启用开关只设置该规范化任务路径对应注册项的 `Enabled`。它不会修改触发器、动作、主体、运行级别或 `MultipleInstances`，也不会自动运行或停止实例。
 - 外部任务不是 Local Ops Job。“停止”只调用 Task Scheduler COM `Stop(0)` 停止该注册项的运行实例，不按 PID 结束进程，也不禁用或删除任务；强制停止和重启仍不提供。删除卡片只移除监控配置，不停止、禁用或删除 Windows 计划任务。
 - 受保护系统进程或工作目录不可读取属于预期的 Windows 可见性限制，只显示提示，不再把健康状态错误标记为“降级”。任务库读取失败、配置损坏或关键组件扫描失败仍会进入降级状态。
 
 接口和状态字段见 [`docs/windows-task-scheduler.md`](docs/windows-task-scheduler.md)。
+
+### Docker 收藏
+
+添加卡片时可从当前 Docker daemon 发现 Compose 项目和单容器。Compose 身份保存项目名、工作目录和完整配置文件列表；单容器身份保存 Docker 返回的完整容器 ID。启动和停止时会再次按该精确身份调用 Docker CLI，状态仍由 daemon 的只读发现结果决定。
+
+- Compose 启动/停止分别使用 `docker compose ... up --detach` 与 `docker compose ... stop`。
+- 单容器启动/停止分别使用 `docker container start <完整 ID>` 与 `docker container stop <完整 ID>`。
+- Local Ops 不执行 `compose down`、`rm`、`prune`，也不会因为显示名相同而控制另一个容器。
+
+接口与持久化字段见 [`docs/docker-resources.md`](docs/docker-resources.md)。
+
+### Windows 管理员程序收藏
+
+管理员启动使用一个固定、无触发器的 Task Scheduler broker，而不是为每个 EXE 新建提权任务。首次安装代理时会出现一次 UAC，并设置至少 8 个字符的自定义密码；此后每次 Local Ops 进程启动只需输入一次密码，解锁状态只保存在该进程内存中。Local Ops 退出、进程身份变化、代理重启或会话令牌失效后都必须重新输入。
+
+代理只接受绝对 `.exe` 路径、字符串参数数组和绝对工作目录，并以 `shell=False` 启动。收藏记录不授予权限；删除收藏不会卸载代理。为避免把用户可写源码注册为管理员入口，代理只能从打包后的 Windows onedir 安装，源码模式会返回 `BROKER_PACKAGE_REQUIRED`。新代理与首次 UAC 路径仍属于本分支的工程实现，尚未完成签名包、干净 VM、Defender/SmartScreen 和真实 UAC 材料门禁，因此不改变 `phaseStatus=IMPLEMENTED_UNVERIFIED` 或 `windowsBetaReady=false`。
+
+安装、解锁、会话与安全边界见 [`docs/windows-elevation-broker.md`](docs/windows-elevation-broker.md)。
 
 本地 Phase 4 门禁已通过 Windows real discovery 174/174（406.426s）、frontend 24/24、HTTP hardening 6/6（合计 30/30）和 Node 30/30。其中包括 `WIN-LIFE-001..012` 的 12/12、`WIN-SEC-001..014` 的 14/14、HTTP 总控台测试子进程终止后重开，以及 100 次完整启动/Force/释放循环。相同实现已通过上述 exact-commit CI；只有 Phase 5 的 Windows 10、self-contained clean-machine 和发行审计全部通过后，才会把 `windowsBetaReady` 改为 `true`。
 
@@ -277,7 +299,7 @@ $env:CONSOLE_LOG_DIR = 'D:\LocalOpsData\logs'
 4. 源码 checkout 在 macOS 运行 `make check`，在 Windows 运行 `py -3.12 tools\check_project.py --scope windows`；打包用户使用已经通过对应审计的完整 ZIP。
 5. 启动后检查应用数量、主题、关注关键字和一个可控服务的完整启停。
 
-当前配置为 schema v2，启动时逐版执行显式、幂等迁移。v2 保留旧 `command`，Windows Phase 4 只会执行通过静态预检的结构化 `commandSpec`；POSIX/待复核命令仍不可执行。新程序不会静默降级它不认识的更高 schema；回退程序时仍应同时恢复与该版本匹配的数据备份。
+当前配置为 schema v4，启动时逐版执行显式、幂等迁移。v3 为应用增加 `dockerResource`，v4 增加 `elevated` 与 `program` 类型；旧 `command` 仍保留，Windows 只执行通过静态预检的结构化 `commandSpec`。新程序不会静默降级它不认识的更高 schema；回退程序时仍应同时恢复与该版本匹配的数据备份。
 
 ## 卸载
 

@@ -3,7 +3,7 @@
    overlays.js — 浮层：确认框 / 应用编辑模态 / 日志抽屉
    ============================================================ */
 import { $, el, setText, setChildren, icon, escapeHtml,
-  post, put, del, act, toast, openLayer, closeLayer,
+  post, put, del, act, toast, state, openLayer, closeLayer,
   GLYPHS, findApp, bumpMutationEpoch, hasCapability,
   platformPresentation, currentPlatform } from './core.js';
 import { lifecyclePayload, lifecycleSnapshot, sameLifecycleGeneration,
@@ -17,7 +17,12 @@ const kindRow = $('#kindRow'), portField = $('#portField'), fCmdLabel = $('#fCmd
 const scheduledTaskField = $('#scheduledTaskField');
 const fScheduledTaskPath = $('#fScheduledTaskPath');
 const btnRefreshScheduledTasks = $('#btnRefreshScheduledTasks');
+const dockerResourceField = $('#dockerResourceField');
+const fDockerResource = $('#fDockerResource');
+const btnRefreshDockerResources = $('#btnRefreshDockerResources');
 const cwdField = $('#cwdField');
+const programArgsField = $('#programArgsField'), fProgramArgs = $('#fProgramArgs');
+const elevatedField = $('#elevatedField'), fElevated = $('#fElevated');
 const btnPickScript = $('#btnPickScript'), btnPickCwd = $('#btnPickCwd');
 const btnDetectProject = $('#btnDetectProject');
 const detectPanel = $('#detectPanel'), detectSummary = $('#detectSummary');
@@ -39,6 +44,15 @@ const confirmCancel = $('#confirmCancel'), confirmOk = $('#confirmOk');
 const drawerMask = $('#drawerMask'), logDrawer = $('#logDrawer');
 const drawerTitle = $('#drawerTitle'), drawerClose = $('#drawerClose');
 const logBody = $('#logBody'), logPre = $('#logPre');
+
+const brokerPasswordMask = $('#brokerPasswordMask');
+const brokerPasswordTitle = $('#brokerPasswordTitle');
+const brokerPasswordNote = $('#brokerPasswordNote');
+const brokerPassword = $('#brokerPassword');
+const brokerPasswordConfirmField = $('#brokerPasswordConfirmField');
+const brokerPasswordConfirm = $('#brokerPasswordConfirm');
+const brokerPasswordCancel = $('#brokerPasswordCancel');
+const brokerPasswordSubmit = $('#brokerPasswordSubmit');
 
 const iconVer = new Map();   // appId → 图标版本号，上传/删除后刷新浏览器缓存
 setChildren(appearanceChevron, icon('chevron-down', 16));
@@ -73,6 +87,65 @@ confirmOk.addEventListener('click', () => {
 });
 confirmCancel.addEventListener('click', closeConfirm);
 confirmMask.addEventListener('mousedown', e => { if (e.target === confirmMask) closeConfirm(); });
+
+/* ============================================================
+   管理员启动代理：首次安装或当前会话解锁
+   ============================================================ */
+let brokerPasswordMode = 'unlock';
+
+export function openBrokerPassword() {
+  const broker = (state.data && state.data.elevationBroker) || {};
+  brokerPasswordMode = !broker.installed || !broker.verified ? 'install' : 'unlock';
+  const installing = brokerPasswordMode === 'install';
+  setText(brokerPasswordTitle, installing ? '安装管理员启动代理' : '解锁管理员启动');
+  setText(brokerPasswordNote, installing
+    ? '首次安装会显示一次 Windows UAC。密码仅保存为不可逆 verifier。'
+    : '密码只解锁当前 Local Ops 进程；退出后需要重新输入。');
+  brokerPasswordConfirmField.hidden = !installing;
+  brokerPassword.value = '';
+  brokerPasswordConfirm.value = '';
+  setText(brokerPasswordSubmit, installing ? '安装并解锁' : '解锁');
+  openLayer(brokerPasswordMask, brokerPassword);
+}
+
+export function closeBrokerPassword() {
+  brokerPassword.value = '';
+  brokerPasswordConfirm.value = '';
+  closeLayer(brokerPasswordMask);
+}
+
+async function submitBrokerPassword() {
+  const password = brokerPassword.value;
+  if (password.length < 8) return fieldError(brokerPassword, '密码至少需要 8 个字符');
+  if (brokerPasswordMode === 'install' && password !== brokerPasswordConfirm.value) {
+    return fieldError(brokerPasswordConfirm, '两次输入的密码不一致');
+  }
+  brokerPasswordSubmit.disabled = true;
+  try {
+    const endpoint = brokerPasswordMode === 'install'
+      ? '/api/windows/elevation-broker/install'
+      : '/api/windows/elevation-broker/unlock';
+    const result = await act(post(endpoint, { password }));
+    if (!result || result.ok === false) return;
+    if (brokerPasswordMode === 'install') {
+      const unlocked = await act(post(
+        '/api/windows/elevation-broker/unlock', { password },
+      ));
+      if (!unlocked || unlocked.ok === false) return;
+    }
+    closeBrokerPassword();
+    await window.__poll();
+    toast('当前 Local Ops 会话已解锁管理员启动');
+  } finally {
+    brokerPasswordSubmit.disabled = false;
+  }
+}
+
+brokerPasswordCancel.addEventListener('click', closeBrokerPassword);
+brokerPasswordSubmit.addEventListener('click', submitBrokerPassword);
+brokerPasswordMask.addEventListener('mousedown', e => {
+  if (e.target === brokerPasswordMask) closeBrokerPassword();
+});
 
 /* ---------------- 结束进程确认 ---------------- */
 export function confirmKill(svc) {
@@ -167,6 +240,7 @@ let detectingProject = false; // 认领流程必须等项目命令识别完成�
 let selectedCommandSpec = null;
 let selectedCompatibility = null;
 let scheduledTaskRows = [];
+let dockerResourceRows = [];
 
 function selectedScheduledTaskPath() {
   const value = fScheduledTaskPath.value.trim();
@@ -175,6 +249,27 @@ function selectedScheduledTaskPath() {
 
 function scheduledTaskMode() {
   return currentPlatform() === 'windows' && !!selectedScheduledTaskPath();
+}
+
+function dockerResourceKey(resource) {
+  if (!resource || typeof resource !== 'object') return '';
+  return resource.kind === 'container'
+    ? 'container:' + (resource.containerId || '')
+    : resource.kind === 'compose' ? 'compose:' + (resource.projectName || '') : '';
+}
+
+function selectedDockerResource() {
+  const key = fDockerResource.value;
+  const row = dockerResourceRows.find(item => item.key === key);
+  return row ? row.resource : null;
+}
+
+function dockerResourceMode() {
+  return !!selectedDockerResource();
+}
+
+function externalResourceMode() {
+  return scheduledTaskMode() || dockerResourceMode();
 }
 
 function scheduledTaskCommand(path) {
@@ -210,12 +305,15 @@ function renderScheduledTaskOptions(selectedPath) {
 function syncScheduledTaskMode({ inferKind = false } = {}) {
   const path = selectedScheduledTaskPath();
   const scheduled = scheduledTaskMode();
-  const wasScheduled = fCmd.readOnly;
-  cwdField.hidden = scheduled;
-  detectPanel.hidden = scheduled || detectPanel.hidden;
-  btnPickScript.hidden = scheduled;
-  btnDetectProject.hidden = scheduled;
-  fCmd.readOnly = scheduled;
+  const docker = selectedDockerResource();
+  const external = scheduled || !!docker;
+  const program = modalKind === 'program';
+  const wasExternal = fCmd.readOnly;
+  cwdField.hidden = external;
+  detectPanel.hidden = external || detectPanel.hidden;
+  btnPickScript.hidden = external;
+  btnDetectProject.hidden = external || program;
+  fCmd.readOnly = external || program;
   if (scheduled) {
     fCwd.value = '';
     fPort.value = '';
@@ -224,14 +322,24 @@ function syncScheduledTaskMode({ inferKind = false } = {}) {
     const row = scheduledTaskRows.find(task => task.path === path);
     if (!fName.value.trim() && row) fName.value = row.name || row.path || '';
     if (inferKind && row && row.state === 'running') setModalKind('service');
-  } else if (wasScheduled) {
+  } else if (docker) {
+    fCwd.value = docker.kind === 'compose' ? docker.workingDir || '' : '';
+    fPort.value = '';
+    fCmd.value = dockerResourceCommand(docker);
+    setStructuredCommand(null, { status: 'ready', reasons: [] });
+    const row = dockerResourceRows.find(item => item.key === dockerResourceKey(docker));
+    if (!fName.value.trim() && row) {
+      fName.value = row.label.split(' · ')[1] || row.label;
+    }
+    if (inferKind) setModalKind('service');
+  } else if (wasExternal && !program) {
     fCmd.value = '';
     setStructuredCommand(null, null);
   }
-  setText(fCmdLabel, scheduled ? '计划任务入口'
+  setText(fCmdLabel, scheduled ? '计划任务入口' : docker ? 'Docker 启动入口'
     : modalKind === 'task' ? '执行命令' : '启动命令');
-  portField.hidden = scheduled || modalKind === 'task';
-  fPort.disabled = scheduled || modalKind === 'task';
+  portField.hidden = external || modalKind !== 'service';
+  fPort.disabled = external || modalKind !== 'service';
   refreshEditSaveMode();
 }
 
@@ -255,6 +363,76 @@ async function loadScheduledTasks(selectedPath = selectedScheduledTaskPath()) {
     toast('Windows 计划任务读取失败：' + error.message);
   } finally {
     btnRefreshScheduledTasks.disabled = false;
+  }
+}
+
+function dockerResourceCommand(resource) {
+  if (!resource) return '';
+  if (resource.kind === 'container') {
+    return 'docker container start ' + resource.containerId;
+  }
+  const files = (resource.configFiles || [])
+    .map(path => ' --file "' + path + '"').join('');
+  return 'docker compose --project-name "' + resource.projectName + '"' +
+    ' --project-directory "' + resource.workingDir + '"' + files + ' up --detach';
+}
+
+function renderDockerResourceOptions(selectedResource) {
+  const selected = dockerResourceKey(selectedResource);
+  fDockerResource.replaceChildren();
+  const local = document.createElement('option');
+  local.value = '';
+  local.textContent = '不关联 Docker 资源（使用本地命令）';
+  fDockerResource.appendChild(local);
+  if (selectedResource && !dockerResourceRows.some(row => row.key === selected)) {
+    dockerResourceRows.push({
+      key: selected, resource: selectedResource,
+      label: selected + ' · 当前未发现',
+    });
+  }
+  for (const row of dockerResourceRows) {
+    const option = document.createElement('option');
+    option.value = row.key;
+    option.textContent = row.label;
+    fDockerResource.appendChild(option);
+  }
+  fDockerResource.value = selected;
+}
+
+async function loadDockerResources(selectedResource = selectedDockerResource()) {
+  if (!hasCapability('monitor_docker')) return;
+  btnRefreshDockerResources.disabled = true;
+  try {
+    const response = await fetch('/api/docker/resources', {
+      method: 'GET', headers: { Accept: 'application/json' },
+    });
+    const result = await response.json();
+    if (!response.ok || !result || result.ok === false) {
+      throw new Error((result && result.error) || 'Docker 资源读取失败');
+    }
+    const projects = (result.projects || []).map(project => ({
+      key: dockerResourceKey({ kind: 'compose', ...project }),
+      resource: {
+        kind: 'compose', projectName: project.projectName,
+        workingDir: project.workingDir, configFiles: project.configFiles || [],
+      },
+      label: 'Compose · ' + project.projectName +
+        (project.running ? ' · 运行中' : ' · 已停止'),
+    })).filter(row => row.resource.workingDir && row.resource.configFiles.length);
+    const containers = (result.containers || []).map(container => ({
+      key: 'container:' + container.id,
+      resource: { kind: 'container', containerId: container.id },
+      label: '容器 · ' + (container.name || container.id.slice(0, 12)) +
+        ' · ' + (container.running ? '运行中' : container.state || '已停止'),
+    }));
+    dockerResourceRows = [...projects, ...containers];
+    renderDockerResourceOptions(selectedResource);
+    syncScheduledTaskMode();
+  } catch (error) {
+    renderDockerResourceOptions(selectedResource);
+    toast('Docker 资源读取失败：' + error.message);
+  } finally {
+    btnRefreshDockerResources.disabled = false;
   }
 }
 
@@ -395,18 +573,25 @@ function resetDetection(clearAutoPort = false) {
 
 function modalLifecycleChanged() {
   if (!editingAppOriginal) return false;
-  const currentPort = modalKind === 'task' || scheduledTaskMode() ? null
+  const currentPort = modalKind === 'task' || externalResourceMode() ? null
     : readPortValue();
   return fCmd.value.trim() !== (editingAppOriginal.command || '') ||
     (fCwd.value.trim() || null) !== (editingAppOriginal.cwd || null) ||
     currentPort !== (editingAppOriginal.port == null ? null : editingAppOriginal.port) ||
     modalKind !== (editingAppOriginal.kind || 'service') ||
-    selectedScheduledTaskPath() !== (editingAppOriginal.scheduledTaskPath || null);
+    (modalKind === 'program' && fElevated.checked !== editingAppOriginal.elevated) ||
+    (modalKind === 'program' && JSON.stringify(selectedCommandSpec) !==
+      JSON.stringify(editingAppOriginal.commandSpec)) ||
+    selectedScheduledTaskPath() !== (editingAppOriginal.scheduledTaskPath || null) ||
+    dockerResourceKey(selectedDockerResource()) !==
+      dockerResourceKey(editingAppOriginal.dockerResource);
 }
 
 function refreshEditSaveMode() {
   const lifecycle = editingAppOriginal && editingAppOriginal.lifecycle;
-  const externalMonitor = !!(editingAppOriginal && editingAppOriginal.scheduledTaskPath);
+  const externalMonitor = !!(editingAppOriginal && (
+    editingAppOriginal.scheduledTaskPath || editingAppOriginal.dockerResource
+  ));
   const observedRunning = !!(lifecycle && lifecycle.status === 'running');
   const running = observedRunning && !externalMonitor;
   const lifecycleUnavailable = !externalMonitor
@@ -432,7 +617,7 @@ function refreshEditSaveMode() {
   appStopEdit.disabled = appSaving || !canStop || !lifecycle || !lifecycle.canManage;
   appSave.hidden = false;
   const willAttach = !editingAppId && pendingAttach && modalKind === 'service'
-    && !scheduledTaskMode()
+    && !externalResourceMode()
     && readPortValue() === pendingAttach.port;
   setText(appSave, willAttach ? '保存并认领' : '保存');
   appSave.disabled = appSaving || needsStop || commandBlocked
@@ -447,22 +632,41 @@ function refreshEditSaveMode() {
 }
 
 function setModalKind(kind) {
-  modalKind = kind === 'task' ? 'task' : 'service';
+  modalKind = ['service', 'task', 'program'].includes(kind) ? kind : 'service';
+  if (modalKind === 'program') {
+    fScheduledTaskPath.value = '';
+    fDockerResource.value = '';
+  }
   kindRow.querySelectorAll('.kind-btn').forEach(b => {
     const active = b.dataset.kind === modalKind;
     b.classList.toggle('active', active);
     b.setAttribute('aria-pressed', String(active));
   });
-  portField.hidden = modalKind === 'task' || scheduledTaskMode();
-  fPort.disabled = modalKind === 'task' || scheduledTaskMode();
+  const program = modalKind === 'program';
+  scheduledTaskField.hidden = program || currentPlatform() !== 'windows'
+    || !hasCapability('monitor_scheduled_tasks');
+  dockerResourceField.hidden = program || !hasCapability('monitor_docker');
+  programArgsField.hidden = !program;
+  elevatedField.hidden = !program || currentPlatform() !== 'windows';
+  portField.hidden = modalKind !== 'service' || externalResourceMode();
+  fPort.disabled = modalKind !== 'service' || externalResourceMode();
+  fCmd.readOnly = externalResourceMode() || program;
+  btnDetectProject.hidden = program || externalResourceMode();
+  btnPickScript.hidden = externalResourceMode();
+  setText(btnPickScript, program ? '选择 EXE' : '选择脚本…');
   setText(fCmdLabel, scheduledTaskMode() ? '计划任务入口'
-    : modalKind === 'task' ? '执行命令' : '启动命令');
-  fName.placeholder = modalKind === 'task' ? '如：每日备份' : '如：本地博客';
-  fCmd.placeholder = modalKind === 'task'
+    : dockerResourceMode() ? 'Docker 启动入口'
+    : modalKind === 'program' ? 'EXE 路径'
+      : modalKind === 'task' ? '执行命令' : '启动命令');
+  fName.placeholder = modalKind === 'task' ? '如：每日备份'
+    : modalKind === 'program' ? '如：设备管理器' : '如：本地博客';
+  fCmd.placeholder = modalKind === 'program' ? '请选择一个 EXE'
+    : modalKind === 'task'
     ? '选择脚本后自动生成执行命令，也可以手动填写'
     : '选择项目后自动识别启动命令，也可以手动填写';
   appModalTitle.textContent = (editingAppId ? '编辑' : '添加') +
-    (modalKind === 'task' ? '批处理任务' : '服务');
+    (modalKind === 'task' ? '批处理任务'
+      : modalKind === 'program' ? '程序收藏' : '服务');
   refreshEditSaveMode();
 }
 kindRow.querySelectorAll('.kind-btn').forEach(b =>
@@ -484,7 +688,10 @@ export function openAppModal(app, presetKind, focusAction = '') {
     command: app.command || '', cwd: app.cwd || null,
     port: app.port == null ? null : app.port,
     kind: app.kind || 'service', running: !!app.running,
+    commandSpec: app.commandSpec || null,
     scheduledTaskPath: app.scheduledTaskPath || null,
+    dockerResource: app.dockerResource || null,
+    elevated: app.elevated === true,
     lifecycle: lifecycleSnapshot(app, currentPlatform()),
   } : null;
   resetDetection();
@@ -496,9 +703,15 @@ export function openAppModal(app, presetKind, focusAction = '') {
   fCmd.value = (app && app.command) || '';
   fCwd.value = (app && app.cwd) || '';
   fPort.value = app && app.port != null ? app.port : '';
+  const programArgs = app && app.commandSpec && app.commandSpec.mode === 'direct'
+    && Array.isArray(app.commandSpec.args) ? app.commandSpec.args : [];
+  fProgramArgs.value = programArgs.join('\n');
+  fElevated.checked = app ? app.elevated === true : currentPlatform() === 'windows';
   scheduledTaskField.hidden = currentPlatform() !== 'windows'
     || !hasCapability('monitor_scheduled_tasks');
+  dockerResourceField.hidden = !hasCapability('monitor_docker');
   renderScheduledTaskOptions((app && app.scheduledTaskPath) || '');
+  renderDockerResourceOptions((app && app.dockerResource) || null);
   [fName, fCmd, fCwd, fPort].forEach(clearFieldError);
   setModalKind(presetKind || (app && app.kind) || 'service');
   syncScheduledTaskMode();
@@ -506,11 +719,13 @@ export function openAppModal(app, presetKind, focusAction = '') {
   syncGlyphGrid();
   renderIconPreview();
   const focusTarget = focusAction === 'pick-script' ? btnPickScript
-    : focusAction === 'pick-cwd' ? btnPickCwd
+      : focusAction === 'pick-cwd' ? btnPickCwd
       : focusAction === 'edit-command' ? fCmd
-        : app ? fName : (modalKind === 'task' ? btnPickScript : btnPickCwd);
+        : app ? fName : (modalKind === 'task' || modalKind === 'program'
+          ? btnPickScript : btnPickCwd);
   openLayer(appModalMask, focusTarget);
   if (!scheduledTaskField.hidden) loadScheduledTasks((app && app.scheduledTaskPath) || '');
+  if (!dockerResourceField.hidden) loadDockerResources((app && app.dockerResource) || null);
   /* 监听进程的 argv 往往只是框架子进程（如 next-server），不一定适合作为
      下次启动命令。打开认领表单时同时读取项目配置，让用户选择可靠命令。 */
   if (pendingAttach && fCwd.value.trim()) detectProject();
@@ -722,7 +937,10 @@ function rememberSavedApp(app, id, body) {
     cwd: body.cwd,
     port: body.port,
     kind: body.kind,
+    commandSpec: body.commandSpec || null,
     scheduledTaskPath: body.scheduledTaskPath || null,
+    dockerResource: body.dockerResource || null,
+    elevated: body.elevated === true,
     running: !!app.running,
     lifecycle: lifecycleSnapshot(app, currentPlatform()),
   };
@@ -736,7 +954,17 @@ async function saveApp() {
   if (!name) return fieldError(fName, '请填写名称');
   if (!command) return fieldError(
     fCmd, modalKind === 'task' ? '请填写执行命令' : '请填写启动命令');
-  const port = modalKind === 'task' || scheduledTaskMode() ? null : readPortValue();
+  if (modalKind === 'program') {
+    if (!selectedCommandSpec || selectedCommandSpec.mode !== 'direct'
+        || !String(selectedCommandSpec.executable || '').toLowerCase().endsWith('.exe')) {
+      return fieldError(fCmd, '请选择一个 EXE 程序');
+    }
+    selectedCommandSpec = {
+      ...selectedCommandSpec,
+      args: fProgramArgs.value.split(/\r?\n/).filter(value => value !== ''),
+    };
+  }
+  const port = modalKind !== 'service' || externalResourceMode() ? null : readPortValue();
   if (Number.isNaN(port)) return fieldError(fPort, '端口必须是 1–65535 之间的整数');
   const body = {
     name,
@@ -746,15 +974,18 @@ async function saveApp() {
     glyph: selectedGlyph || null,
     kind: modalKind,
     scheduledTaskPath: selectedScheduledTaskPath(),
+    dockerResource: selectedDockerResource(),
+    elevated: modalKind === 'program' && fElevated.checked,
   };
   if (selectedCommandSpec) body.commandSpec = selectedCommandSpec;
-  if (scheduledTaskMode()) delete body.commandSpec;
+  if (externalResourceMode()) delete body.commandSpec;
   if (editingAppOriginal && editingAppOriginal.lifecycle) {
     body.expectedGeneration = editingAppOriginal.lifecycle.expectedGeneration;
   }
   const wasCreating = !editingAppId;
   const attachRequest = wasCreating && hasCapability('attach_external') && pendingAttach
     && modalKind === 'service'
+    && !externalResourceMode()
     && port === pendingAttach.port ? { ...pendingAttach } : null;
   if (attachRequest) body.attachPid = attachRequest.pid;
   appSaving = true;
@@ -824,24 +1055,38 @@ async function saveApp() {
     closeAppModal();
     await window.__poll();
     if (attachSucceeded) toast('已加入启动台并认领正在运行的进程');
+    if (body.elevated) {
+      const broker = (state.data && state.data.elevationBroker) || {};
+      if (!broker.unlocked) openBrokerPassword();
+    }
   } finally {
     appSaving = false;
     refreshEditSaveMode();
   }
 }
 
-export function initAppModal({ onAddService, onAddTask }) {
+export function initAppModal({ onAddService, onAddTask, onAddProgram }) {
   onAddService.addEventListener('click', () => openAppModal(null, 'service'));
   onAddTask.addEventListener('click', () => openAppModal(null, 'task'));
+  onAddProgram.addEventListener('click', () => openAppModal(null, 'program'));
   appCancel.addEventListener('click', closeAppModal);
   appSave.addEventListener('click', saveApp);
   appStopEdit.addEventListener('click', stopEditingApp);
   fScheduledTaskPath.addEventListener('change', () => {
+    if (selectedScheduledTaskPath()) fDockerResource.value = '';
     syncScheduledTaskMode({ inferKind: !editingAppId });
     renderIconPreview();
   });
   btnRefreshScheduledTasks.addEventListener('click', () => {
     loadScheduledTasks(selectedScheduledTaskPath());
+  });
+  fDockerResource.addEventListener('change', () => {
+    if (selectedDockerResource()) fScheduledTaskPath.value = '';
+    syncScheduledTaskMode({ inferKind: !editingAppId });
+    renderIconPreview();
+  });
+  btnRefreshDockerResources.addEventListener('click', () => {
+    loadDockerResources(selectedDockerResource());
   });
   appModalMask.addEventListener('mousedown', e => { if (e.target === appModalMask) closeAppModal(); });
 
@@ -855,7 +1100,11 @@ export function initAppModal({ onAddService, onAddTask }) {
         toast('选择结果缺少结构化命令，请刷新总控台后重试');
         return;
       }
-      fCmd.value = r.command;
+      if (modalKind === 'program' && !r.path.toLowerCase().endsWith('.exe')) {
+        toast('程序收藏只接受 EXE 文件');
+        return;
+      }
+      fCmd.value = modalKind === 'program' ? r.path : r.command;
       setStructuredCommand(r.commandSpec, r.platformCompatibility);
       if (r.dir && !fCwd.value.trim()) fCwd.value = r.dir;
       if (!fName.value.trim()) {
@@ -867,7 +1116,7 @@ export function initAppModal({ onAddService, onAddTask }) {
         node.classList.remove('selected');
         node.setAttribute('aria-pressed', 'false');
       });
-      toast('已按脚本类型生成执行命令');
+      toast(modalKind === 'program' ? '已选择 EXE' : '已按脚本类型生成执行命令');
     } finally {
       btnPickScript.disabled = false;
     }
@@ -884,7 +1133,7 @@ export function initAppModal({ onAddService, onAddTask }) {
         if (!fName.value.trim() && r.stem) fName.value = r.stem;
         fCwd.classList.remove('invalid');
         refreshEditSaveMode();
-        await detectProject();
+        if (modalKind !== 'program') await detectProject();
       }
     } finally {
       btnPickCwd.disabled = false;
@@ -905,6 +1154,16 @@ export function initAppModal({ onAddService, onAddTask }) {
     setStructuredCommand(null, null);
     refreshEditSaveMode();
   });
+  fProgramArgs.addEventListener('input', () => {
+    if (selectedCommandSpec && selectedCommandSpec.mode === 'direct') {
+      selectedCommandSpec = {
+        ...selectedCommandSpec,
+        args: fProgramArgs.value.split(/\r?\n/).filter(value => value !== ''),
+      };
+    }
+    refreshEditSaveMode();
+  });
+  fElevated.addEventListener('change', refreshEditSaveMode);
 
   /* 图标：上传 / 粘贴 / 清除 */
   btnPickIcon.addEventListener('click', () => iconFile.click());

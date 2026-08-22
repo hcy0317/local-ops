@@ -7,6 +7,8 @@ from typing import Literal, Mapping
 
 from .contracts import (
     CwdSnapshot,
+    ElevationBrokerResult,
+    ElevationBrokerStatus,
     ListenerSnapshot,
     ManagedActivation,
     ManagedInspection,
@@ -50,6 +52,11 @@ class FakePlatform:
             monitor_scheduled_tasks=False,
             run_scheduled_tasks=False,
             stop_scheduled_tasks=False,
+            toggle_scheduled_tasks=False,
+            monitor_docker=False,
+            control_docker=False,
+            manage_elevation_broker=False,
+            launch_elevated=False,
         )
     )
     paths: RuntimePaths = field(
@@ -79,6 +86,24 @@ class FakePlatform:
     )
     scheduled_stop_result: ScheduledTaskRunResult = field(
         default_factory=lambda: ScheduledTaskRunResult(False, "", "unsupported")
+    )
+    scheduled_toggle_result: ScheduledTaskRunResult = field(
+        default_factory=lambda: ScheduledTaskRunResult(True, "")
+    )
+    elevation_status: ElevationBrokerStatus = field(
+        default_factory=ElevationBrokerStatus
+    )
+    elevation_install_result: ElevationBrokerResult = field(
+        default_factory=lambda: ElevationBrokerResult(False, "unsupported")
+    )
+    elevation_unlock_result: ElevationBrokerResult = field(
+        default_factory=lambda: ElevationBrokerResult(False, "unsupported")
+    )
+    elevation_lock_result: ElevationBrokerResult = field(
+        default_factory=lambda: ElevationBrokerResult(False, "unsupported")
+    )
+    elevation_launch_result: ElevationBrokerResult = field(
+        default_factory=lambda: ElevationBrokerResult(False, "unsupported")
     )
     launch_result: ManagedRuntime = field(default_factory=lambda: ManagedRuntime(ok=True))
     activation_result: ManagedActivation = field(
@@ -207,6 +232,37 @@ class FakePlatform:
         if result.task_path:
             return result
         return ScheduledTaskRunResult(result.ok, path, result.error, result.code)
+
+    def set_scheduled_task_enabled(
+            self, path: str, enabled: bool) -> ScheduledTaskRunResult:
+        self.calls.append(("set_scheduled_task_enabled", (path, enabled)))
+        result = self.scheduled_toggle_result
+        if result.task_path:
+            return result
+        return ScheduledTaskRunResult(result.ok, path, result.error, result.code)
+
+    def elevation_broker_status(self) -> ElevationBrokerStatus:
+        self.calls.append(("elevation_broker_status", None))
+        return self.elevation_status
+
+    def install_elevation_broker(
+            self, password_record: Mapping[str, object]) -> ElevationBrokerResult:
+        self.calls.append(("install_elevation_broker", password_record))
+        return self.elevation_install_result
+
+    def unlock_elevation_broker(self, password: str) -> ElevationBrokerResult:
+        self.calls.append(("unlock_elevation_broker", password))
+        return self.elevation_unlock_result
+
+    def lock_elevation_broker(self) -> ElevationBrokerResult:
+        self.calls.append(("lock_elevation_broker", None))
+        return self.elevation_lock_result
+
+    def launch_elevated(
+            self, command_spec: Mapping[str, object],
+            cwd: str | None) -> ElevationBrokerResult:
+        self.calls.append(("launch_elevated", (command_spec, cwd)))
+        return self.elevation_launch_result
 
     def pick_path(self, kind: Literal["dir", "script"]) -> PickResult:
         self.calls.append(("pick_path", kind))

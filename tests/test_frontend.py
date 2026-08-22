@@ -229,6 +229,7 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         html = (ROOT / "static/index.html").read_text(encoding="utf-8")
         overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
         launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        app = (ROOT / "static/app.js").read_text(encoding="utf-8")
 
         self.assertIn('id="scheduledTaskField"', html)
         self.assertIn('id="fScheduledTaskPath"', html)
@@ -237,7 +238,46 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("app.runtimeSource === 'windowsTaskScheduler'", launchpad)
         self.assertIn("app.scheduledTask", launchpad)
         self.assertIn("'stop_scheduled_tasks'", launchpad)
-        self.assertIn("'stop_scheduled_tasks'", (ROOT / "static/app.js").read_text(encoding="utf-8"))
+        self.assertIn("scheduledTaskControlAvailable", launchpad)
+        self.assertIn("'toggle_scheduled_tasks'", launchpad)
+        self.assertIn("'/scheduled-enabled'", launchpad)
+        self.assertIn("'stop_scheduled_tasks'", app)
+
+    def test_docker_compose_and_container_resources_are_selectable_and_controllable(self):
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="dockerResourceField"', html)
+        self.assertIn('id="fDockerResource"', html)
+        self.assertIn("'/api/docker/resources'", overlays)
+        self.assertIn("dockerResource", overlays)
+        self.assertIn("app.runtimeSource === 'dockerCompose'", launchpad)
+        self.assertIn("app.runtimeSource === 'dockerContainer'", launchpad)
+        self.assertIn("'control_docker'", launchpad)
+
+    def test_program_favorites_use_session_unlocked_elevation_broker(self):
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        app = (ROOT / "static/app.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="programGrid"', html)
+        self.assertIn('id="addProgramCard"', html)
+        self.assertIn('data-kind="program"', html)
+        self.assertIn('id="elevatedField"', html)
+        self.assertIn('id="fProgramArgs"', html)
+        self.assertIn('id="brokerPasswordMask"', html)
+        self.assertIn("'/api/windows/elevation-broker/install'", overlays)
+        self.assertIn("'/api/windows/elevation-broker/unlock'", overlays)
+        self.assertIn("act, toast, state, openLayer", overlays)
+        self.assertIn("elevated", overlays)
+        self.assertIn("app.runtimeSource === 'windowsElevationBroker'", launchpad)
+        self.assertIn("'launch_elevated'", launchpad)
+        self.assertIn("promptForElevationSession", app)
+        self.assertIn("brokerPromptedConsolePid", app)
+        self.assertIn("closeBrokerPassword", app)
+        self.assertIn("$('#brokerPasswordMask').classList.contains('open')", app)
 
     def test_watched_process_row_can_remove_its_keywords_without_killing_process(self):
         services = (ROOT / "static/js/services.js").read_text(encoding="utf-8")

@@ -80,6 +80,17 @@ class PackagedEntryTests(unittest.TestCase):
         )
         runner.assert_not_called()
 
+    def test_frozen_elevation_broker_dispatch_is_fixed_to_broker_module(self):
+        calls = []
+
+        result = packaged_entry.main(
+            ["-m", "localops.windows.elevation_broker", "serve"],
+            broker_main=lambda argv: calls.append(argv) or 9,
+        )
+
+        self.assertEqual(result, 9)
+        self.assertEqual(calls, [["serve"]])
+
     def test_windowed_none_streams_bind_to_private_utf8_log(self):
         with tempfile.TemporaryDirectory() as temporary:
             calls = []
@@ -195,6 +206,7 @@ class WindowsBuildContractTests(unittest.TestCase):
         self.assertNotIn("--onefile", command)
         self.assertEqual(command[-1], str(build_windows.ENTRYPOINT))
         self.assertIn("localops.windows.runner", command)
+        self.assertIn("localops.windows.elevation_broker", command)
         self.assertIn("win32timezone", command)
 
     def test_pyinstaller_environment_freezes_hash_order_and_build_epoch(self):
@@ -272,6 +284,7 @@ class WindowsBuildContractTests(unittest.TestCase):
             "pythonVersion": "3.12.11",
             "runtimeDistributions": {"psutil": "7.2.2", "pywin32": "312"},
             "runnerDispatch": "-m localops.windows.runner",
+            "elevationBrokerDispatch": "-m localops.windows.elevation_broker",
             "schemaVersion": 1,
             "signingStatus": build_windows.SIGNING_STATUS,
             "version": VERSION,

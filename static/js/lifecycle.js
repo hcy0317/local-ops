@@ -26,6 +26,9 @@ export function lifecycleSnapshot(app, platform = 'unknown') {
   const hasExplicitControl = !!app && typeof app.controlAvailable === 'boolean';
   const externalScheduled = !!app
     && app.runtimeSource === 'windowsTaskScheduler';
+  const externalDocker = !!app
+    && (app.runtimeSource === 'dockerCompose'
+      || app.runtimeSource === 'dockerContainer');
   const status = (!windows && !macos) || (windows && (!hasExplicitStatus || !hasExplicitControl))
     ? 'unknown' : normalizedStatus(app);
   const generation = generationId(app);
@@ -34,7 +37,7 @@ export function lifecycleSnapshot(app, platform = 'unknown') {
     : macos && app && typeof app.controlAvailable === 'boolean'
       ? app.controlAvailable
       : macos && (status === 'stopped' || status === 'running');
-  const generationReady = externalScheduled || macos || status === 'stopped'
+  const generationReady = externalScheduled || externalDocker || macos || status === 'stopped'
     || (status === 'running' && UUID_RE.test(generation || ''));
   const canStart = controlAvailable && status === 'stopped';
   const canManage = controlAvailable && status === 'running' && generationReady;
@@ -44,7 +47,7 @@ export function lifecycleSnapshot(app, platform = 'unknown') {
     expectedGeneration: status === 'stopped' ? null : generation,
     canStart,
     canManage,
-    canDelete: externalScheduled || (!!app && app.deleteAvailable === true)
+    canDelete: externalScheduled || externalDocker || (!!app && app.deleteAvailable === true)
       || canStart || canManage,
     busy: status === 'starting' || status === 'stopping',
     uncertain: status === 'orphaned' || status === 'unknown',

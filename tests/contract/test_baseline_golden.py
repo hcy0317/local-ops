@@ -24,7 +24,9 @@ class BaselineGoldenTests(unittest.TestCase):
         for key, value in baseline_default.items():
             if key != "schemaVersion":
                 self.assertEqual(server.Config.DEFAULT[key], value)
-        self.assertEqual(server.Config.DEFAULT["schemaVersion"], 2)
+        self.assertEqual(
+            server.Config.DEFAULT["schemaVersion"], server.CURRENT_SCHEMA_VERSION
+        )
 
         for key, value in self.baseline["config"]["appDefault"].items():
             self.assertEqual(server.Config.APP_DEFAULT[key], value)
@@ -32,6 +34,8 @@ class BaselineGoldenTests(unittest.TestCase):
         self.assertEqual(server.Config.APP_DEFAULT["runtimeIdentity"], None)
         self.assertEqual(server.Config.APP_DEFAULT["importStatus"],
                          "needs_review")
+        self.assertIsNone(server.Config.APP_DEFAULT["dockerResource"])
+        self.assertFalse(server.Config.APP_DEFAULT["elevated"])
 
     def test_state_keys_match_phase_zero_baseline(self):
         with mock.patch.object(server, "PLATFORM", FakePlatform()):

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import json
 import os
 import socket
 import stat
 import subprocess
 import sys
 import time
+import uuid
 import webbrowser
 from dataclasses import asdict, dataclass
 from typing import Literal, Mapping
@@ -27,13 +29,27 @@ import win32process
 import win32security
 import winerror
 import win32com.client
-from win32com.shell import shell
+from win32com.shell import shell, shellcon
 
 from localops.command_spec import (
     CommandSpecError,
+    normalize_command_spec,
     prepared_invocation,
     resolve_windows_executable,
 )
+from localops.elevation_broker import (
+    BROKER_INSTALL_SCHEMA,
+    BROKER_MODULE,
+    BROKER_PUBLIC_SCHEMA,
+    BROKER_TASK_PATH,
+    broker_pipe_name,
+    broker_install_request_digest,
+    broker_task_sddl,
+    broker_task_spec,
+    normalize_elevated_launch,
+    verify_broker_task,
+)
+from localops.windows.elevation_broker import public_config_path
 from localops.windows.runner_protocol import (
     PIPE_BUFFER_BYTES,
     ProtocolError,
@@ -59,6 +75,8 @@ from localops.windows.runner_protocol import (
 
 from .contracts import (
     CwdSnapshot,
+    ElevationBrokerResult,
+    ElevationBrokerStatus,
     LaunchRequest,
     ListenerSnapshot,
     ManagedActivation,
@@ -158,6 +176,11 @@ class WindowsPlatform:
         monitor_scheduled_tasks=True,
         run_scheduled_tasks=True,
         stop_scheduled_tasks=True,
+        toggle_scheduled_tasks=True,
+        monitor_docker=True,
+        control_docker=True,
+        manage_elevation_broker=True,
+        launch_elevated=True,
     )
 
     def __init__(self, base_dir: str, entrypoint: str):
@@ -168,6 +191,7 @@ class WindowsPlatform:
         if self._default_owner_sid not in {self._sid, _ADMINISTRATORS_SID}:
             raise PermissionError("current Windows token has an unsupported default owner")
         self._principal = Principal(self._sid)
+        self._elevation_token: str | None = None
 
     @staticmethod
     def _current_token_sids() -> tuple[str, str]:
@@ -724,6 +748,38 @@ class WindowsPlatform:
             except (TypeError, pywintypes.error):
                 return []
 
+    def _broker_task_security_locked(self, task: object) -> bool:
+        try:
+            actual_sddl = str(task.GetSecurityDescriptor(4) or "")
+            actual = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
+                actual_sddl, win32security.SDDL_REVISION_1
+            )
+            expected = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
+                broker_task_sddl(self._sid), win32security.SDDL_REVISION_1
+            )
+
+            def aces(descriptor: object) -> list[tuple[int, int, str]]:
+                dacl = descriptor.GetSecurityDescriptorDacl()
+                if dacl is None:
+                    return []
+                return sorted(
+                    (
+                        int(ace[0][0]), int(ace[1]),
+                        win32security.ConvertSidToStringSid(ace[2]),
+                    )
+                    for ace in (
+                        dacl.GetAce(index) for index in range(dacl.GetAceCount())
+                    )
+                )
+
+            control = actual.GetSecurityDescriptorControl()[0]
+            return (
+                aces(actual) == aces(expected)
+                and bool(control & win32security.SE_DACL_PROTECTED)
+            )
+        except (AttributeError, TypeError, ValueError, pywintypes.error):
+            return False
+
     def _scheduled_task_row(self, task: object) -> dict[str, object]:
         state_value = int(getattr(task, "State", 0) or 0)
         state = {
@@ -734,20 +790,25 @@ class WindowsPlatform:
             4: "running",
         }.get(state_value, "unknown")
         actions: list[str] = []
+        action_details: list[dict[str, object]] = []
         run_level = "limited"
+        principal_user_id = ""
         multiple_instances = "parallel"
+        trigger_count = 0
         try:
             definition = task.Definition
             run_level = (
                 "highest" if int(definition.Principal.RunLevel or 0) == 1
                 else "limited"
             )
+            principal_user_id = str(definition.Principal.UserId or "")
             multiple_instances = {
                 0: "parallel",
                 1: "queue",
                 2: "ignoreNew",
                 3: "stopExisting",
             }.get(int(definition.Settings.MultipleInstances or 0), "unknown")
+            trigger_count = int(getattr(definition.Triggers, "Count", 0) or 0)
             for action in self._com_collection(definition.Actions):
                 if int(getattr(action, "Type", -1)) != 0:
                     continue
@@ -756,6 +817,14 @@ class WindowsPlatform:
                 display = (executable + (" " + arguments if arguments else "")).strip()
                 if display:
                     actions.append(display)
+                action_details.append({
+                    "type": "exec",
+                    "path": executable,
+                    "arguments": arguments,
+                    "workingDirectory": str(
+                        getattr(action, "WorkingDirectory", "") or ""
+                    ),
+                })
         except (AttributeError, TypeError, ValueError, pywintypes.error):
             pass
         engine_pids = []
@@ -767,6 +836,10 @@ class WindowsPlatform:
         except (AttributeError, TypeError, ValueError, pywintypes.error):
             pass
         path = str(getattr(task, "Path", "") or "")
+        security_locked = (
+            self._broker_task_security_locked(task)
+            if path.casefold() == BROKER_TASK_PATH.casefold() else False
+        )
         return {
             "path": path,
             "name": str(getattr(task, "Name", "") or ""),
@@ -776,8 +849,12 @@ class WindowsPlatform:
             "nextRunAt": self._task_timestamp(getattr(task, "NextRunTime", None)),
             "lastResult": int(getattr(task, "LastTaskResult", 0) or 0),
             "runLevel": run_level,
+            "principalUserId": principal_user_id,
             "multipleInstances": multiple_instances,
+            "triggerCount": trigger_count,
             "actions": actions,
+            "actionDetails": action_details,
+            "securityLocked": security_locked,
             "enginePids": sorted(set(engine_pids)),
         }
 
@@ -896,6 +973,299 @@ class WindowsPlatform:
             instances = task = service = None
             gc.collect()
             pythoncom.CoUninitialize()
+
+    def set_scheduled_task_enabled(
+            self, path: str, enabled: bool) -> ScheduledTaskRunResult:
+        """Set only the enabled bit on one exact registered task."""
+        normalized, folder_path, name = self._scheduled_task_parts(path)
+        pythoncom.CoInitialize()
+        service = task = None
+        try:
+            service = win32com.client.Dispatch("Schedule.Service")
+            service.Connect()
+            task = service.GetFolder(folder_path).GetTask(name)
+            task.Enabled = enabled
+            return ScheduledTaskRunResult(True, normalized)
+        except (OSError, AttributeError, pywintypes.error, pythoncom.com_error) as exc:
+            return ScheduledTaskRunResult(
+                False, normalized, str(exc), "SCHEDULED_TASK_TOGGLE_FAILED"
+            )
+        finally:
+            task = service = None
+            gc.collect()
+            pythoncom.CoUninitialize()
+
+    @staticmethod
+    def _file_sha256(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _broker_public_config(self) -> dict[str, object] | None:
+        path = os.fspath(public_config_path())
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                value = json.load(stream)
+        except FileNotFoundError:
+            return None
+        if (not isinstance(value, dict)
+                or value.get("schema") != BROKER_PUBLIC_SCHEMA
+                or set(value) != {
+                    "schema", "ownerSid", "executable", "workingDirectory",
+                    "taskPath", "pipeName", "executableSha256",
+                }
+                or value.get("ownerSid") != self._sid
+                or value.get("taskPath") != BROKER_TASK_PATH
+                or value.get("pipeName") != broker_pipe_name(self._sid)):
+            raise ValueError("broker public configuration is invalid")
+        executable = str(value.get("executable") or "")
+        program_files = os.path.normcase(os.path.abspath(
+            os.environ.get("ProgramFiles") or r"C:\Program Files"
+        ))
+        canonical = os.path.normcase(os.path.abspath(executable))
+        if (not canonical.startswith(program_files + os.sep)
+                or not os.path.isfile(executable)
+                or self._file_sha256(executable) != value.get("executableSha256")):
+            raise ValueError("broker installed executable is invalid")
+        return value
+
+    def _broker_exchange(
+            self, message: Mapping[str, object], timeout_ms: int = 5000,
+    ) -> dict[str, object]:
+        pipe_name = broker_pipe_name(self._sid)
+        win32pipe.WaitNamedPipe(pipe_name, timeout_ms)
+        pipe = win32file.CreateFile(
+            pipe_name,
+            win32con.GENERIC_READ | win32con.GENERIC_WRITE,
+            0,
+            None,
+            win32con.OPEN_EXISTING,
+            0,
+            None,
+        )
+        try:
+            win32pipe.SetNamedPipeHandleState(
+                pipe, win32pipe.PIPE_READMODE_MESSAGE, None, None
+            )
+            win32file.WriteFile(pipe, encode_message(message))
+            _, data = win32file.ReadFile(pipe, 1024 * 1024)
+            return decode_message(bytes(data))
+        finally:
+            win32file.CloseHandle(pipe)
+
+    def elevation_broker_status(self) -> ElevationBrokerStatus:
+        try:
+            public = self._broker_public_config()
+            if public is None:
+                self._elevation_token = None
+                return ElevationBrokerStatus()
+            spec = broker_task_spec(str(public["executable"]), self._sid)
+            snapshot = self.scheduled_tasks({BROKER_TASK_PATH})
+            if snapshot.status is ScanStatus.FAILED:
+                raise OSError(
+                    snapshot.issues[0].message if snapshot.issues
+                    else "broker task query failed"
+                )
+            row = snapshot.tasks.get(BROKER_TASK_PATH.casefold())
+            verified, code = verify_broker_task(row, spec)
+            running = bool(verified and row and row.get("state") == "running")
+            unlocked = False
+            if verified and running and self._elevation_token:
+                try:
+                    response = self._broker_exchange({
+                        "action": "status", "token": self._elevation_token,
+                    }, timeout_ms=1000)
+                    unlocked = bool(response.get("ok") and response.get("unlocked"))
+                except (OSError, pywintypes.error):
+                    unlocked = False
+            if not unlocked:
+                self._elevation_token = None
+            return ElevationBrokerStatus(
+                installed=True,
+                verified=verified,
+                running=running,
+                unlocked=unlocked,
+                issue=(None if verified else _issue(
+                    "elevation_broker", code or "BROKER_TASK_MISMATCH",
+                    "installed broker task failed verification", degrades=False,
+                )),
+            )
+        except (OSError, TypeError, ValueError, pywintypes.error) as exc:
+            self._elevation_token = None
+            return ElevationBrokerStatus(
+                installed=True,
+                issue=_issue(
+                    "elevation_broker", "BROKER_VERIFY_FAILED", str(exc),
+                    degrades=False,
+                ),
+            )
+
+    def install_elevation_broker(
+            self, password_record: Mapping[str, object]) -> ElevationBrokerResult:
+        if not bool(getattr(sys, "frozen", False)):
+            return ElevationBrokerResult(
+                False,
+                "管理员启动代理只能从打包后的 Windows 版本安装",
+                "BROKER_PACKAGE_REQUIRED",
+            )
+        transaction = None
+        process_handle = None
+        reset_previous = os.environ.get("PYINSTALLER_RESET_ENVIRONMENT")
+        try:
+            paths = self.runtime_paths()
+            root = os.path.join(paths.runtime_dir, "elevation-install")
+            for parent in (paths.runtime_dir, root):
+                try:
+                    os.mkdir(parent)
+                except FileExistsError:
+                    pass
+                self.ensure_private_directory(parent)
+            transaction = os.path.join(root, uuid.uuid4().hex)
+            os.mkdir(transaction)
+            self.ensure_private_directory(transaction)
+            request_path = os.path.join(transaction, "request.json")
+            response_path = os.path.join(transaction, "response.json")
+            request = {
+                "schema": BROKER_INSTALL_SCHEMA,
+                "ownerSid": self._sid,
+                "passwordRecord": dict(password_record),
+                "bundleSource": os.path.dirname(sys.executable),
+                "executableName": os.path.basename(sys.executable),
+            }
+            write_json_atomic(request_path, request, self.ensure_private_file)
+            request_digest = broker_install_request_digest(request)
+            os.environ["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+            launched = shell.ShellExecuteEx(
+                fMask=shellcon.SEE_MASK_NOCLOSEPROCESS,
+                lpVerb="runas",
+                lpFile=sys.executable,
+                lpParameters=subprocess.list2cmdline([
+                    "-m", BROKER_MODULE, "install", request_path, response_path,
+                    request_digest,
+                ]),
+                lpDirectory=self.base_dir,
+                nShow=win32con.SW_HIDE,
+            )
+            process_handle = launched.get("hProcess")
+            deadline = time.monotonic() + 180.0
+            while time.monotonic() < deadline and not os.path.isfile(response_path):
+                if process_handle is not None:
+                    win32event.WaitForSingleObject(process_handle, 100)
+                else:
+                    time.sleep(0.1)
+            if not os.path.isfile(response_path):
+                return ElevationBrokerResult(
+                    False, "管理员启动代理安装超时", "BROKER_INSTALL_TIMEOUT"
+                )
+            self.verify_private_file(response_path)
+            response = read_json(response_path)
+            if not response.get("ok"):
+                return ElevationBrokerResult(
+                    False,
+                    str(response.get("error") or "管理员启动代理安装失败"),
+                    str(response.get("code") or "BROKER_INSTALL_FAILED"),
+                )
+            return ElevationBrokerResult(True)
+        except pywintypes.error as exc:
+            code = "BROKER_UAC_CANCELED" if exc.winerror == winerror.ERROR_CANCELLED \
+                else "BROKER_INSTALL_FAILED"
+            return ElevationBrokerResult(False, str(exc), code)
+        except (OSError, TypeError, ValueError) as exc:
+            return ElevationBrokerResult(False, str(exc), "BROKER_INSTALL_FAILED")
+        finally:
+            if reset_previous is None:
+                os.environ.pop("PYINSTALLER_RESET_ENVIRONMENT", None)
+            else:
+                os.environ["PYINSTALLER_RESET_ENVIRONMENT"] = reset_previous
+            if process_handle is not None:
+                win32api.CloseHandle(process_handle)
+            if transaction is not None:
+                for name in ("response.json", "request.json"):
+                    try:
+                        os.remove(os.path.join(transaction, name))
+                    except FileNotFoundError:
+                        pass
+                try:
+                    os.rmdir(transaction)
+                except OSError:
+                    pass
+
+    def unlock_elevation_broker(self, password: str) -> ElevationBrokerResult:
+        status = self.elevation_broker_status()
+        if not status.installed or not status.verified:
+            return ElevationBrokerResult(
+                False, "管理员启动代理尚未正确安装", "BROKER_NOT_READY"
+            )
+        if not status.running:
+            started = self.run_scheduled_task(BROKER_TASK_PATH)
+            if not started.ok:
+                return ElevationBrokerResult(
+                    False, started.error, started.code or "BROKER_START_FAILED"
+                )
+        try:
+            response = self._broker_exchange({
+                "action": "unlock",
+                "password": password,
+                "consolePid": self.self_pid,
+                "consoleCreateTime": psutil.Process(self.self_pid).create_time(),
+            }, timeout_ms=15000)
+        except (OSError, psutil.Error, pywintypes.error) as exc:
+            return ElevationBrokerResult(False, str(exc), "BROKER_UNLOCK_FAILED")
+        if not response.get("ok") or not isinstance(response.get("token"), str):
+            return ElevationBrokerResult(
+                False,
+                str(response.get("error") or "解锁密码不正确"),
+                str(response.get("code") or "BROKER_UNLOCK_FAILED"),
+            )
+        self._elevation_token = response["token"]
+        return ElevationBrokerResult(True)
+
+    def lock_elevation_broker(self) -> ElevationBrokerResult:
+        token, self._elevation_token = self._elevation_token, None
+        if token is None:
+            return ElevationBrokerResult(True)
+        try:
+            response = self._broker_exchange({"action": "lock", "token": token})
+        except (OSError, pywintypes.error) as exc:
+            return ElevationBrokerResult(False, str(exc), "BROKER_LOCK_FAILED")
+        return ElevationBrokerResult(
+            bool(response.get("ok")),
+            None if response.get("ok") else str(response.get("error") or "锁定失败"),
+            None if response.get("ok") else str(response.get("code") or "BROKER_LOCK_FAILED"),
+        )
+
+    def launch_elevated(
+            self, command_spec: Mapping[str, object],
+            cwd: str | None) -> ElevationBrokerResult:
+        if self._elevation_token is None:
+            return ElevationBrokerResult(
+                False, "本次 Local Ops 会话尚未解锁管理员启动",
+                "BROKER_SESSION_LOCKED",
+            )
+        try:
+            normalized = normalize_command_spec(command_spec)
+            request = normalize_elevated_launch({
+                "executable": normalized.get("executable"),
+                "args": normalized.get("args"),
+                "cwd": cwd or os.path.dirname(str(normalized.get("executable") or "")),
+            })
+            response = self._broker_exchange({
+                "action": "launch", "token": self._elevation_token,
+                "request": request,
+            })
+        except (CommandSpecError, OSError, TypeError, ValueError, pywintypes.error) as exc:
+            return ElevationBrokerResult(False, str(exc), "BROKER_LAUNCH_FAILED")
+        if not response.get("ok"):
+            if response.get("code") == "BROKER_SESSION_INVALID":
+                self._elevation_token = None
+            return ElevationBrokerResult(
+                False,
+                str(response.get("error") or "管理员程序启动失败"),
+                str(response.get("code") or "BROKER_LAUNCH_FAILED"),
+            )
+        return ElevationBrokerResult(True, process_id=int(response["pid"]))
 
     @staticmethod
     def process_groups() -> ProcessSnapshot:

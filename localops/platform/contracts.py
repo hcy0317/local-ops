@@ -79,6 +79,23 @@ class ScheduledTaskRunResult:
 
 
 @dataclass(frozen=True)
+class ElevationBrokerStatus:
+    installed: bool = False
+    verified: bool = False
+    running: bool = False
+    unlocked: bool = False
+    issue: PlatformIssue | None = None
+
+
+@dataclass(frozen=True)
+class ElevationBrokerResult:
+    ok: bool
+    error: str | None = None
+    code: str | None = None
+    process_id: int | None = None
+
+
+@dataclass(frozen=True)
 class PickResult:
     path: str | None = None
     canceled: bool = False
@@ -217,6 +234,11 @@ class PlatformCapabilities:
     monitor_scheduled_tasks: bool = False
     run_scheduled_tasks: bool = False
     stop_scheduled_tasks: bool = False
+    toggle_scheduled_tasks: bool = False
+    monitor_docker: bool = False
+    control_docker: bool = False
+    manage_elevation_broker: bool = False
+    launch_elevated: bool = False
 
 
 class PlatformUnavailable(RuntimeError):
@@ -266,6 +288,18 @@ class PlatformBackend(Protocol):
     def scheduled_tasks(self, paths: set[str] | None = None) -> ScheduledTaskSnapshot: ...
     def run_scheduled_task(self, path: str) -> ScheduledTaskRunResult: ...
     def stop_scheduled_task(self, path: str) -> ScheduledTaskRunResult: ...
+    def set_scheduled_task_enabled(
+        self, path: str, enabled: bool,
+    ) -> ScheduledTaskRunResult: ...
+    def elevation_broker_status(self) -> ElevationBrokerStatus: ...
+    def install_elevation_broker(
+        self, password_record: Mapping[str, object],
+    ) -> ElevationBrokerResult: ...
+    def unlock_elevation_broker(self, password: str) -> ElevationBrokerResult: ...
+    def lock_elevation_broker(self) -> ElevationBrokerResult: ...
+    def launch_elevated(
+        self, command_spec: Mapping[str, object], cwd: str | None,
+    ) -> ElevationBrokerResult: ...
     def pick_path(self, kind: Literal["dir", "script"]) -> PickResult: ...
     def open_browser(self, url: str) -> None: ...
     def restart_console(self, preferred_port: int) -> RestartResult: ...

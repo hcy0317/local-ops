@@ -10,6 +10,7 @@ from typing import Callable, Sequence, TextIO
 
 
 RUNNER_MODULE = "localops.windows.runner"
+ELEVATION_BROKER_MODULE = "localops.windows.elevation_broker"
 
 
 def _bind_private_console_log(server: ModuleType) -> TextIO:
@@ -87,6 +88,7 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     runner_main: Callable[[list[str]], int] | None = None,
+    broker_main: Callable[[list[str]], int] | None = None,
 ) -> int:
     """Dispatch the frozen runner CLI or start the windowed console."""
     args = list(sys.argv[1:] if argv is None else argv)
@@ -94,6 +96,10 @@ def main(
         if runner_main is None:
             from localops.windows.runner import main as runner_main
         return runner_main(args[2:])
+    if args[:2] == ["-m", ELEVATION_BROKER_MODULE]:
+        if broker_main is None:
+            from localops.windows.elevation_broker import main as broker_main
+        return broker_main(args[2:])
     if args[:1] == ["-m"]:
         return 2
     return _run_console(args)

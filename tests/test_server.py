@@ -516,7 +516,7 @@ class ConfigTests(unittest.TestCase):
                 migrated = json.load(f)
             with open(path + ".bak", "r", encoding="utf-8") as f:
                 previous = json.load(f)
-            self.assertEqual(migrated["schemaVersion"], 2)
+            self.assertEqual(migrated["schemaVersion"], server.CURRENT_SCHEMA_VERSION)
             self.assertNotIn("schemaVersion", previous)
 
             # 第二次读取已是当前 schema，不再改写备份。
@@ -549,7 +549,7 @@ class ConfigTests(unittest.TestCase):
         migrated_again, current_source = server.migrate_config(migrated)
 
         self.assertEqual(source_version, 1)
-        self.assertEqual(current_source, 2)
+        self.assertEqual(current_source, server.CURRENT_SCHEMA_VERSION)
         self.assertEqual(migrated_again, migrated)
         app = migrated["apps"][0]
         self.assertEqual(app["command"], legacy_app["command"])
@@ -559,6 +559,8 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(app["commandSpec"]["needsReview"])
         self.assertIsNone(app["runtimeIdentity"])
         self.assertEqual(app["importStatus"], "needs_review")
+        self.assertIsNone(app["dockerResource"])
+        self.assertFalse(app["elevated"])
 
     def test_future_schema_is_not_silently_overwritten(self):
         with tempfile.TemporaryDirectory() as td:

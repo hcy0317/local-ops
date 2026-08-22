@@ -63,6 +63,7 @@ class ScheduledTaskStateTests(unittest.TestCase):
                 monitor_scheduled_tasks=True,
                 run_scheduled_tasks=True,
                 stop_scheduled_tasks=True,
+                toggle_scheduled_tasks=True,
             ),
             scheduled=ScheduledTaskSnapshot(
                 ScanStatus.OK, {TASK_PATH.casefold(): task_row(state)}
@@ -87,6 +88,7 @@ class ScheduledTaskStateTests(unittest.TestCase):
         self.assertEqual(app["runtimeSource"], "windowsTaskScheduler")
         self.assertEqual(app["scheduledTask"]["state"], "running")
         self.assertTrue(app["controlAvailable"])
+        self.assertTrue(app["scheduledTaskControlAvailable"])
         self.assertEqual(
             fake.calls.count(("scheduled_tasks", frozenset({TASK_PATH}))), 1
         )
@@ -109,6 +111,18 @@ class ScheduledTaskStateTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["taskPath"], TASK_PATH)
         self.assertEqual(fake.calls[-1], ("stop_scheduled_task", TASK_PATH))
+
+    def test_scheduled_task_enabled_state_can_be_changed_without_runtime_control(self):
+        fake = self.fake_platform("ready")
+        app = scheduled_app("service")
+
+        result = server.set_scheduled_task_enabled_app(fake, app, False)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["enabled"])
+        self.assertEqual(
+            fake.calls[-1], ("set_scheduled_task_enabled", (TASK_PATH, False))
+        )
 
     def test_scheduled_task_field_round_trips_through_validation(self):
         fields, error = server.validate_app_fields({
@@ -156,6 +170,31 @@ class ScheduledTaskStateTests(unittest.TestCase):
         folder.GetTask.assert_called_once_with("Memos-Guard")
         task.Stop.assert_called_once_with(0)
 
+    @unittest.skipUnless(os.name == "nt", "Windows Task Scheduler COM only")
+    def test_windows_adapter_only_changes_exact_registered_task_enabled_state(self):
+        from localops.platform import windows as windows_platform
+
+        platform = object.__new__(windows_platform.WindowsPlatform)
+        task = mock.Mock()
+        task.Enabled = True
+        folder = mock.Mock()
+        folder.GetTask.return_value = task
+        service = mock.Mock()
+        service.GetFolder.return_value = folder
+
+        with mock.patch.object(
+                windows_platform.win32com.client, "Dispatch", return_value=service), \
+                mock.patch.object(windows_platform.pythoncom, "CoInitialize"), \
+                mock.patch.object(windows_platform.pythoncom, "CoUninitialize"):
+            result = platform.set_scheduled_task_enabled(TASK_PATH, False)
+
+        self.assertTrue(result.ok)
+        self.assertFalse(task.Enabled)
+        service.GetFolder.assert_called_once_with("\\")
+        folder.GetTask.assert_called_once_with("Memos-Guard")
+        task.Run.assert_not_called()
+        task.Stop.assert_not_called()
+
 
 class ScheduledTaskHttpTests(unittest.TestCase):
     def setUp(self):
@@ -166,6 +205,7 @@ class ScheduledTaskHttpTests(unittest.TestCase):
                 monitor_scheduled_tasks=True,
                 run_scheduled_tasks=True,
                 stop_scheduled_tasks=True,
+                toggle_scheduled_tasks=True,
             ),
             scheduled=ScheduledTaskSnapshot(
                 ScanStatus.OK, {TASK_PATH.casefold(): task_row("running")}
@@ -203,6 +243,33 @@ class ScheduledTaskHttpTests(unittest.TestCase):
             self.platform.calls[-1], ("stop_scheduled_task", TASK_PATH)
         )
         self.assertEqual(len(self.harness.cfg.snapshot()["apps"]), 1)
+
+    def test_disable_endpoint_changes_only_the_bound_scheduled_task(self):
+        status, body, _ = self.harness.request(
+            "POST",
+            "/api/apps/deadbeef/scheduled-enabled",
+            {"enabled": False},
+            self.headers,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertFalse(body["enabled"])
+        self.assertEqual(
+            self.platform.calls[-1],
+            ("set_scheduled_task_enabled", (TASK_PATH, False)),
+        )
+
+    def test_enable_endpoint_rejects_non_boolean_value(self):
+        status, body, _ = self.harness.request(
+            "POST",
+            "/api/apps/deadbeef/scheduled-enabled",
+            {"enabled": "yes"},
+            self.headers,
+        )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(body["code"], "INVALID_REQUEST")
 
 
 class WindowsHealthTests(unittest.TestCase):

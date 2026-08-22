@@ -18,6 +18,8 @@ from typing import Literal, Mapping, Sequence
 
 from .contracts import (
     CwdSnapshot,
+    ElevationBrokerResult,
+    ElevationBrokerStatus,
     InstanceLock,
     LaunchRequest,
     ListenerSnapshot,
@@ -101,6 +103,8 @@ class MacOSPlatform:
         attach_external=True,
         pick_path=True,
         restart_console=True,
+        monitor_docker=True,
+        control_docker=True,
     )
 
     def __init__(self, base_dir: str, entrypoint: str):
@@ -493,6 +497,45 @@ class MacOSPlatform:
     def stop_scheduled_task(self, path: str) -> ScheduledTaskRunResult:
         return ScheduledTaskRunResult(
             False, path, "Windows Task Scheduler is unavailable on macOS",
+            "UNSUPPORTED_PLATFORM",
+        )
+
+    def set_scheduled_task_enabled(
+            self, path: str, enabled: bool) -> ScheduledTaskRunResult:
+        return ScheduledTaskRunResult(
+            False, path, "Windows Task Scheduler is unavailable on macOS",
+            "UNSUPPORTED_PLATFORM",
+        )
+
+    @staticmethod
+    def elevation_broker_status() -> ElevationBrokerStatus:
+        return ElevationBrokerStatus()
+
+    @staticmethod
+    def install_elevation_broker(
+            password_record: Mapping[str, object]) -> ElevationBrokerResult:
+        return ElevationBrokerResult(
+            False, "Windows elevation broker is unavailable on macOS",
+            "UNSUPPORTED_PLATFORM",
+        )
+
+    @staticmethod
+    def unlock_elevation_broker(password: str) -> ElevationBrokerResult:
+        return ElevationBrokerResult(
+            False, "Windows elevation broker is unavailable on macOS",
+            "UNSUPPORTED_PLATFORM",
+        )
+
+    @staticmethod
+    def lock_elevation_broker() -> ElevationBrokerResult:
+        return ElevationBrokerResult(True)
+
+    @staticmethod
+    def launch_elevated(
+            command_spec: Mapping[str, object], cwd: str | None,
+    ) -> ElevationBrokerResult:
+        return ElevationBrokerResult(
+            False, "Windows elevation broker is unavailable on macOS",
             "UNSUPPORTED_PLATFORM",
         )
 

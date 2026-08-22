@@ -161,7 +161,7 @@ class WindowsPhase3ContractTests(unittest.TestCase):
             migrated, source_version = server.migrate_config(schema_v1)
 
         self.assertEqual(source_version, 1)
-        self.assertEqual(migrated["schemaVersion"], 2)
+        self.assertEqual(migrated["schemaVersion"], server.CURRENT_SCHEMA_VERSION)
         run.assert_not_called()
         urlopen.assert_not_called()
         json.dumps(migrated)

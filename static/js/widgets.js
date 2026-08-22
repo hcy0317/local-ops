@@ -52,6 +52,7 @@ export function initWidgets() {
     const action = btn.dataset.qa;
     if (action === 'add-svc') openAppModal(null, 'service');
     else if (action === 'add-task') openAppModal(null, 'task');
+    else if (action === 'add-program') openAppModal(null, 'program');
     else if (action === 'refresh' && window.__poll) window.__poll();
     else if (action === 'logs') openLogsCenter();
     else if (action === 'settings') openSettingsCenter();
@@ -772,6 +773,9 @@ function batchStopApps() {
   const running = ((state.data && state.data.apps) || [])
     .map(app => ({ app, intent: lifecycleSnapshot(app, currentPlatform()) }))
     .filter(item => item.app.runtimeSource !== 'windowsTaskScheduler'
+      && item.app.runtimeSource !== 'dockerCompose'
+      && item.app.runtimeSource !== 'dockerContainer'
+      && item.app.runtimeSource !== 'windowsElevationBroker'
       && item.intent.canManage);
   if (!running.length) {
     toast('当前没有运行中的应用');

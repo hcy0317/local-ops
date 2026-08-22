@@ -68,6 +68,22 @@ test('running Windows scheduled task is controllable without a managed generatio
   assert.equal(snapshot.canDelete, true);
 });
 
+test('running Docker resource is controllable without a managed generation', () => {
+  for (const runtimeSource of ['dockerCompose', 'dockerContainer']) {
+    const snapshot = lifecycleSnapshot({
+      lifecycleStatus: 'running',
+      controlAvailable: true,
+      running: true,
+      runtimeIdentity: null,
+      runtimeSource,
+    }, 'windows');
+
+    assert.equal(snapshot.expectedGeneration, null, runtimeSource);
+    assert.equal(snapshot.canManage, true, runtimeSource);
+    assert.equal(snapshot.canDelete, true, runtimeSource);
+  }
+});
+
 test('captured intent never substitutes a newer generation', () => {
   const app = runningApp();
   const snapshot = lifecycleSnapshot(app, 'windows');

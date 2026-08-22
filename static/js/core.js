@@ -156,9 +156,9 @@ export function currentMutationEpoch() { return mutationEpoch; }
    使在途轮询的旧快照作废，避免图标延迟一帧才出现。 */
 export function bumpMutationEpoch() { mutationEpoch += 1; }
 
-async function req(method, path, body) {
+async function req(method, path, body, timeoutMs = REQUEST_TIMEOUT_MS) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   const opt = { method, signal: controller.signal };
   if (body !== undefined) {
     opt.headers = { 'Content-Type': 'application/json' };
@@ -186,7 +186,7 @@ async function req(method, path, body) {
     clearTimeout(timer);
   }
 }
-export const post = (p, b = {}) => req('POST', p, b);
+export const post = (p, b = {}, timeoutMs) => req('POST', p, b, timeoutMs);
 export const put = (p, b) => req('PUT', p, b);
 export const del = (p, b) => req('DELETE', p, b);
 

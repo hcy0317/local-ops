@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -103,35 +104,46 @@ class ElevationBrokerStateTests(unittest.TestCase):
 
 class ElevationBrokerHttpTests(unittest.TestCase):
     def setUp(self):
+        self.log_dir = tempfile.TemporaryDirectory()
         self.platform = broker_platform(unlocked=True)
         self.platform_patch = mock.patch.object(server, "PLATFORM", self.platform)
         self.principal_patch = mock.patch.object(
             server, "SELF_PRINCIPAL", self.platform.principal
         )
+        self.logs_patch = mock.patch.object(server, "LOGS_DIR", self.log_dir.name)
         self.platform_patch.start()
         self.principal_patch.start()
+        self.logs_patch.start()
         self.harness = HttpHarness()
         self.headers = self.harness.session_headers()
         self.harness.cfg.update(lambda data: data["apps"].append(program_app()))
 
     def tearDown(self):
         self.harness.close()
+        self.logs_patch.stop()
         self.principal_patch.stop()
         self.platform_patch.stop()
+        self.log_dir.cleanup()
 
     def test_install_derives_password_verifier_before_platform_boundary(self):
         password = "correct horse battery staple"
+        package_executable = r"C:\Local Ops\LocalOps.exe"
         status, body, _ = self.harness.request(
             "POST", "/api/windows/elevation-broker/install",
-            {"password": password}, self.headers,
+            {
+                "password": password,
+                "packageExecutable": package_executable,
+            }, self.headers,
         )
 
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
         call = self.platform.calls[-1]
         self.assertEqual(call[0], "install_elevation_broker")
-        self.assertNotIn(password, repr(call[1]))
-        self.assertIn("verifier", call[1])
+        password_record, selected_executable = call[1]
+        self.assertNotIn(password, repr(password_record))
+        self.assertIn("verifier", password_record)
+        self.assertEqual(selected_executable, package_executable)
 
     def test_unlock_is_session_only_and_not_written_to_config(self):
         before = self.harness.cfg.snapshot()
@@ -148,6 +160,21 @@ class ElevationBrokerHttpTests(unittest.TestCase):
             ("unlock_elevation_broker", "correct horse battery staple"),
         )
 
+    def test_install_rejects_non_string_package_executable(self):
+        status, body, _ = self.harness.request(
+            "POST", "/api/windows/elevation-broker/install",
+            {
+                "password": "correct horse battery staple",
+                "packageExecutable": 42,
+            }, self.headers,
+        )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(body["code"], "INVALID_REQUEST")
+        self.assertNotIn(
+            "install_elevation_broker", [call[0] for call in self.platform.calls]
+        )
+
     def test_elevated_program_start_uses_structured_broker_launch(self):
         status, body, _ = self.harness.request(
             "POST", "/api/apps/deadbeef/start",
@@ -157,9 +184,9 @@ class ElevationBrokerHttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
         self.assertEqual(body["pid"], 4321)
-        self.assertEqual(self.platform.calls[-1], (
+        self.assertIn((
             "launch_elevated", (program_app()["commandSpec"], r"C:\Tools"),
-        ))
+        ), self.platform.calls)
 
     def test_delete_removes_only_favorite_without_broker_uac(self):
         status, body, _ = self.harness.request(

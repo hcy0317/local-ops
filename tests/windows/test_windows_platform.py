@@ -1,8 +1,10 @@
+import json
 import os
 import socket
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -13,8 +15,10 @@ if sys.platform == "win32":
     import psutil
     import win32api
     import win32con
+    import win32gui
     import win32process
     import win32security
+    import win32ui
 
     from localops.platform import windows as windows_adapter
     from localops.platform.windows import WindowsPlatform
@@ -446,21 +450,121 @@ class WindowsPlatformTests(unittest.TestCase):
         self.assertEqual(snapshot.status, ScanStatus.PARTIAL)
         self.assertFalse(snapshot.issues[0].degrades)
 
-    def test_native_picker_returns_path_and_cancel_without_side_effects(self):
-        root = mock.Mock()
+    def test_native_picker_returns_directory_from_windows_shell(self):
         selected = os.path.join(os.getcwd(), "中文 folder")
-        with mock.patch("tkinter.Tk", return_value=root), \
-                mock.patch("tkinter.filedialog.askdirectory", return_value=selected):
+        pidl = object()
+        owner_hwnd = 4242
+        with mock.patch.object(
+                windows_adapter.shell, "SHBrowseForFolder",
+                return_value=(pidl, "中文 folder", 0)) as browse, \
+                mock.patch.object(
+                    windows_adapter.shell, "SHGetPathFromIDList",
+                    return_value=selected), \
+                mock.patch.object(
+                    win32gui, "GetForegroundWindow", return_value=owner_hwnd), \
+                mock.patch("tkinter.Tk", side_effect=AssertionError(
+                    "Windows picker must not depend on Tk")):
             result = self.platform.pick_path("dir")
+
         self.assertEqual(result.path, os.path.abspath(selected))
         self.assertFalse(result.canceled)
-        root.withdraw.assert_called_once_with()
-        root.destroy.assert_called_once_with()
-        with mock.patch("tkinter.Tk", return_value=mock.Mock()), \
-                mock.patch("tkinter.filedialog.askopenfilename", return_value=""):
-            result = self.platform.pick_path("script")
+        self.assertEqual(browse.call_args.args[0], owner_hwnd)
+
+    def test_native_picker_filters_executables_and_reports_cancel(self):
+        selected = os.path.join(os.getcwd(), "工具 program.exe")
+        dialog = mock.Mock()
+        owner_hwnd = 4242
+        owner_window = object()
+        dialog.DoModal.return_value = win32con.IDOK
+        dialog.GetPathName.return_value = selected
+        with mock.patch.object(
+                win32ui, "CreateFileDialog", return_value=dialog) as create_dialog, \
+                mock.patch.object(
+                    win32gui, "GetForegroundWindow", return_value=owner_hwnd), \
+                mock.patch.object(
+                    win32ui, "CreateWindowFromHandle",
+                    return_value=owner_window) as create_owner, \
+                mock.patch("tkinter.Tk", side_effect=AssertionError(
+                    "Windows picker must not depend on Tk")):
+            result = self.platform.pick_path("exe")
+
+        self.assertEqual(result.path, os.path.abspath(selected))
+        self.assertFalse(result.canceled)
+        self.assertIn("*.exe", create_dialog.call_args.args[4])
+        create_owner.assert_called_once_with(owner_hwnd)
+        self.assertIs(create_dialog.call_args.args[5], owner_window)
+
+        dialog.DoModal.return_value = win32con.IDCANCEL
+        with mock.patch.object(win32ui, "CreateFileDialog", return_value=dialog):
+            result = self.platform.pick_path("exe")
+
         self.assertTrue(result.canceled)
         self.assertIsNone(result.path)
+
+    def test_source_broker_install_uses_selected_packaged_companion(self):
+        with tempfile.TemporaryDirectory() as root:
+            bundle = Path(root) / "LocalOps-1.0.0-windows-x64"
+            internal = bundle / "_internal"
+            internal.mkdir(parents=True)
+            executable = bundle / "LocalOps.exe"
+            executable.write_bytes(b"packaged-local-ops")
+            (internal / "python312.dll").write_bytes(b"runtime")
+            (internal / "VERSION").write_text("1.0.0\n", encoding="utf-8")
+            (bundle / "BUILD-INFO.json").write_text(json.dumps({
+                "architecture": "x64",
+                "elevationBrokerDispatch": "-m localops.windows.elevation_broker",
+                "entrypoint": "localops.windows.packaged_entry",
+                "packaging": "PyInstaller onedir windowed",
+                "product": "Local Ops Console",
+                "pythonVersion": "3.12.13",
+                "schemaVersion": 1,
+                "version": "1.0.0",
+            }), encoding="utf-8")
+            runtime_dir = Path(root) / "runtime"
+
+            def approve_install(**kwargs):
+                request_path = next(
+                    (runtime_dir / "elevation-install").glob("*/request.json")
+                )
+                (request_path.parent / "response.json").write_text(
+                    '{"ok": true}', encoding="utf-8"
+                )
+                return {}
+
+            with mock.patch.object(
+                    self.platform, "runtime_paths",
+                    return_value=SimpleNamespace(runtime_dir=str(runtime_dir))), \
+                    mock.patch.object(
+                        self.platform, "ensure_private_directory"), \
+                    mock.patch.object(self.platform, "ensure_private_file"), \
+                    mock.patch.object(self.platform, "verify_private_file"), \
+                    mock.patch.object(
+                        windows_adapter.shell, "ShellExecuteEx",
+                        side_effect=approve_install) as shell_execute:
+                result = self.platform.install_elevation_broker(
+                    {"verifier": "opaque"}, str(executable)
+                )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(
+                shell_execute.call_args.kwargs["lpFile"], str(executable)
+            )
+            parameters = shell_execute.call_args.kwargs["lpParameters"]
+            self.assertIn("localops.windows.elevation_broker", parameters)
+
+    def test_source_broker_install_rejects_incomplete_package_before_uac(self):
+        with tempfile.TemporaryDirectory() as root:
+            executable = Path(root) / "LocalOps.exe"
+            executable.write_bytes(b"not-a-bundle")
+            with mock.patch.object(
+                    windows_adapter.shell, "ShellExecuteEx") as shell_execute:
+                result = self.platform.install_elevation_broker(
+                    {"verifier": "opaque"}, str(executable)
+                )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "BROKER_PACKAGE_INVALID")
+        shell_execute.assert_not_called()
 
     def test_real_loopback_listener_is_observable(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

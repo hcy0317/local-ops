@@ -51,6 +51,17 @@ const sideSvc = $('#sideSvc');
 
 let firstRender = true;          // 首屏渲染（stagger 入场）
 let brokerPromptedConsolePid = null;
+let migrationNotifiedConsolePid = null;
+
+function notifyConfigMigration(data) {
+  const fromSchema = data && data.configHealth
+    ? data.configHealth.migratedFromSchema : null;
+  const consolePid = Number(data && data.consolePid);
+  if (fromSchema == null || !Number.isInteger(consolePid) || consolePid <= 0
+      || migrationNotifiedConsolePid === consolePid) return;
+  migrationNotifiedConsolePid = consolePid;
+  toast('配置已从旧版本升级');
+}
 
 function promptForElevationSession(data) {
   const broker = data && data.elevationBroker;
@@ -169,6 +180,7 @@ function poll(force = false) {
       notifyTaskCompletions(state.data, data);
       state.data = data;
       state.lastUpdate = new Date();
+      notifyConfigMigration(data);
       const restartCompleted = state.restartingFrom && data.consolePid
         && data.consolePid !== state.restartingFrom;
       if (restartCompleted) {
@@ -252,9 +264,6 @@ function stateHealthNotice(data) {
     messages.push('配置处于只读保护，修改不会保存');
   } else if (health.recoveredFromBackup) {
     messages.push('配置已从备份恢复，请核对内容');
-  }
-  if (health.migratedFromSchema != null) {
-    messages.push('配置已从旧版本升级');
   }
   return messages.length ? messages.join('；') + '。' : '';
 }

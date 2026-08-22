@@ -55,6 +55,15 @@ def scheduled_app(kind="service"):
 
 
 class ScheduledTaskStateTests(unittest.TestCase):
+    def setUp(self):
+        self.log_dir = tempfile.TemporaryDirectory()
+        self.log_patch = mock.patch.object(server, "LOGS_DIR", self.log_dir.name)
+        self.log_patch.start()
+
+    def tearDown(self):
+        self.log_patch.stop()
+        self.log_dir.cleanup()
+
     def fake_platform(self, state="running"):
         return FakePlatform(
             name="windows",
@@ -101,6 +110,20 @@ class ScheduledTaskStateTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["taskPath"], TASK_PATH)
         self.assertEqual(fake.calls[-1], ("run_scheduled_task", TASK_PATH))
+
+    def test_scheduled_task_control_failure_is_written_to_app_log(self):
+        fake = self.fake_platform("ready")
+        fake.scheduled_run_result = ScheduledTaskRunResult(
+            False, TASK_PATH, "拒绝访问", "SCHEDULED_TASK_RUN_FAILED"
+        )
+        app = scheduled_app("task")
+        result = server.start_scheduled_task_app(fake, app)
+        text = server.read_log_tail(app["id"], 20)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Windows 计划任务启动失败", text)
+        self.assertIn("SCHEDULED_TASK_RUN_FAILED", text)
+        self.assertIn("拒绝访问", text)
 
     def test_running_guard_can_be_stopped_through_task_scheduler(self):
         fake = self.fake_platform("running")
@@ -198,6 +221,7 @@ class ScheduledTaskStateTests(unittest.TestCase):
 
 class ScheduledTaskHttpTests(unittest.TestCase):
     def setUp(self):
+        self.log_dir = tempfile.TemporaryDirectory()
         self.platform = FakePlatform(
             name="windows",
             capabilities=PlatformCapabilities(
@@ -216,8 +240,10 @@ class ScheduledTaskHttpTests(unittest.TestCase):
         self.principal_patch = mock.patch.object(
             server, "SELF_PRINCIPAL", self.platform.principal
         )
+        self.logs_patch = mock.patch.object(server, "LOGS_DIR", self.log_dir.name)
         self.platform_patch.start()
         self.principal_patch.start()
+        self.logs_patch.start()
         self.harness = HttpHarness()
         self.headers = self.harness.session_headers()
         self.harness.cfg.update(
@@ -226,8 +252,10 @@ class ScheduledTaskHttpTests(unittest.TestCase):
 
     def tearDown(self):
         self.harness.close()
+        self.logs_patch.stop()
         self.principal_patch.stop()
         self.platform_patch.stop()
+        self.log_dir.cleanup()
 
     def test_stop_uses_scheduler_capability_without_managed_job_control(self):
         status, body, _ = self.harness.request(
@@ -239,9 +267,7 @@ class ScheduledTaskHttpTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
-        self.assertEqual(
-            self.platform.calls[-1], ("stop_scheduled_task", TASK_PATH)
-        )
+        self.assertIn(("stop_scheduled_task", TASK_PATH), self.platform.calls)
         self.assertEqual(len(self.harness.cfg.snapshot()["apps"]), 1)
 
     def test_disable_endpoint_changes_only_the_bound_scheduled_task(self):
@@ -255,9 +281,9 @@ class ScheduledTaskHttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
         self.assertFalse(body["enabled"])
-        self.assertEqual(
-            self.platform.calls[-1],
+        self.assertIn(
             ("set_scheduled_task_enabled", (TASK_PATH, False)),
+            self.platform.calls,
         )
 
     def test_enable_endpoint_rejects_non_boolean_value(self):
@@ -270,6 +296,22 @@ class ScheduledTaskHttpTests(unittest.TestCase):
 
         self.assertEqual(status, 400)
         self.assertEqual(body["code"], "INVALID_REQUEST")
+
+    def test_logs_endpoint_includes_current_scheduler_result(self):
+        failed = task_row("ready")
+        failed["lastResult"] = 1
+        self.platform.scheduled = ScheduledTaskSnapshot(
+            ScanStatus.OK, {TASK_PATH.casefold(): failed}
+        )
+
+        status, body, _ = self.harness.request(
+            "GET", "/api/apps/deadbeef/logs?tail=20", headers=self.headers,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertIn("Windows 计划任务：\\Memos-Guard", body["text"])
+        self.assertIn("状态：就绪", body["text"])
+        self.assertIn("最近结果：失败 (0x00000001)", body["text"])
 
 
 class WindowsHealthTests(unittest.TestCase):

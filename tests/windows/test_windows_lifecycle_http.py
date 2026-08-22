@@ -526,6 +526,20 @@ class WindowsLifecycleTransactionTests(unittest.TestCase):
         self.assertNotIn("activate_managed", call_names)
         self.assertIsNone(self.current_app()["runtimeIdentity"])
 
+    def test_prepare_failure_is_written_to_app_log(self):
+        self.platform.launch_result = ManagedRuntime(
+            ok=False,
+            error="runner could not start",
+            code="LAUNCH_PREPARE_FAILED",
+        )
+
+        result = server.start_windows_app(self.cfg, self.current_app())
+        text = server.read_log_tail("deadbeef", 20)
+
+        self.assertEqual(result["code"], "LAUNCH_PREPARE_FAILED")
+        self.assertIn("Windows 受管应用启动失败", text)
+        self.assertIn("LAUNCH_PREPARE_FAILED", text)
+
     def test_read_only_config_rejects_before_prepare(self):
         self.cfg._writable = False
 

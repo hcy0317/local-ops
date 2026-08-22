@@ -24,9 +24,11 @@ import win32api
 import win32con
 import win32event
 import win32file
+import win32gui
 import win32pipe
 import win32process
 import win32security
+import win32ui
 import winerror
 import win32com.client
 from win32com.shell import shell, shellcon
@@ -1103,13 +1105,22 @@ class WindowsPlatform:
             )
 
     def install_elevation_broker(
-            self, password_record: Mapping[str, object]) -> ElevationBrokerResult:
-        if not bool(getattr(sys, "frozen", False)):
+            self, password_record: Mapping[str, object],
+            package_executable: str | None = None) -> ElevationBrokerResult:
+        frozen = bool(getattr(sys, "frozen", False))
+        if not frozen and not package_executable:
             return ElevationBrokerResult(
                 False,
-                "管理员启动代理只能从打包后的 Windows 版本安装",
+                "请选择已解压的 Windows 版 LocalOps.exe 作为管理员代理伴随程序",
                 "BROKER_PACKAGE_REQUIRED",
             )
+        try:
+            source_executable = (
+                os.path.abspath(sys.executable) if frozen
+                else self._validate_broker_package_executable(package_executable)
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            return ElevationBrokerResult(False, str(exc), "BROKER_PACKAGE_INVALID")
         transaction = None
         process_handle = None
         reset_previous = os.environ.get("PYINSTALLER_RESET_ENVIRONMENT")
@@ -1131,8 +1142,8 @@ class WindowsPlatform:
                 "schema": BROKER_INSTALL_SCHEMA,
                 "ownerSid": self._sid,
                 "passwordRecord": dict(password_record),
-                "bundleSource": os.path.dirname(sys.executable),
-                "executableName": os.path.basename(sys.executable),
+                "bundleSource": os.path.dirname(source_executable),
+                "executableName": os.path.basename(source_executable),
             }
             write_json_atomic(request_path, request, self.ensure_private_file)
             request_digest = broker_install_request_digest(request)
@@ -1140,7 +1151,7 @@ class WindowsPlatform:
             launched = shell.ShellExecuteEx(
                 fMask=shellcon.SEE_MASK_NOCLOSEPROCESS,
                 lpVerb="runas",
-                lpFile=sys.executable,
+                lpFile=source_executable,
                 lpParameters=subprocess.list2cmdline([
                     "-m", BROKER_MODULE, "install", request_path, response_path,
                     request_digest,
@@ -1191,6 +1202,44 @@ class WindowsPlatform:
                     os.rmdir(transaction)
                 except OSError:
                     pass
+
+    @staticmethod
+    def _validate_broker_package_executable(value: object) -> str:
+        if not isinstance(value, str) or not value or not os.path.isabs(value):
+            raise ValueError("管理员代理伴随程序必须是绝对 EXE 路径")
+        executable = os.path.abspath(value)
+        if (os.path.basename(executable).casefold() != "localops.exe"
+                or not os.path.isfile(executable)
+                or os.path.islink(executable)):
+            raise ValueError("请选择打包目录中的 LocalOps.exe")
+        bundle = os.path.dirname(executable)
+        build_info_path = os.path.join(bundle, "BUILD-INFO.json")
+        version_path = os.path.join(bundle, "_internal", "VERSION")
+        runtime_path = os.path.join(bundle, "_internal", "python312.dll")
+        try:
+            with open(build_info_path, "r", encoding="utf-8") as stream:
+                build_info = json.load(stream)
+            with open(version_path, "r", encoding="utf-8") as stream:
+                version = stream.read().strip()
+        except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("所选 EXE 不属于完整的 Windows onedir 包") from exc
+        expected = {
+            "architecture": "x64",
+            "elevationBrokerDispatch": "-m localops.windows.elevation_broker",
+            "entrypoint": "localops.windows.packaged_entry",
+            "packaging": "PyInstaller onedir windowed",
+            "product": "Local Ops Console",
+            "schemaVersion": 1,
+        }
+        if (not isinstance(build_info, dict)
+                or any(build_info.get(key) != expected_value
+                       for key, expected_value in expected.items())
+                or build_info.get("version") != version
+                or not isinstance(build_info.get("pythonVersion"), str)
+                or not build_info["pythonVersion"].startswith("3.12.")
+                or not os.path.isfile(runtime_path)):
+            raise ValueError("所选 Windows 包未通过管理员代理完整性检查")
+        return executable
 
     def unlock_elevation_broker(self, password: str) -> ElevationBrokerResult:
         status = self.elevation_broker_status()
@@ -2202,24 +2251,58 @@ class WindowsPlatform:
             return False
 
     @staticmethod
-    def pick_path(kind: Literal["dir", "script"]) -> PickResult:
+    def pick_path(kind: Literal["dir", "script", "exe"]) -> PickResult:
+        initialized = False
         try:
-            import tkinter
-            from tkinter import filedialog
-
-            root = tkinter.Tk()
-            root.withdraw()
-            try:
-                path = (
-                    filedialog.askdirectory(title="选择工作目录", mustexist=True)
-                    if kind == "dir"
-                    else filedialog.askopenfilename(title="选择批处理脚本")
+            pythoncom.CoInitialize()
+            initialized = True
+            owner_hwnd = win32gui.GetForegroundWindow()
+            if kind == "dir":
+                selection = shell.SHBrowseForFolder(
+                    owner_hwnd,
+                    None,
+                    "选择工作目录",
+                    shellcon.BIF_RETURNONLYFSDIRS | 0x0040,
                 )
-            finally:
-                root.destroy()
+                pidl = selection[0] if selection else None
+                path = shell.SHGetPathFromIDList(pidl) if pidl else None
+            else:
+                executable = kind == "exe"
+                title = "选择 EXE 程序" if executable else "选择批处理脚本"
+                file_filter = (
+                    "可执行程序 (*.exe)|*.exe|所有文件 (*.*)|*.*||"
+                    if executable else
+                    "脚本文件 (*.cmd;*.bat;*.ps1;*.py;*.sh;*.command)|"
+                    "*.cmd;*.bat;*.ps1;*.py;*.sh;*.command|"
+                    "所有文件 (*.*)|*.*||"
+                )
+                flags = (
+                    win32con.OFN_FILEMUSTEXIST
+                    | win32con.OFN_PATHMUSTEXIST
+                    | win32con.OFN_HIDEREADONLY
+                    | win32con.OFN_NOCHANGEDIR
+                )
+                owner_window = (
+                    win32ui.CreateWindowFromHandle(owner_hwnd)
+                    if owner_hwnd else None
+                )
+                dialog = win32ui.CreateFileDialog(
+                    True, "exe" if executable else None,
+                    None, flags, file_filter, owner_window,
+                )
+                dialog.SetOFNTitle(title)
+                if dialog.DoModal() != win32con.IDOK:
+                    return PickResult(canceled=True)
+                path = dialog.GetPathName()
         except Exception as exc:
             return PickResult(issue=_issue("picker", "os_error", str(exc)))
-        return PickResult(path=os.path.abspath(path) if path else None, canceled=not bool(path))
+        finally:
+            if initialized:
+                pythoncom.CoUninitialize()
+        return PickResult(
+            path=os.path.abspath(path) if path else None,
+            canceled=not bool(path),
+        )
 
     @staticmethod
     def open_browser(url: str) -> None:

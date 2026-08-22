@@ -1,8 +1,13 @@
+import tempfile
 import unittest
 from unittest import mock
 
 import server
-from localops.docker_resources import DockerActionResult, DockerSnapshot
+from localops.docker_resources import (
+    DockerActionResult,
+    DockerLogResult,
+    DockerSnapshot,
+)
 from localops.platform.contracts import PlatformCapabilities, ScanStatus
 from localops.platform.fake import FakePlatform
 from tests.windows.test_windows_server import HttpHarness
@@ -39,6 +44,10 @@ class FakeDocker:
     def stop(self, resource):
         self.calls.append(("stop", resource))
         return DockerActionResult(True)
+
+    def logs(self, resource, tail):
+        self.calls.append(("logs", (resource, tail)))
+        return DockerLogResult(True, "2026-08-22T12:00:00Z 容器日志")
 
 
 def docker_app():
@@ -93,6 +102,7 @@ class DockerStateTests(unittest.TestCase):
 
 class DockerHttpTests(unittest.TestCase):
     def setUp(self):
+        self.log_dir = tempfile.TemporaryDirectory()
         self.platform = FakePlatform(
             name="windows",
             capabilities=PlatformCapabilities(
@@ -107,18 +117,22 @@ class DockerHttpTests(unittest.TestCase):
         self.principal_patch = mock.patch.object(
             server, "SELF_PRINCIPAL", self.platform.principal
         )
+        self.logs_patch = mock.patch.object(server, "LOGS_DIR", self.log_dir.name)
         self.platform_patch.start()
         self.docker_patch.start()
         self.principal_patch.start()
+        self.logs_patch.start()
         self.harness = HttpHarness()
         self.headers = self.harness.session_headers()
         self.harness.cfg.update(lambda data: data["apps"].append(docker_app()))
 
     def tearDown(self):
         self.harness.close()
+        self.logs_patch.stop()
         self.principal_patch.stop()
         self.docker_patch.stop()
         self.platform_patch.stop()
+        self.log_dir.cleanup()
 
     def test_discovery_endpoint_returns_compose_and_container_resources(self):
         status, body, _ = self.harness.request(
@@ -149,6 +163,17 @@ class DockerHttpTests(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertEqual(self.docker.calls[-1], (
             "stop", {"kind": "container", "containerId": CONTAINER_ID},
+        ))
+
+    def test_app_logs_endpoint_includes_live_docker_logs(self):
+        status, body, _ = self.harness.request(
+            "GET", "/api/apps/deadbeef/logs?tail=25", headers=self.headers,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertIn("容器日志", body["text"])
+        self.assertEqual(self.docker.calls[-1], (
+            "logs", ({"kind": "container", "containerId": CONTAINER_ID}, 25),
         ))
 
 

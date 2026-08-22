@@ -92,6 +92,22 @@ class WindowsServerTests(unittest.TestCase):
         self.assertEqual((status, body["code"]), (500, "PICKER_UNAVAILABLE"))
         self.assertNotIn("sensitive detail", body["error"])
 
+    def test_exe_picker_returns_direct_command_contract(self):
+        executable = os.path.join(self.harness.temp_dir.name, "工具.exe")
+        with open(executable, "wb") as handle:
+            handle.write(b"fixture")
+        with mock.patch.object(
+                server.PLATFORM, "pick_path",
+                return_value=PickResult(path=executable)):
+            status, body, _ = self.harness.request(
+                "POST", "/api/pick", {"what": "exe"}, self.headers
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["path"], os.path.abspath(executable))
+        self.assertEqual(body["commandSpec"]["mode"], "direct")
+        self.assertEqual(body["commandSpec"]["executable"], os.path.abspath(executable))
+
     def test_create_and_cwd_update_derive_import_status(self):
         runtime = os.path.join(self.harness.temp_dir.name, "runner.exe")
         with open(runtime, "wb") as handle:

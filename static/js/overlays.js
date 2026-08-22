@@ -92,6 +92,7 @@ confirmMask.addEventListener('mousedown', e => { if (e.target === confirmMask) c
    管理员启动代理：首次安装或当前会话解锁
    ============================================================ */
 let brokerPasswordMode = 'unlock';
+const BROKER_INTERACTIVE_TIMEOUT_MS = 180000;
 
 export function openBrokerPassword() {
   const broker = (state.data && state.data.elevationBroker) || {};
@@ -99,7 +100,7 @@ export function openBrokerPassword() {
   const installing = brokerPasswordMode === 'install';
   setText(brokerPasswordTitle, installing ? '安装管理员启动代理' : '解锁管理员启动');
   setText(brokerPasswordNote, installing
-    ? '首次安装会显示一次 Windows UAC。密码仅保存为不可逆 verifier。'
+    ? '首次安装会显示一次 Windows UAC；源码模式会先选择完整的 Windows 版 LocalOps.exe。密码仅保存为不可逆 verifier。'
     : '密码只解锁当前 Local Ops 进程；退出后需要重新输入。');
   brokerPasswordConfirmField.hidden = !installing;
   brokerPassword.value = '';
@@ -125,7 +126,30 @@ async function submitBrokerPassword() {
     const endpoint = brokerPasswordMode === 'install'
       ? '/api/windows/elevation-broker/install'
       : '/api/windows/elevation-broker/unlock';
-    const result = await act(post(endpoint, { password }));
+    let result;
+    try {
+      result = await post(
+        endpoint, { password },
+        brokerPasswordMode === 'install' ? BROKER_INTERACTIVE_TIMEOUT_MS : undefined,
+      );
+    } catch (error) {
+      await act(Promise.reject(error));
+      return;
+    }
+    if (brokerPasswordMode === 'install'
+        && result && result.code === 'BROKER_PACKAGE_REQUIRED') {
+      const selected = await act(post(
+        '/api/pick', { what: 'exe' }, BROKER_INTERACTIVE_TIMEOUT_MS,
+      ));
+      if (!selected || selected.ok === false || selected.canceled) return;
+      result = await act(post(
+        endpoint,
+        { password, packageExecutable: selected.path },
+        BROKER_INTERACTIVE_TIMEOUT_MS,
+      ));
+    } else {
+      result = await act(result);
+    }
     if (!result || result.ok === false) return;
     if (brokerPasswordMode === 'install') {
       const unlocked = await act(post(
@@ -1094,7 +1118,9 @@ export function initAppModal({ onAddService, onAddTask, onAddProgram }) {
   btnPickScript.addEventListener('click', async () => {
     btnPickScript.disabled = true;
     try {
-      const r = await act(post('/api/pick', { what: 'script' }));
+      const r = await act(post('/api/pick', {
+        what: modalKind === 'program' ? 'exe' : 'script',
+      }));
       if (!r || r.canceled || !r.path) return;  // 取消或失败均静默
       if (!r.command || !r.commandSpec) {
         toast('选择结果缺少结构化命令，请刷新总控台后重试');
@@ -1258,7 +1284,7 @@ async function fetchLogs(appId, requestSeq) {
     const firstLoad = logPre.textContent === '加载中…';
     const nearBottom = firstLoad ||
       logBody.scrollHeight - logBody.scrollTop - logBody.clientHeight < 48;
-    const text = j.text || '';
+    const text = j.text || '暂无日志';
     /* 增量追加新行：全量重写会打断用户选区并让滚动位置漂移。 */
     const previous = firstLoad ? '' : logPre.textContent;
     if (previous && text.startsWith(previous)) {

@@ -37,6 +37,14 @@ class DockerActionResult:
     code: str | None = None
 
 
+@dataclass(frozen=True)
+class DockerLogResult:
+    ok: bool
+    text: str = ""
+    error: str | None = None
+    code: str | None = None
+
+
 def _absolute_path(value: object, label: str) -> str:
     if not isinstance(value, str) or not value or "\x00" in value:
         raise ValueError(f"{label} must be a non-empty absolute path")
@@ -234,3 +242,36 @@ class DockerController:
 
     def stop(self, resource: object) -> DockerActionResult:
         return self._control(resource, False)
+
+    def logs(self, value: object, tail: int) -> DockerLogResult:
+        try:
+            resource = normalize_docker_resource(value)
+            if not isinstance(tail, int) or isinstance(tail, bool) or not 1 <= tail <= 5000:
+                raise ValueError("tail must be between 1 and 5000")
+            if resource["kind"] == "container":
+                args = [
+                    "container", "logs", "--timestamps", "--tail", str(tail),
+                    str(resource["containerId"]),
+                ]
+            else:
+                args = self._compose_args(resource)
+                args.extend([
+                    "logs", "--no-color", "--timestamps", "--tail", str(tail),
+                ])
+            result = self._run([self.executable, *args], 30.0)
+            stdout = str(getattr(result, "stdout", "") or "").rstrip()
+            stderr = str(getattr(result, "stderr", "") or "").rstrip()
+            if int(getattr(result, "returncode", 1)) != 0:
+                return DockerLogResult(
+                    False, error=stderr or stdout or "Docker log command failed",
+                    code="DOCKER_LOG_FAILED",
+                )
+            return DockerLogResult(
+                True, "\n".join(part for part in (stdout, stderr) if part)
+            )
+        except FileNotFoundError as exc:
+            return DockerLogResult(False, error=str(exc), code="DOCKER_CLI_MISSING")
+        except subprocess.TimeoutExpired as exc:
+            return DockerLogResult(False, error=str(exc), code="DOCKER_TIMEOUT")
+        except (OSError, TypeError, ValueError) as exc:
+            return DockerLogResult(False, error=str(exc), code="DOCKER_LOG_FAILED")

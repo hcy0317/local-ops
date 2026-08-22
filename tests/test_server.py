@@ -715,7 +715,45 @@ class RuntimeStorageTests(unittest.TestCase):
             log_path = os.path.join(logs, "console.log")
             with open(log_path, encoding="utf-8") as f:
                 self.assertEqual(f.read(), "launcher-log-ready\n")
-            self.assertEqual(os.stat(log_path).st_mode & 0o777, 0o600)
+            if os.name == "nt":
+                server.PLATFORM.verify_private_file(log_path)
+            else:
+                self.assertEqual(os.stat(log_path).st_mode & 0o777, 0o600)
+
+    @unittest.skipUnless(os.name == "nt", "Windows headless stdio only")
+    def test_source_file_logging_replaces_absent_windows_stdio(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = os.path.join(td, "custom-data")
+            logs = os.path.join(td, "custom-logs")
+            env = dict(
+                os.environ,
+                CONSOLE_DATA_DIR=target,
+                CONSOLE_LOG_DIR=logs,
+            )
+            script = (
+                "import server, sys; "
+                "server.prepare_runtime_storage(); "
+                "sys.stdout = None; sys.stderr = None; "
+                "server.redirect_console_output(); "
+                "print('headless-log-ready', flush=True)"
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", script], cwd=server.BASE_DIR,
+                env=env, capture_output=True, text=True, timeout=5,
+            )
+
+            self.assertEqual(result.returncode, 0)
+            with open(os.path.join(logs, "console.log"), encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "headless-log-ready\n")
+
+    def test_source_console_options_can_enable_private_file_logging(self):
+        preferred, open_browser, log_to_file = server.parse_source_console_options([
+            "server.py", "--no-browser", "--preferred-port", "9603",
+        ], platform_name="windows")
+
+        self.assertEqual(preferred, 9603)
+        self.assertFalse(open_browser)
+        self.assertTrue(log_to_file)
 
     def test_redirected_legacy_stdio_does_not_crash_localized_startup(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1163,6 +1201,30 @@ class LogTests(unittest.TestCase):
             with open(path, "ab") as f:
                 f.write(b"five\nsix\n")
             self.assertEqual(server.read_log_tail("a", 3), "four\nfive\nsix")
+
+    def test_tail_decodes_legacy_windows_code_page(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(server, "LOGS_DIR", td):
+            path = os.path.join(td, "legacy.log")
+            expected = "信息: 计划任务启动失败"
+            with open(path, "wb") as handle:
+                handle.write((expected + "\r\n").encode("gbk"))
+
+            self.assertEqual(server.read_log_tail("legacy", 10), expected)
+
+    def test_tail_decodes_mixed_legacy_and_utf8_lines(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(server, "LOGS_DIR", td):
+            path = os.path.join(td, "mixed.log")
+            legacy = "信息: 旧计划任务失败"
+            current = "[Local Ops] Windows 计划任务启动成功"
+            with open(path, "wb") as handle:
+                handle.write((legacy + "\r\n").encode("gbk"))
+                handle.write((current + "\n").encode("utf-8"))
+
+            self.assertEqual(
+                server.read_log_tail("mixed", 10), legacy + "\n" + current
+            )
 
 
 class IconTests(unittest.TestCase):

@@ -100,7 +100,7 @@ export function openBrokerPassword() {
   const installing = brokerPasswordMode === 'install';
   setText(brokerPasswordTitle, installing ? '安装管理员启动代理' : '解锁管理员启动');
   setText(brokerPasswordNote, installing
-    ? '首次安装会显示一次 Windows UAC；源码模式会先选择完整的 Windows 版 LocalOps.exe。密码仅保存为不可逆 verifier。'
+    ? '首次安装会显示一次 Windows UAC；系统会自动使用已部署的 Windows 伴随包，未找到时才需手动选择。密码仅保存为不可逆 verifier。'
     : '密码只解锁当前 Local Ops 进程；退出后需要重新输入。');
   brokerPasswordConfirmField.hidden = !installing;
   brokerPassword.value = '';

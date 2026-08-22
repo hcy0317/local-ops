@@ -1108,19 +1108,25 @@ class WindowsPlatform:
             self, password_record: Mapping[str, object],
             package_executable: str | None = None) -> ElevationBrokerResult:
         frozen = bool(getattr(sys, "frozen", False))
-        if not frozen and not package_executable:
+        if frozen:
+            source_executable = os.path.abspath(sys.executable)
+        elif package_executable:
+            try:
+                source_executable = self._validate_broker_package_executable(
+                    package_executable
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                return ElevationBrokerResult(
+                    False, str(exc), "BROKER_PACKAGE_INVALID"
+                )
+        else:
+            source_executable = self._discover_deployed_broker_package()
+        if source_executable is None:
             return ElevationBrokerResult(
                 False,
-                "请选择已解压的 Windows 版 LocalOps.exe 作为管理员代理伴随程序",
+                "未找到已部署的 Windows 管理员代理伴随包",
                 "BROKER_PACKAGE_REQUIRED",
             )
-        try:
-            source_executable = (
-                os.path.abspath(sys.executable) if frozen
-                else self._validate_broker_package_executable(package_executable)
-            )
-        except (OSError, TypeError, ValueError) as exc:
-            return ElevationBrokerResult(False, str(exc), "BROKER_PACKAGE_INVALID")
         transaction = None
         process_handle = None
         reset_previous = os.environ.get("PYINSTALLER_RESET_ENVIRONMENT")
@@ -1240,6 +1246,42 @@ class WindowsPlatform:
                 or not os.path.isfile(runtime_path)):
             raise ValueError("所选 Windows 包未通过管理员代理完整性检查")
         return executable
+
+    def _discover_deployed_broker_package(self) -> str | None:
+        def child_directories(path: str) -> list[str]:
+            directories = []
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    if entry.is_dir(follow_symlinks=False):
+                        directories.append(entry.path)
+                    if len(directories) >= 64:
+                        break
+            return directories
+
+        data_root = os.path.dirname(self.runtime_paths().runtime_dir)
+        packages_root = os.path.join(data_root, "packages")
+        candidates: list[str] = []
+        try:
+            for release in child_directories(packages_root):
+                candidates.append(os.path.join(release, "LocalOps.exe"))
+                candidates.extend(
+                    os.path.join(bundle, "LocalOps.exe")
+                    for bundle in child_directories(release)
+                )
+        except OSError:
+            return None
+        ranked = []
+        for candidate in candidates:
+            try:
+                ranked.append((os.path.getmtime(candidate), candidate))
+            except OSError:
+                continue
+        for _, candidate in sorted(ranked, reverse=True):
+            try:
+                return self._validate_broker_package_executable(candidate)
+            except (OSError, TypeError, ValueError):
+                continue
+        return None
 
     def unlock_elevation_broker(self, password: str) -> ElevationBrokerResult:
         status = self.elevation_broker_status()

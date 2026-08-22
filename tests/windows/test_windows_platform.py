@@ -36,6 +36,26 @@ class WindowsPlatformTests(unittest.TestCase):
     def setUp(self):
         self.platform = WindowsPlatform(os.getcwd(), "server.py")
 
+    @staticmethod
+    def _write_broker_package(bundle: Path) -> Path:
+        internal = bundle / "_internal"
+        internal.mkdir(parents=True)
+        executable = bundle / "LocalOps.exe"
+        executable.write_bytes(b"packaged-local-ops")
+        (internal / "python312.dll").write_bytes(b"runtime")
+        (internal / "VERSION").write_text("1.0.0\n", encoding="utf-8")
+        (bundle / "BUILD-INFO.json").write_text(json.dumps({
+            "architecture": "x64",
+            "elevationBrokerDispatch": "-m localops.windows.elevation_broker",
+            "entrypoint": "localops.windows.packaged_entry",
+            "packaging": "PyInstaller onedir windowed",
+            "product": "Local Ops Console",
+            "pythonVersion": "3.12.13",
+            "schemaVersion": 1,
+            "version": "1.0.0",
+        }), encoding="utf-8")
+        return executable
+
     def test_source_venv_runner_uses_base_process_with_venv_context(self):
         venv_python = r"C:\fixture\.venv\Scripts\python.exe"
         base_python = r"C:\Python312\python.exe"
@@ -504,22 +524,7 @@ class WindowsPlatformTests(unittest.TestCase):
     def test_source_broker_install_uses_selected_packaged_companion(self):
         with tempfile.TemporaryDirectory() as root:
             bundle = Path(root) / "LocalOps-1.0.0-windows-x64"
-            internal = bundle / "_internal"
-            internal.mkdir(parents=True)
-            executable = bundle / "LocalOps.exe"
-            executable.write_bytes(b"packaged-local-ops")
-            (internal / "python312.dll").write_bytes(b"runtime")
-            (internal / "VERSION").write_text("1.0.0\n", encoding="utf-8")
-            (bundle / "BUILD-INFO.json").write_text(json.dumps({
-                "architecture": "x64",
-                "elevationBrokerDispatch": "-m localops.windows.elevation_broker",
-                "entrypoint": "localops.windows.packaged_entry",
-                "packaging": "PyInstaller onedir windowed",
-                "product": "Local Ops Console",
-                "pythonVersion": "3.12.13",
-                "schemaVersion": 1,
-                "version": "1.0.0",
-            }), encoding="utf-8")
+            executable = self._write_broker_package(bundle)
             runtime_dir = Path(root) / "runtime"
 
             def approve_install(**kwargs):
@@ -551,6 +556,43 @@ class WindowsPlatformTests(unittest.TestCase):
             )
             parameters = shell_execute.call_args.kwargs["lpParameters"]
             self.assertIn("localops.windows.elevation_broker", parameters)
+
+    def test_source_broker_install_auto_discovers_deployed_package(self):
+        with tempfile.TemporaryDirectory() as root:
+            bundle = (
+                Path(root) / "packages" / "1.0.0-audited"
+                / "LocalOps-1.0.0-windows-x64"
+            )
+            executable = self._write_broker_package(bundle)
+            runtime_dir = Path(root) / "runtime"
+
+            def approve_install(**kwargs):
+                request_path = next(
+                    (runtime_dir / "elevation-install").glob("*/request.json")
+                )
+                (request_path.parent / "response.json").write_text(
+                    '{"ok": true}', encoding="utf-8"
+                )
+                return {}
+
+            with mock.patch.object(
+                    self.platform, "runtime_paths",
+                    return_value=SimpleNamespace(runtime_dir=str(runtime_dir))), \
+                    mock.patch.object(
+                        self.platform, "ensure_private_directory"), \
+                    mock.patch.object(self.platform, "ensure_private_file"), \
+                    mock.patch.object(self.platform, "verify_private_file"), \
+                    mock.patch.object(
+                        windows_adapter.shell, "ShellExecuteEx",
+                        side_effect=approve_install) as shell_execute:
+                result = self.platform.install_elevation_broker(
+                    {"verifier": "opaque"}
+                )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(
+                shell_execute.call_args.kwargs["lpFile"], str(executable)
+            )
 
     def test_source_broker_install_rejects_incomplete_package_before_uac(self):
         with tempfile.TemporaryDirectory() as root:

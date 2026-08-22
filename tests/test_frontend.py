@@ -272,6 +272,7 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("'/api/windows/elevation-broker/unlock'", overlays)
         self.assertIn("'BROKER_PACKAGE_REQUIRED'", overlays)
         self.assertIn("packageExecutable", overlays)
+        self.assertIn("系统会自动使用已部署的 Windows 伴随包", overlays)
         self.assertRegex(
             overlays,
             r"post\('/api/pick', \{\s*what: modalKind === 'program'"

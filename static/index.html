@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-theme="light">
+<html lang="zh-CN" data-theme="light" data-ui="tactical-editorial">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -67,19 +67,6 @@
           </div>
         </div>
 
-        <nav class="side-nav" id="sideNav" role="tablist" aria-label="主视图">
-          <button class="nav-btn active" id="tab-launchpad" type="button" role="tab" aria-selected="true" aria-controls="view-launchpad" data-view="launchpad">
-            <span class="nav-ic" id="navIconLaunch" aria-hidden="true"></span>
-            <span class="nav-label">启动台</span>
-            <span class="nav-count" id="navCountLaunch"></span>
-          </button>
-          <button class="nav-btn" id="tab-services" type="button" role="tab" aria-selected="false" aria-controls="view-services" tabindex="-1" data-view="services">
-            <span class="nav-ic" id="navIconSvc" aria-hidden="true"></span>
-            <span class="nav-label">服务监控</span>
-            <span class="nav-count" id="navCountSvc"></span>
-          </button>
-        </nav>
-
         <div class="topbar-right">
           <div class="side-stats mono" id="sideStats">—</div>
           <div class="side-controls">
@@ -127,7 +114,7 @@
           </div>
 
           <!-- ===== 启动台视图 ===== -->
-          <section class="view active" id="view-launchpad" role="tabpanel" aria-labelledby="tab-launchpad" aria-hidden="false">
+          <section class="view active" id="view-launchpad" role="tabpanel" aria-label="启动台" aria-hidden="false">
 
             <!-- 启动台概览 -->
             <div class="ov-row" id="lpOvRow">
@@ -166,7 +153,7 @@
               <div class="ov">
                 <span class="ov-icon tone-cyan" data-ov-icon="gauge" aria-hidden="true"></span>
                 <div class="ov-body">
-                  <div class="ov-label">总 CPU</div>
+                  <div class="ov-label">服务 CPU</div>
                   <div class="ov-main"><span class="ov-num ov-mono" id="lpStatCpu">0.0%</span></div>
                   <div class="ov-sub" id="lpStatCpuSub">负载正常</div>
                 </div>
@@ -174,7 +161,7 @@
               <div class="ov">
                 <span class="ov-icon tone-pink" data-ov-icon="memory-stick" aria-hidden="true"></span>
                 <div class="ov-body">
-                  <div class="ov-label">总内存</div>
+                  <div class="ov-label">服务内存</div>
                   <div class="ov-main"><span class="ov-num ov-mono" id="lpStatMem">0.0%</span></div>
                   <div class="ov-sub" id="lpStatMemSub">占用正常</div>
                 </div>
@@ -217,7 +204,7 @@
           </section>
 
           <!-- ===== 服务监控视图 ===== -->
-          <section class="view" id="view-services" role="tabpanel" aria-labelledby="tab-services" aria-hidden="true">
+          <section class="view" id="view-services" role="tabpanel" aria-label="服务监控" aria-hidden="true">
 
             <!-- 全局概览 -->
             <div class="ov-row">
@@ -240,7 +227,7 @@
               <div class="ov">
                 <span class="ov-icon tone-cyan" data-ov-icon="gauge" aria-hidden="true"></span>
                 <div class="ov-body">
-                  <div class="ov-label">总 CPU</div>
+                  <div class="ov-label">服务 CPU</div>
                   <div class="ov-main"><span class="ov-num ov-mono" id="statCpu">0.0%</span></div>
                   <svg class="spark" id="sparkCpu" viewBox="0 0 100 26" preserveAspectRatio="none" aria-hidden="true"><polyline points="" fill="none" /></svg>
                 </div>
@@ -248,7 +235,7 @@
               <div class="ov">
                 <span class="ov-icon tone-purple" data-ov-icon="memory-stick" aria-hidden="true"></span>
                 <div class="ov-body">
-                  <div class="ov-label">总内存</div>
+                  <div class="ov-label">服务内存</div>
                   <div class="ov-main"><span class="ov-num ov-mono" id="statMem">0.0%</span></div>
                   <svg class="spark" id="sparkMem" viewBox="0 0 100 26" preserveAspectRatio="none" aria-hidden="true"><polyline points="" fill="none" /></svg>
                 </div>

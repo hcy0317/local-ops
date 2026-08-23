@@ -1,7 +1,7 @@
 {
   "id": "ops",
-  "name": "Ops 指挥台",
+  "name": "Tactical Editorial Console",
   "author": "总控台",
-  "desc": "深空蓝黑 · 左侧导航轨 · KPI 图标卡 · 迷你负载条 · 实时动态侧栏",
-  "colors": ["#0a0e14", "#131a24", "#5b9dff", "#3ecf8e", "#f5b544"]
+  "desc": "战术编辑式排版 · 硬网格 · 连续遥测带 · 克制状态色",
+  "colors": ["#0d0d0c", "#171715", "#85aef2", "#5bc495", "#e7b65d"]
 }

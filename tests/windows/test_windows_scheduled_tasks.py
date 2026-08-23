@@ -452,6 +452,25 @@ class ScheduledTaskHttpTests(unittest.TestCase):
         self.assertIn("任务已完成 (Event 102) · 结果 0x00000001", body["text"])
         self.assertFalse(body["taskHistory"]["enabled"])
 
+    def test_diagnosis_reports_structured_scheduler_failure(self):
+        failed = task_row("ready")
+        failed["lastResult"] = 1
+        self.platform.scheduled = ScheduledTaskSnapshot(
+            ScanStatus.OK, {TASK_PATH.casefold(): failed}
+        )
+
+        status, body, _ = self.harness.request(
+            "POST", "/api/apps/deadbeef/diagnose", {}, self.headers,
+        )
+
+        self.assertEqual(status, 200)
+        issue = next(
+            item for item in body["issues"]
+            if item["kind"] == "scheduled-task-failed"
+        )
+        self.assertIn("0x00000001", issue["detail"])
+        self.assertNotIn("暂无日志", body["summary"])
+
     def test_history_endpoint_enables_windows_operational_log(self):
         status, body, _ = self.harness.request(
             "POST",

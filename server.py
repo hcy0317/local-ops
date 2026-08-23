@@ -2404,6 +2404,7 @@ def build_state(cfg, console_port, config_health=None):
         "consolePort": console_port,
         "consolePid": SELF_PID,
         "consoleCwd": BASE_DIR,
+        "logicalCpuCount": max(1, os.cpu_count() or 1),
         "version": APP_VERSION,
         "schemaVersion": cfg.get("schemaVersion", CURRENT_SCHEMA_VERSION),
         "platform": platform_name,
@@ -4407,6 +4408,7 @@ def scheduled_task_log_data(app, count):
     if not isinstance(task, dict) or task.get("state") == "missing":
         lines.append("[Local Ops] Windows 计划任务不存在：%s" % path)
         return lines, meta
+    meta["state"] = str(task.get("state") or "unknown")
     state_label = {
         "ready": "就绪", "running": "运行中", "queued": "排队中",
         "disabled": "已禁用", "missing": "不存在", "unknown": "未知",
@@ -4417,12 +4419,14 @@ def scheduled_task_log_data(app, count):
     ])
     last_run = task.get("lastRunAt")
     if isinstance(last_run, (int, float)) and not isinstance(last_run, bool):
+        meta["lastRunAt"] = last_run
         lines.append("上次运行：%s" % time.strftime(
             "%Y-%m-%d %H:%M:%S", time.localtime(last_run)
         ))
     result = task.get("lastResult")
     if isinstance(result, int) and not isinstance(result, bool):
         unsigned = result & 0xFFFFFFFF
+        meta["lastResult"] = unsigned
         if unsigned == 0:
             result_label = "成功"
         elif unsigned == 0x00041301:
@@ -4630,7 +4634,11 @@ def diagnose_app(cfg, app):
     last_exit = app.get("lastExit") or {}
     code = last_exit.get("code")
     port = app.get("port")
-    log_tail = read_log_tail(app_id, 150) if app_id else ""
+    log_payload = read_app_log_payload(app, 150) if app_id else {
+        "text": "", "taskHistory": {"applicable": False},
+    }
+    log_tail = log_payload["text"]
+    task_history = log_payload.get("taskHistory") or {}
     log_lower = log_tail.lower()
 
     # ---- 配置层检查（不依赖日志） ----
@@ -4695,6 +4703,17 @@ def diagnose_app(cfg, app):
         add("pip-missing", "缺少 Python 包：%s" % m.group(1),
             "日志报 ModuleNotFoundError: No module named '%s'。" % m.group(1),
             "建议在项目目录建虚拟环境再装：python3 -m venv .venv && .venv/bin/pip install %s" % m.group(1))
+
+    task_result = task_history.get("lastResult")
+    if (task_history.get("applicable") and isinstance(task_result, int)
+            and not isinstance(task_result, bool)
+            and task_result not in (0, 0x00041301)):
+        add(
+            "scheduled-task-failed",
+            "Windows 计划任务最近一次运行失败",
+            "Task Scheduler 最近结果为 0x%08X。" % task_result,
+            "打开完整日志查看运行时间线，并检查任务动作、账户权限与脚本退出码。",
+        )
 
     if re.search(r"no such file or directory", log_lower) and not issues:
         add("file-missing", "命令里的文件/脚本不存在",

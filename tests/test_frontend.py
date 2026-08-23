@@ -131,6 +131,85 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn(".tbl .tr.th > * { display: block !important; }", css)
         self.assertNotIn(".tbl .tr.th { display: none; }", css)
 
+    def test_tactical_editorial_console_uses_rigid_operational_grid(self):
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+        ops = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
+        base = (ROOT / "static/base.css").read_text(encoding="utf-8")
+
+        self.assertIn('data-ui="tactical-editorial"', html)
+        self.assertIn("--panel-radius: 2px;", ops)
+
+        headline = theme_block(ops, ".view-head h2")
+        self.assertIn("font-size: 64px", headline)
+
+        overview = theme_block(ops, ".ov-row")
+        self.assertIn("gap: 1px", overview)
+        self.assertIn("border: 1px solid var(--line-2)", overview)
+
+        grid = theme_block(ops, ".app-grid")
+        self.assertIn("gap: 1px", grid)
+        self.assertIn("border: 1px solid var(--line-2)", grid)
+
+        empty_grid_action = theme_block(
+            ops,
+            ".app-grid > .add-card:only-child",
+        )
+        self.assertIn("grid-column: 1 / -1", empty_grid_action)
+        self.assertIn("min-height: 112px", empty_grid_action)
+
+        card = theme_block(ops, ".app-card")
+        self.assertIn("border-radius: var(--panel-radius)", card)
+        self.assertNotIn("border-top", card)
+        self.assertNotIn("box-shadow", theme_block(ops, ".app-card:hover"))
+        self.assertNotIn(".app-card.running { border-top-color", ops)
+        self.assertNotIn(".app-card.has-error { border-top-color", ops)
+        self.assertNotIn(".view-head::before", ops)
+
+        texture = theme_block(ops, "body::before")
+        self.assertIn("position: fixed", texture)
+        self.assertIn("pointer-events: none", texture)
+
+        telemetry = theme_block(base, ".side-stack")
+        self.assertIn("gap: 1px", telemetry)
+        self.assertIn("border: 1px solid var(--line-2)", telemetry)
+
+    def test_tactical_editorial_motion_is_visible_and_reduced_motion_safe(self):
+        ops = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
+        core = (ROOT / "static/js/core.js").read_text(encoding="utf-8")
+
+        self.assertIn("@keyframes telemetry-sweep", ops)
+        self.assertIn("@keyframes status-pulse", ops)
+        self.assertIn("@keyframes signal-enter", ops)
+        self.assertIn("@keyframes signal-exit", ops)
+        self.assertIn("@keyframes view-out", ops)
+        self.assertIn("animation: telemetry-sweep 7s", ops)
+        self.assertIn("animation: status-pulse 2.4s", ops)
+        self.assertIn(
+            "node.classList.remove('flash');\n"
+            "  void node.offsetWidth;\n"
+            "  node.classList.add('flash');",
+            core,
+        )
+        self.assertIn("node.classList.add('anim-out')", core)
+        self.assertIn("node.remove()", core)
+
+        app = (ROOT / "static/app.js").read_text(encoding="utf-8")
+        self.assertIn("classList.add('is-leaving')", app)
+
+        card_marker = theme_block(ops, ".app-card::before")
+        self.assertIn("transform: scaleY(0)", card_marker)
+        self.assertIn(
+            "transform: scaleY(1)",
+            theme_block(ops, ".app-card:hover::before"),
+        )
+
+        self.assertRegex(
+            ops,
+            r"(?s)@media \(prefers-reduced-motion: reduce\)\s*\{.*?"
+            r"\.ov-row::after,\s*\.status-dot\.running::after\s*"
+            r"\{[^}]*display:\s*none;",
+        )
+
     def test_focus_indicators_avoid_hard_double_rings(self):
         base = (ROOT / "static/base.css").read_text(encoding="utf-8")
 
@@ -188,6 +267,30 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
                     4.5,
                 )
 
+    def test_light_theme_uses_high_contrast_cool_neutrals(self):
+        ops = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
+        light = theme_token_block(ops, "light")
+        room = css_variable(light, "room")
+        card = css_variable(light, "card")
+
+        self.assertGreaterEqual(int(room[5:7], 16), int(room[1:3], 16))
+        self.assertGreaterEqual(int(card[5:7], 16), int(card[1:3], 16))
+        for name, minimum in (
+            ("ink", 12.0),
+            ("ink-2", 8.0),
+            ("ink-3", 5.5),
+            ("ink-4", 4.5),
+            ("accent", 5.0),
+            ("green", 4.5),
+            ("red", 4.5),
+            ("amber", 4.5),
+        ):
+            with self.subTest(token=name):
+                self.assertGreaterEqual(
+                    contrast_ratio(css_variable(light, name), card),
+                    minimum,
+                )
+
     def test_linked_service_action_edits_instead_of_duplicating(self):
         source = (ROOT / "static/js/services.js").read_text(encoding="utf-8")
         self.assertIn("if (s.appId)", source)
@@ -242,6 +345,22 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("'toggle_scheduled_tasks'", launchpad)
         self.assertIn("'/scheduled-enabled'", launchpad)
         self.assertIn("'stop_scheduled_tasks'", app)
+
+    def test_scheduled_task_ready_state_is_distinct_from_running(self):
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        ops = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
+
+        self.assertIn("const scheduledReady = isScheduled", launchpad)
+        self.assertIn("classList.toggle('ready', scheduledReady && !dotFailure)", launchpad)
+        self.assertIn(
+            "classList.toggle('success', taskSucceeded && !isScheduled && !dotFailure)",
+            launchpad,
+        )
+
+        ready = theme_block(ops, ".status-dot.ready")
+        self.assertIn("background: var(--amber)", ready)
+        self.assertNotIn(".status-dot.ready::after", ops)
+        self.assertIn("animation: status-pulse", theme_block(ops, ".status-dot.running::after"))
 
     def test_docker_compose_and_container_resources_are_selectable_and_controllable(self):
         html = (ROOT / "static/index.html").read_text(encoding="utf-8")
@@ -572,6 +691,73 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("title: '添加批处理任务'", app)
         self.assertIn("row.tabIndex = -1", app)
 
+    def test_topbar_does_not_duplicate_primary_view_navigation(self):
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+        app = (ROOT / "static/app.js").read_text(encoding="utf-8")
+        widgets = (ROOT / "static/js/widgets.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="rail-launchpad"', html)
+        self.assertIn('id="rail-services"', html)
+        for obsolete_id in (
+            'id="sideNav"',
+            'id="tab-launchpad"',
+            'id="tab-services"',
+        ):
+            self.assertNotIn(obsolete_id, html)
+        self.assertIn('id="view-launchpad" role="tabpanel" aria-label="启动台"', html)
+        self.assertIn('id="view-services" role="tabpanel" aria-label="服务监控"', html)
+        for obsolete_binding in (
+            "const sideNav",
+            "navBtns",
+            "navCountLaunch",
+            "navCountSvc",
+            "navIconLaunch",
+            "navIconSvc",
+        ):
+            self.assertNotIn(obsolete_binding, app)
+        self.assertIn("const tab = $('#rail-services')", widgets)
+        self.assertNotIn("const tab = $('#tab-services')", widgets)
+
+    def test_command_search_and_quick_actions_share_one_width_track(self):
+        ops = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
+        base = (ROOT / "static/base.css").read_text(encoding="utf-8")
+
+        command_column = theme_block(ops, ".vh-right")
+        self.assertIn("width: min(100%, 400px)", command_column)
+        self.assertIn("flex: 0 1 400px", command_column)
+        self.assertIn("padding-top: 28px", command_column)
+        self.assertIn("width: 100%", theme_block(ops, ".cmdk-trigger"))
+
+        actions = theme_block(base, ".quick-actions")
+        self.assertIn("display: grid", actions)
+        self.assertIn("grid-template-columns: repeat(4, minmax(0, 1fr))", actions)
+        self.assertIn("width: 100%", actions)
+        self.assertIn("justify-content: center", theme_block(base, ".qa-chip"))
+        self.assertRegex(
+            ops,
+            r"(?s)@media \(max-width: 900px\)\s*\{.*?"
+            r"\.vh-right\s*\{[^}]*padding-top:\s*0;",
+        )
+
+    def test_service_kpi_sparklines_do_not_change_row_height(self):
+        ops = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
+        base = (ROOT / "static/base.css").read_text(encoding="utf-8")
+
+        kpi = theme_block(ops, ".ov")
+        self.assertIn("height: 92px", kpi)
+        self.assertNotIn("min-height", kpi)
+
+        spark = theme_block(base, ".spark")
+        for declaration in (
+            "position: absolute",
+            "left: 58px",
+            "right: 16px",
+            "bottom: 9px",
+            "height: 14px",
+            "margin: 0",
+        ):
+            self.assertIn(declaration, spark)
+
     def test_launchpad_cards_have_keyboard_sorting_contract(self):
         html = (ROOT / "static/index.html").read_text(encoding="utf-8")
         source = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
@@ -581,6 +767,71 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("finishKeyboardSort(false)", source)
         self.assertIn("pointercancel', onCancel", source)
         self.assertNotIn("pointercancel', onUp", source)
+
+    def test_add_cards_stay_after_existing_cards(self):
+        source = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        for statement in (
+            "svcGrid.append(addSvc)",
+            "taskGrid.append(addTask)",
+            "programGrid.append(addProgram)",
+        ):
+            self.assertIn(statement, source)
+        for statement in (
+            "svcGrid.prepend(addSvc)",
+            "taskGrid.prepend(addTask)",
+            "programGrid.prepend(addProgram)",
+        ):
+            self.assertNotIn(statement, source)
+
+    def test_launchpad_cards_expose_runtime_and_privilege_sources(self):
+        source = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        ops = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
+
+        self.assertIn("runtimeBadge = el('span', 'runtime-badge')", source)
+        for runtime_class in (
+            "runtime-managed",
+            "runtime-task",
+            "runtime-scheduled",
+            "runtime-docker",
+            "runtime-program",
+            "runtime-elevated",
+        ):
+            self.assertIn("classList.toggle('" + runtime_class + "'", source)
+            self.assertIn(".app-card." + runtime_class, ops)
+        for label in (
+            "本地受管",
+            "本地任务",
+            "计划任务",
+            "Docker",
+            "常规启动",
+            "管理员启动",
+        ):
+            self.assertIn(label, source)
+
+    def test_service_load_kpis_name_their_scope_and_deduplicate_pids(self):
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        services = (ROOT / "static/js/services.js").read_text(encoding="utf-8")
+
+        self.assertEqual(html.count('<div class="ov-label">服务 CPU</div>'), 2)
+        self.assertEqual(html.count('<div class="ov-label">服务内存</div>'), 2)
+        self.assertNotIn('<div class="ov-label">总 CPU</div>', html)
+        self.assertNotIn('<div class="ov-label">总内存</div>', html)
+        self.assertIn("const seenPids = new Set()", launchpad)
+        self.assertIn("const seenPids = new Set()", services)
+
+    def test_service_cpu_kpis_normalize_for_logical_core_capacity(self):
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        services = (ROOT / "static/js/services.js").read_text(encoding="utf-8")
+        widgets = (ROOT / "static/js/widgets.js").read_text(encoding="utf-8")
+
+        for source in (launchpad, services, widgets):
+            self.assertIn("normalizeHostCpuPercent", source)
+            self.assertIn("logicalCpuCount", source)
+            self.assertIn("navigator.hardwareConcurrency", source)
+        self.assertIn("serviceCpuPercent(svc.cpu)", services)
+        self.assertIn("serviceCpuPercent(w.cpu)", services)
+        self.assertIn("const seenPids = new Set()", widgets)
 
     def test_optional_appearance_section_and_unified_brand_assets_exist(self):
         html = (ROOT / "static/index.html").read_text(encoding="utf-8")

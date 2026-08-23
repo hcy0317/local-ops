@@ -264,7 +264,6 @@
   }
 
   .btn,
-  .nav-btn,
   .console-control,
   .cmdk-trigger,
   .kind-btn,
@@ -485,30 +484,59 @@
 
 /* ---------- 左侧导航轨 ---------- */
 .rail {
-  flex: none; width: 88px;
+  position: relative;
+  flex: none; width: 76px;
   display: flex; flex-direction: column;
   background: var(--card);
-  border-right: 1px solid var(--line);
+  border-right: 1px solid var(--line-2);
+  overflow: hidden;
+}
+.rail::after {
+  content: '';
+  position: absolute;
+  inset: 0 0 0 auto;
+  width: 3px;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    0deg,
+    var(--line-2) 0,
+    var(--line-2) 1px,
+    transparent 1px,
+    transparent 7px
+  );
+  opacity: 0.58;
 }
 .rail-nav {
   display: flex; flex-direction: column; gap: 6px;
   padding: 14px 10px;
 }
 .rail-btn {
+  position: relative;
   display: flex; flex-direction: column; align-items: center; gap: 6px;
   padding: 11px 4px 9px;
-  border: 1px solid transparent; border-radius: 10px;
+  border: 1px solid transparent; border-radius: var(--control-radius);
   color: var(--ink-3);
   font-size: 10.5px; font-weight: 600;
   transition: color 0.13s ease, background-color 0.13s ease, border-color 0.13s ease;
+}
+.rail-btn::before {
+  content: '';
+  position: absolute;
+  inset: 6px auto 6px 0;
+  width: 2px;
+  background: var(--accent);
+  transform: scaleY(0);
+  transition: transform 0.28s var(--ease);
 }
 .rail-btn .ic svg { width: 19px; height: 19px; }
 .rail-btn:hover { color: var(--ink); background: var(--room); }
 .rail-btn.active {
   color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  border-color: color-mix(in srgb, var(--accent) 28%, transparent);
+  background: var(--room);
+  border-color: var(--line-2);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
+.rail-btn.active::before { transform: scaleY(1); }
 .rail-foot {
   margin-top: auto;
   padding: 14px 10px 16px;
@@ -526,8 +554,8 @@
 /* ---------- 内容 + 右侧信息栏 ---------- */
 .main-inner {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 300px;
-  gap: 22px;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 32px;
   align-items: start;
 }
 .content { min-width: 0; }
@@ -536,14 +564,27 @@
   /* 与 .view-head 顶距一致，让首个部件与内容页头同一条水平线 */
   padding-top: 30px;
 }
-.side-stack { display: flex; flex-direction: column; gap: 14px; }
+.side-stack {
+  position: relative;
+  display: flex; flex-direction: column; gap: 1px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--panel-radius);
+  background: var(--line-2);
+  overflow: hidden;
+}
 
 /* ---------- 侧栏小部件 ---------- */
 .widget {
-  border: 1px solid var(--line); border-radius: 12px;
+  border: 0; border-radius: 0;
   background: var(--card);
-  padding: 13px 14px;
+  padding: 16px;
+  transition: background-color 0.24s ease;
 }
+.widget:hover { background: color-mix(in srgb, var(--accent) 3%, var(--card)); }
+.side-stack .widget { animation: signal-enter 0.48s var(--ease) both; }
+.side-stack .widget:nth-child(2) { animation-delay: 70ms; }
+.side-stack .widget:nth-child(3) { animation-delay: 140ms; }
+.side-stack .widget:nth-child(4) { animation-delay: 210ms; }
 .widget-head {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
   margin-bottom: 6px;
@@ -636,16 +677,16 @@
 .mini-tab:hover { color: var(--ink); }
 .mini-tab.active { background: var(--ink); border-color: var(--ink); color: var(--room); }
 
-.quick-list { display: flex; flex-direction: column; gap: 6px; }
+.quick-list { display: flex; flex-direction: column; gap: 0; }
 .quick-item {
   display: flex; align-items: center; gap: 9px;
-  padding: 9px 11px;
-  border: 1px solid var(--line); border-radius: 8px;
-  background: var(--card);
+  padding: 10px 0;
+  border: 0; border-top: 1px solid var(--line); border-radius: 0;
+  background: transparent;
   font-size: 12px; font-weight: 600; color: var(--ink-2);
   transition: all 0.12s ease;
 }
-.quick-item:hover { color: var(--ink); border-color: var(--line-2); }
+.quick-item:hover { color: var(--ink); border-color: var(--line-2); transform: translateX(4px); }
 .quick-item kbd { margin-left: auto; }
 
 /* ---------- 日志中心 ---------- */
@@ -736,41 +777,62 @@
 .ov { display: flex; align-items: flex-start; gap: 12px; }
 .ov-body { flex: 1; min-width: 0; }
 .ov-icon {
-  flex: none; width: 34px; height: 34px;
+  flex: none; width: 30px; height: 30px;
   display: inline-flex; align-items: center; justify-content: center;
-  border-radius: 9px;
-  background: color-mix(in srgb, var(--tone, var(--accent)) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--tone, var(--accent)) 48%, var(--line));
+  border-radius: var(--control-radius);
+  background: transparent;
   color: var(--tone, var(--accent));
+  transition: transform 0.3s var(--ease), border-color 0.2s ease;
 }
+.ov:hover .ov-icon { transform: translateY(-2px) scale(1.06); border-color: var(--tone, var(--accent)); }
 .tone-green { --tone: var(--green); }
 .tone-red { --tone: var(--red); }
 .tone-amber { --tone: var(--amber); }
-.tone-purple { --tone: var(--purple); }
+.tone-purple { --tone: var(--accent); }
 .tone-grey { --tone: var(--ink-3); }
-.tone-blue { --tone: #4f8cff; }
-.tone-cyan { --tone: #22b8cf; }
-.tone-pink { --tone: #e879a9; }
+.tone-blue, .tone-cyan, .tone-pink { --tone: var(--accent); }
 .ov-sub {
   margin-top: 3px;
   font-size: 10px; color: var(--ink-3);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.spark { display: block; width: 100%; height: 26px; margin-top: 6px; }
-.spark polyline { stroke: var(--accent); stroke-width: 1.5; }
-#sparkMem polyline { stroke: var(--purple); }
+.spark {
+  position: absolute;
+  left: 58px;
+  right: 16px;
+  bottom: 9px;
+  display: block;
+  width: auto;
+  height: 14px;
+  margin: 0;
+  pointer-events: none;
+}
+.spark polyline {
+  stroke: var(--accent); stroke-width: 1.5;
+  stroke-dasharray: 8 6;
+  animation: telemetry-dash 6s linear infinite;
+}
+#sparkMem polyline { stroke: var(--accent); }
 
 /* ---------- 视图页头右侧：搜索 + 快捷操作 ---------- */
 .vh-right { gap: 10px; }
-.quick-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.quick-actions {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  width: 100%;
+}
 .qa-chip {
-  display: inline-flex; align-items: center; gap: 6px;
-  height: 30px; padding: 0 12px;
-  border: 1px solid var(--line-2); border-radius: 8px;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  min-width: 0; height: 30px; padding: 0 8px;
+  border: 1px solid var(--line-2); border-radius: var(--control-radius);
   background: var(--card);
   font-size: 12px; font-weight: 600; color: var(--ink-2);
   transition: all 0.12s ease;
 }
-.qa-chip:hover { color: var(--ink); border-color: var(--ink); }
+.qa-chip:hover { color: var(--ink); border-color: var(--ink); transform: translateY(-1px); }
+.qa-chip:active { transform: translateY(1px) scale(0.98); }
 .qa-ic { display: inline-flex; }
 
 /* ---------- 分区过滤芯片（内嵌于分区标签行） ---------- */
@@ -786,7 +848,7 @@
 .fchip {
   display: inline-flex; align-items: center; gap: 6px;
   height: 27px; padding: 0 12px;
-  border: 1px solid var(--line-2); border-radius: 99px;
+  border: 1px solid var(--line-2); border-radius: var(--control-radius);
   background: var(--card);
   font-size: 11px; font-weight: 600; color: var(--ink-3);
   transition: all 0.12s ease;
@@ -817,7 +879,7 @@
 .status-pill {
   display: inline-flex; align-items: center;
   font-family: var(--font-mono); font-size: 9px; font-weight: 700;
-  padding: 2px 8px; border-radius: 99px;
+  padding: 2px 8px; border-radius: var(--control-radius);
   border: 1px solid var(--line-2); color: var(--ink-3);
 }
 .status-pill.on {
@@ -848,6 +910,10 @@
     gap: 14px;
   }
   .side-stack { display: contents; }
+  .side-widgets .widget {
+    border: 1px solid var(--line-2);
+    border-radius: var(--panel-radius);
+  }
 }
 @media (max-width: 1080px) {
   .tbl:not(.tbl-watch) .tr {
@@ -858,5 +924,5 @@
 @media (max-width: 900px) {
   .rail { display: none; }
   .shell-col { height: auto; min-height: 100vh; }
-  .quick-actions { justify-content: flex-start; }
+  .quick-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

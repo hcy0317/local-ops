@@ -45,6 +45,13 @@ class BaselineGoldenTests(unittest.TestCase):
         self.assertIn("platformInfo", state)
         self.assertFalse(state["degraded"])
 
+    def test_state_exposes_logical_cpu_capacity_for_load_normalization(self):
+        with mock.patch.object(server, "PLATFORM", FakePlatform()), \
+                mock.patch.object(server.os, "cpu_count", return_value=32):
+            state = server.build_state(dict(server.Config.DEFAULT), 9600, {})
+
+        self.assertEqual(state["logicalCpuCount"], 32)
+
 
 if __name__ == "__main__":
     unittest.main()

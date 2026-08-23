@@ -8,6 +8,7 @@ import { $, el, setText, setChildren, setKpi, setKpiUnit, icon, iconBtn,
   platformPresentation } from './core.js';
 import { confirmKill, openAppModal } from './overlays.js';
 import { configuredPort, actualPorts } from './ports.js';
+import { normalizeHostCpuPercent } from './metrics.js';
 
 const mineList = $('#mineList'), mineEmpty = $('#mineEmpty');
 const bgHeader = $('#bgHeader'), bgBody = $('#bgBody'), bgList = $('#bgList');
@@ -21,6 +22,13 @@ const statCpu = $('#statCpu'), statMem = $('#statMem'), statWarn = $('#statWarn'
 const portDiscovery = $('#portDiscovery'), portDiscoveryList = $('#portDiscoveryList');
 const portDiscoveryCount = $('#portDiscoveryCount'), portDiscoveryIcon = $('#portDiscoveryIcon');
 let serviceCommandId = 0;
+
+function serviceCpuPercent(value) {
+  const data = state.data || {};
+  return normalizeHostCpuPercent(
+    value, data.logicalCpuCount || navigator.hardwareConcurrency,
+  );
+}
 
 function findSvc(key) {
   return ((state.data && state.data.services) || [])
@@ -342,9 +350,10 @@ function updateServiceRow(row, svc) {
     r.subIcon.removeAttribute('title');
   }
   setText(r.pid, svc.pid ? String(svc.pid) : '—');
+  const cpuPercent = serviceCpuPercent(svc.cpu);
   if (r.ldCpuFill) {
-    const pct = typeof svc.cpu === 'number' && !isNaN(svc.cpu) ? svc.cpu : 0;
-    r.ldCpuFill.style.width = pct <= 0 ? '0%' : Math.max(2, Math.min(100, pct)) + '%';
+    r.ldCpuFill.style.width = cpuPercent <= 0
+      ? '0%' : Math.max(2, cpuPercent) + '%';
   }
   if (svc.port != null) {
     r.port.hidden = false;
@@ -358,7 +367,7 @@ function updateServiceRow(row, svc) {
   const full = svc.cwd || '';
   setText(r.cwd, full ? truncateMiddle(full) : '');
   r.cwd.title = full;
-  setText(r.ldCpu, fmtPct(svc.cpu));
+  setText(r.ldCpu, fmtPct(cpuPercent));
   setText(r.ldMem, fmtPct(svc.mem));
   setText(r.up, fmtUptime(svc.uptimeSec));
   if (r.pin) {
@@ -541,7 +550,7 @@ function updateWatchRow(row, w) {
   r.name.title = w.cmd || w.name || '';
   setText(r.kw, w.keyword || '');
   setText(r.pid, String(w.pid));
-  setText(r.ldCpu, fmtPct(w.cpu));
+  setText(r.ldCpu, fmtPct(serviceCpuPercent(w.cpu)));
   setText(r.ldMem, fmtPct(w.mem));
   setText(r.up, fmtUptime(w.uptimeSec));
   const target = w.name || ('PID ' + w.pid);
@@ -657,10 +666,19 @@ export function renderServices(d, firstRender) {
   }
   /* 全局概览：我的服务负载合计 + 启动台端口警告数 */
   let cpuSum = 0, memSum = 0;
-  for (const s of mine) { cpuSum += s.cpu || 0; memSum += s.mem || 0; }
-  setKpiUnit(statCpu, cpuSum.toFixed(1), '%');
+  const seenPids = new Set();
+  for (const s of mine) {
+    if (seenPids.has(s.pid)) continue;
+    seenPids.add(s.pid);
+    cpuSum += s.cpu || 0;
+    memSum += s.mem || 0;
+  }
+  const cpuPercent = normalizeHostCpuPercent(
+    cpuSum, d.logicalCpuCount || navigator.hardwareConcurrency,
+  );
+  setKpiUnit(statCpu, cpuPercent.toFixed(1), '%');
   setKpiUnit(statMem, memSum.toFixed(1), '%');
-  cpuHistory.push(cpuSum);
+  cpuHistory.push(cpuPercent);
   memHistory.push(memSum);
   if (cpuHistory.length > SPARK_CAP) cpuHistory.shift();
   if (memHistory.length > SPARK_CAP) memHistory.shift();

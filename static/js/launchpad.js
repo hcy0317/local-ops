@@ -13,6 +13,7 @@ import { openConfirm, openAppModal, openLogs, getIconVer,
 import { configuredPort, actualPorts, hasPortMismatch,
   preferredOpenPort, displayedPorts, portIsOpenable } from './ports.js';
 import { lifecyclePayload, lifecycleSnapshot, runLifecycleMutation } from './lifecycle.js';
+import { normalizeHostCpuPercent } from './metrics.js';
 
 const svcGrid = $('#svcGrid'), taskGrid = $('#taskGrid');
 const programGrid = $('#programGrid');
@@ -141,6 +142,10 @@ function createAppCard() {
 
   const meta = el('div', 'app-meta');
   const name = el('div', 'app-name');
+  const titleRow = el('div', 'app-title-row');
+  const runtimeBadge = el('span', 'runtime-badge');
+  runtimeBadge.hidden = true;
+  titleRow.append(name, runtimeBadge);
   const status = el('div', 'app-status');
   const dot = el('span', 'status-dot');
   const stText = el('span', 'st-text');
@@ -150,7 +155,7 @@ function createAppCard() {
   status.append(dot, stText, stPort, stUp);
   const taskHistory = el('div', 'task-history');
   taskHistory.hidden = true;
-  meta.append(name, status, taskHistory);
+  meta.append(titleRow, status, taskHistory);
   head.append(iconBox, meta);
 
   const cmd = el('div', 'app-cmd');
@@ -173,7 +178,7 @@ function createAppCard() {
   actions.append(primary, sub);
 
   card.append(head, cmd, actions);
-  card._r = { iconBox, iconImg, iconGlyph, iconTxt, name, status, dot,
+  card._r = { iconBox, iconImg, iconGlyph, iconTxt, name, runtimeBadge, status, dot,
     stText, stPort, stUp, taskHistory, cmd, primary, copy: bCopy, logs: bLogs,
     diag: bDiag, restart: bRestart, schedule: bSchedule, edit: bEdit, del: bDel };
 
@@ -290,13 +295,42 @@ function updateAppCard(card, app) {
   /* 状态副行：运行态、端口冲突，以及服务/任务上次退出结果。 */
   const kind = app.kind || 'service';
   const isTask = kind === 'task';
+  const isProgram = kind === 'program';
   const isScheduled = app.runtimeSource === 'windowsTaskScheduler';
   const isDocker = app.runtimeSource === 'dockerCompose'
     || app.runtimeSource === 'dockerContainer';
   const isElevated = app.runtimeSource === 'windowsElevationBroker';
+  const managedService = kind === 'service' && !isScheduled && !isDocker
+    && !isElevated;
+  const managedTask = isTask && !isScheduled && !isDocker;
+  const regularProgram = isProgram && !isElevated;
+  const elevatedProgram = isProgram && isElevated;
+  card.classList.toggle('runtime-managed', managedService);
+  card.classList.toggle('runtime-task', managedTask);
+  card.classList.toggle('runtime-scheduled', isScheduled);
+  card.classList.toggle('runtime-docker', isDocker);
+  card.classList.toggle('runtime-program', regularProgram);
+  card.classList.toggle('runtime-elevated', elevatedProgram);
+  const runtimeLabel = managedService ? '本地受管'
+    : managedTask ? '本地任务'
+      : isScheduled ? '计划任务'
+        : isDocker ? 'Docker'
+          : elevatedProgram ? '管理员启动'
+            : regularProgram ? '常规启动' : '';
+  setText(r.runtimeBadge, runtimeLabel);
+  r.runtimeBadge.hidden = !runtimeLabel;
+  r.runtimeBadge.title = managedService ? 'Local Ops 受管服务'
+    : managedTask ? 'Local Ops 本地批处理任务'
+      : isScheduled ? 'Windows 计划任务'
+        : isDocker ? (app.runtimeSource === 'dockerCompose'
+          ? 'Docker Compose' : 'Docker 容器')
+          : elevatedProgram ? '通过管理员代理启动'
+            : regularProgram ? '使用当前用户权限启动' : '';
   const launchOnlyObserved = isElevated && !!app.running;
   const scheduledState = isScheduled && app.scheduledTask
     ? app.scheduledTask.state : '';
+  const scheduledReady = isScheduled
+    && (scheduledState === 'ready' || scheduledState === 'queued');
   const lifecycle = lifecycleSnapshot(app, currentPlatform());
   const taskStatus = isTask && app.lastExit ? taskExitStatus(app.lastExit) : '';
   const taskFinished = isTask && !app.running && !!app.lastExit;
@@ -311,9 +345,6 @@ function updateAppCard(card, app) {
   const platformBlocked = currentPlatform() === 'windows'
     && (compatibilityStatus === 'needs_review' || compatibilityStatus === 'blocked');
   const portMismatch = hasPortMismatch(app);
-  r.dot.classList.toggle('running', !!app.running);
-  r.dot.classList.toggle('success', taskSucceeded);
-  r.dot.classList.toggle('danger', taskFailed || lifecycle.uncertain);
   let stTxt = app.running ? '运行中' : (app.port ? '已停止' : '未运行');
   let stFail = false;
   let taskHistoryText = '';
@@ -394,6 +425,11 @@ function updateAppCard(card, app) {
       stTxt = what + ' · ' + agoText;
     }
   }
+  const dotFailure = taskFailed || lifecycle.uncertain || stFail;
+  r.dot.classList.toggle('running', !!app.running && !dotFailure);
+  r.dot.classList.toggle('ready', scheduledReady && !dotFailure);
+  r.dot.classList.toggle('success', taskSucceeded && !isScheduled && !dotFailure);
+  r.dot.classList.toggle('danger', dotFailure);
   setText(r.stText, stTxt);
   r.stText.classList.toggle('fail', stFail);
   setText(r.taskHistory, taskHistoryText);
@@ -1262,11 +1298,11 @@ export function renderLaunchpad(apps, firstRender) {
   addTask.remove();
   addProgram.remove();
   reconcile(svcGrid, svcs, a => a.id, createAppCard, updateAppCard, firstRender);
-  svcGrid.prepend(addSvc);                  // 新增入口始终优先可见
+  svcGrid.append(addSvc);
   reconcile(taskGrid, tasks, a => a.id, createAppCard, updateAppCard, firstRender);
-  taskGrid.prepend(addTask);                // 批处理新增入口始终优先可见
+  taskGrid.append(addTask);
   reconcile(programGrid, programs, a => a.id, createAppCard, updateAppCard, firstRender);
-  programGrid.prepend(addProgram);
+  programGrid.append(addProgram);
   renderLpKpi(apps, svcs, tasks);
   latestSvcs = svcs;
   latestTasks = tasks;
@@ -1304,15 +1340,23 @@ function renderLpKpi(apps, svcs, tasks) {
   setText($('#lpStatWarnSub'), warn ? '需要处理' : '无需处理');
   /* 与「服务监控」同口径：我的服务负载合计 */
   let cpuSum = 0, memSum = 0;
+  const seenPids = new Set();
   for (const s of ((state.data && state.data.services) || [])) {
     if (s.group !== 'mine' || s.hidden) continue;
+    if (seenPids.has(s.pid)) continue;
+    seenPids.add(s.pid);
     cpuSum += s.cpu || 0;
     memSum += s.mem || 0;
   }
-  setKpiUnit($('#lpStatCpu'), cpuSum.toFixed(1), '%');
+  const cpuPercent = normalizeHostCpuPercent(
+    cpuSum,
+    (state.data && state.data.logicalCpuCount) || navigator.hardwareConcurrency,
+  );
+  setKpiUnit($('#lpStatCpu'), cpuPercent.toFixed(1), '%');
   setKpiUnit($('#lpStatMem'), memSum.toFixed(1), '%');
-  setText($('#lpStatCpuSub'), '负载' + loadLevel(cpuSum));
-  setText($('#lpStatMemSub'), '占用' + loadLevel(memSum));
+  const scope = seenPids.size + ' 个服务进程 · ';
+  setText($('#lpStatCpuSub'), scope + loadLevel(cpuPercent));
+  setText($('#lpStatMemSub'), scope + loadLevel(memSum));
 }
 
 function loadLevel(pct) {

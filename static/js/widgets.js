@@ -14,6 +14,7 @@ import { openAppModal, openLogs, openConsoleLog, openConfirm,
 import { configuredPort } from './ports.js';
 import { lifecyclePayload, lifecycleSnapshot, isGenerationMismatch,
   isStopTimeout, runLifecycleMutation } from './lifecycle.js';
+import { normalizeHostCpuPercent } from './metrics.js';
 
 const FEED_CAP = 50;
 let feedSeq = 0;
@@ -120,7 +121,7 @@ export function initWidgets() {
   syncConn();
 
   tipsAction.addEventListener('click', () => {
-    const tab = $('#tab-services');
+    const tab = $('#rail-services');
     if (tab) tab.click();
   });
   initImportWizard();
@@ -285,7 +286,13 @@ function renderTopPortsInto(container, data) {
 }
 
 function renderTopRes(data) {
+  const seenPids = new Set();
   const rows = mineServices(data)
+    .filter(svc => {
+      if (seenPids.has(svc.pid)) return false;
+      seenPids.add(svc.pid);
+      return true;
+    })
     .slice()
     .sort((a, b) => (b[resMetric] || 0) - (a[resMetric] || 0))
     .slice(0, 5);
@@ -304,7 +311,10 @@ function renderTopRes(data) {
     name.textContent = svc.appName || svc.project || svc.name || '本地服务';
     name.title = name.textContent;
     const val = el('span', 't5-val');
-    const pct = typeof svc[resMetric] === 'number' ? svc[resMetric] : 0;
+    const raw = typeof svc[resMetric] === 'number' ? svc[resMetric] : 0;
+    const pct = resMetric === 'cpu' ? normalizeHostCpuPercent(
+      raw, data.logicalCpuCount || navigator.hardwareConcurrency,
+    ) : raw;
     val.textContent = pct.toFixed(1) + '%';
     const bar = el('span', 't5-bar');
     const fill = el('i');

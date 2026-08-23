@@ -12,6 +12,7 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import webbrowser
@@ -112,6 +113,8 @@ _SYSTEM_SID = "S-1-5-18"
 _ADMINISTRATORS_SID = "S-1-5-32-544"
 _JUNCTION_REPARSE_TAG = 0xA0000003
 _RUNNER_PREPARE_TIMEOUT = 10.0
+_CPU_SAMPLE_MIN_INTERVAL = 0.1
+_CPU_SAMPLE_MAX_AGE = 300.0
 _MAX_CLEANUP_RECOVERY_ENTRIES = 256
 _RUNTIME_RECORD_NAMES = frozenset({"request.json", "token.bin", "receipt.json"})
 _CLEANUP_TOMBSTONE_PREFIX = ".cleanup-"
@@ -222,6 +225,9 @@ class WindowsPlatform:
             raise PermissionError("current Windows token has an unsupported default owner")
         self._principal = Principal(self._sid)
         self._elevation_token: str | None = None
+        self._cpu_samples: dict[int, tuple[float, float, float, float]] = {}
+        self._cpu_samples_lock = threading.Lock()
+        self._cpu_samples_pruned_at = 0.0
 
     @staticmethod
     def _current_token_sids() -> tuple[str, str]:
@@ -489,6 +495,38 @@ class WindowsPlatform:
             issues,
         )
 
+    def _sample_cpu_percent(
+        self, pid: int, create_time: object, cpu_times: object, sampled_at: float,
+    ) -> float:
+        try:
+            created = float(create_time)
+            total = float(cpu_times.user) + float(cpu_times.system)
+        except (AttributeError, TypeError, ValueError):
+            return 0.0
+
+        with self._cpu_samples_lock:
+            if sampled_at - self._cpu_samples_pruned_at >= 60.0:
+                cutoff = sampled_at - _CPU_SAMPLE_MAX_AGE
+                self._cpu_samples = {
+                    cached_pid: sample
+                    for cached_pid, sample in self._cpu_samples.items()
+                    if sample[1] >= cutoff
+                }
+                self._cpu_samples_pruned_at = sampled_at
+
+            previous = self._cpu_samples.get(pid)
+            if previous is None or previous[0] != created:
+                self._cpu_samples[pid] = (created, sampled_at, total, 0.0)
+                return 0.0
+
+            elapsed = sampled_at - previous[1]
+            if elapsed < _CPU_SAMPLE_MIN_INTERVAL:
+                return previous[3]
+            delta = total - previous[2]
+            percent = 0.0 if delta < 0 else round((delta / elapsed) * 100.0, 1)
+            self._cpu_samples[pid] = (created, sampled_at, total, percent)
+            return percent
+
     def process_snapshot(
         self, pids: set[int] | None = None, *, with_owner: bool = True,
     ) -> ProcessSnapshot:
@@ -512,6 +550,7 @@ class WindowsPlatform:
                 _issue("processes", "scan_failed", str(exc)),
             ))
         now = time.time()
+        sampled_at = time.perf_counter()
         for process in candidates:
             try:
                 pid = int(process.pid)
@@ -525,16 +564,19 @@ class WindowsPlatform:
                     if owner != self._sid:
                         continue
                 info = process.as_dict(
-                    attrs=("pid", "name", "exe", "cmdline", "cpu_percent",
+                    attrs=("pid", "name", "exe", "cmdline", "cpu_times",
                            "memory_percent", "create_time", "ppid"),
                     ad_value=None,
                 )
                 command = info.get("cmdline") or []
+                cpu = self._sample_cpu_percent(
+                    pid, info.get("create_time"), info.get("cpu_times"), sampled_at,
+                )
                 processes[pid] = {
                     "owner": owner,
                     "uid": None,
                     "etime": max(0, int(now - (info.get("create_time") or now))),
-                    "cpu": float(info.get("cpu_percent") or 0.0),
+                    "cpu": cpu,
                     "mem": float(info.get("memory_percent") or 0.0),
                     "comm": info.get("exe") or info.get("name") or "",
                     "args": subprocess.list2cmdline(command) if command else "",
@@ -629,6 +671,7 @@ class WindowsPlatform:
         processes: dict[int, dict[str, object]] = {}
         access_denied = False
         now = time.time()
+        sampled_at = time.perf_counter()
         current_session_id = win32ts.ProcessIdToSessionId(self.self_pid)
         for row in candidates:
             pid = 0
@@ -649,15 +692,18 @@ class WindowsPlatform:
                     continue
                 process = psutil.Process(pid)
                 info = process.as_dict(
-                    attrs=("name", "exe", "cpu_percent", "memory_percent",
+                    attrs=("name", "exe", "cpu_times", "memory_percent",
                            "create_time", "ppid"),
                     ad_value=None,
+                )
+                cpu = self._sample_cpu_percent(
+                    pid, info.get("create_time"), info.get("cpu_times"), sampled_at,
                 )
                 processes[pid] = {
                     "owner": owner,
                     "uid": None,
                     "etime": max(0, int(now - (info.get("create_time") or now))),
-                    "cpu": float(info.get("cpu_percent") or 0.0),
+                    "cpu": cpu,
                     "mem": float(info.get("memory_percent") or 0.0),
                     "comm": info.get("exe") or info.get("name") or name,
                     "args": command_line,

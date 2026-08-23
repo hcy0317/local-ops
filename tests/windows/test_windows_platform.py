@@ -383,6 +383,34 @@ class WindowsPlatformTests(unittest.TestCase):
             self.platform.current_principal().identifier,
         )
 
+    def test_scoped_process_snapshots_report_cpu_after_the_baseline_sample(self):
+        first = mock.Mock(pid=4242)
+        first.as_dict.return_value = {
+            "pid": 4242,
+            "name": "worker.exe",
+            "exe": r"C:\\Tools\\worker.exe",
+            "cmdline": [r"C:\\Tools\\worker.exe"],
+            "cpu_times": SimpleNamespace(user=1.0, system=0.5),
+            "memory_percent": 2.0,
+            "create_time": 100.0,
+            "ppid": 1,
+        }
+        second = mock.Mock(pid=4242)
+        second.as_dict.return_value = {
+            **first.as_dict.return_value,
+            "cpu_times": SimpleNamespace(user=1.2, system=0.55),
+        }
+
+        with mock.patch("psutil.Process", side_effect=[first, second]), \
+                mock.patch("time.perf_counter", side_effect=[10.0, 12.0]):
+            baseline = self.platform.process_snapshot({4242}, with_owner=False)
+            sampled = self.platform.process_snapshot({4242}, with_owner=False)
+
+        self.assertEqual(baseline.processes[4242]["cpu"], 0.0)
+        self.assertEqual(sampled.processes[4242]["cpu"], 12.5)
+        self.assertIn("cpu_times", first.as_dict.call_args.kwargs["attrs"])
+        self.assertNotIn("cpu_percent", first.as_dict.call_args.kwargs["attrs"])
+
     def test_process_observation_treats_exited_object_as_absent(self):
         process = mock.Mock()
         process.create_time.return_value = 123.0

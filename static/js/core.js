@@ -25,9 +25,9 @@ export function setKpi(node, txt) {
   if (node._t === txt) return;
   node._t = txt;
   node.textContent = txt;
-  node.classList.add('flash');
-  void node.offsetWidth;
   node.classList.remove('flash');
+  void node.offsetWidth;
+  node.classList.add('flash');
 }
 /* 带缩小单位的 KPI 数字（%、秒）：主体与整数同号，单位以 .unit 缩小弱化 */
 export function setKpiUnit(node, txt, unit) {
@@ -37,9 +37,9 @@ export function setKpiUnit(node, txt, unit) {
   const u = el('span', 'unit');
   u.textContent = unit;
   setChildren(node, document.createTextNode(txt), u);
-  node.classList.add('flash');
-  void node.offsetWidth;
   node.classList.remove('flash');
+  void node.offsetWidth;
+  node.classList.add('flash');
 }
 export function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c =>
@@ -271,6 +271,29 @@ export function trapLayerFocus(e) {
 }
 
 /* ---------------- 按 key 原地更新的 reconcile ---------------- */
+function cancelPendingRemoval(node) {
+  if (node._removeTimer) clearTimeout(node._removeTimer);
+  if (node._removeEnd) node.removeEventListener('animationend', node._removeEnd);
+  node._removeTimer = null;
+  node._removeEnd = null;
+  node.classList.remove('anim-out');
+}
+
+function removeWithMotion(node) {
+  if (node.classList.contains('anim-out')) return;
+  node.classList.remove('anim-in');
+  node.classList.add('anim-out');
+  const finish = () => {
+    cancelPendingRemoval(node);
+    node.remove();
+  };
+  node._removeEnd = e => {
+    if (e.target === node && e.animationName === 'signal-exit') finish();
+  };
+  node.addEventListener('animationend', node._removeEnd);
+  node._removeTimer = setTimeout(finish, 360);
+}
+
 export function reconcile(container, items, getKey, createFn, updateFn, stagger) {
   const old = new Map();
   for (const child of container.children) {
@@ -286,12 +309,14 @@ export function reconcile(container, items, getKey, createFn, updateFn, stagger)
       node.dataset.key = key;
       node.classList.add('anim-in');
       if (stagger) node.style.setProperty('--d', Math.min(i * 30, 600) + 'ms');
+    } else {
+      cancelPendingRemoval(node);
     }
     updateFn(node, item);
     const cur = container.children[i];
     if (cur !== node) container.insertBefore(node, cur || null);
   });
-  for (const [key, node] of old) if (!seen.has(key)) node.remove();
+  for (const [key, node] of old) if (!seen.has(key)) removeWithMotion(node);
 }
 /* 入场动画结束后移除类，避免 fill 状态干扰 hover */
 document.addEventListener('animationend', e => {

@@ -27,12 +27,9 @@ import { lifecyclePayload, lifecycleSnapshot, runLifecycleMutation } from './js/
 
 /* ---------------- DOM 引用 ---------------- */
 const banner = $('#banner');
-const sideNav = $('#sideNav');
-const navBtns = [...sideNav.querySelectorAll('.nav-btn')];
 const viewTitle = $('#viewTitle');
 const viewOverline = $('#viewOverline');
 const viewSub = $('#viewSub');
-const navCountLaunch = $('#navCountLaunch'), navCountSvc = $('#navCountSvc');
 const sideStats = $('#sideStats');
 const cmdkTrigger = $('#cmdkTrigger');
 const restartConsoleBtn = $('#restartConsoleBtn');
@@ -80,8 +77,36 @@ function promptForElevationSession(data) {
 }
 
 /* ---------------- 视图切换 ---------------- */
-function switchView(v) {
-  if (state.view === v) return;
+const viewMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+let viewTransitioning = false;
+let queuedView = null;
+
+function playViewExit(view) {
+  if (!view || viewMotion.matches) return Promise.resolve();
+  return new Promise(resolve => {
+    let timer = null;
+    const finish = e => {
+      if (e && (e.target !== view || e.animationName !== 'view-out')) return;
+      view.removeEventListener('animationend', finish);
+      clearTimeout(timer);
+      view.classList.remove('is-leaving');
+      resolve();
+    };
+    view.addEventListener('animationend', finish);
+    view.classList.add('is-leaving');
+    timer = setTimeout(finish, 280);
+  });
+}
+
+async function switchView(v) {
+  if (state.view === v && !viewTransitioning) return;
+  if (viewTransitioning) {
+    queuedView = v;
+    return;
+  }
+  viewTransitioning = true;
+  const previous = state.view === 'launchpad' ? viewLaunchpad : viewServices;
+  await playViewExit(previous);
   state.view = v;
   localStorage.setItem('console-view', v);
   applyView();
@@ -90,15 +115,13 @@ function switchView(v) {
   active.classList.remove('active');
   void active.offsetWidth;
   active.classList.add('active');
+  viewTransitioning = false;
+  const next = queuedView;
+  queuedView = null;
+  if (next && next !== state.view) switchView(next);
 }
 function applyView() {
   const v = state.view;
-  navBtns.forEach(b => {
-    const active = b.dataset.view === v;
-    b.classList.toggle('active', active);
-    b.setAttribute('aria-selected', String(active));
-    b.tabIndex = active ? 0 : -1;
-  });
   railBtns.forEach(b => {
     const active = b.dataset.view === v;
     b.classList.toggle('active', active);
@@ -118,19 +141,7 @@ function applyView() {
     ? '一键启动与管理你的本地服务、程序和批处理任务'
     : '实时掌握本机监听端口与进程负载');
 }
-navBtns.forEach(b => b.addEventListener('click', () => switchView(b.dataset.view)));
 railBtns.forEach(b => b.addEventListener('click', () => switchView(b.dataset.view)));
-sideNav.addEventListener('keydown', e => {
-  if (!['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
-  e.preventDefault();
-  let index = navBtns.indexOf(document.activeElement);
-  if (index < 0) return;
-  if (e.key === 'Home') index = 0;
-  else if (e.key === 'End') index = navBtns.length - 1;
-  else index = (index + ((e.key === 'ArrowDown' || e.key === 'ArrowRight') ? 1 : -1) + navBtns.length) % navBtns.length;
-  switchView(navBtns[index].dataset.view);
-  navBtns[index].focus();
-});
 
 /* ============================================================
    轮询
@@ -309,13 +320,10 @@ function render() {
     : '当前是旧版后台，点击查看启用方法';
   stopConsoleBtn.setAttribute('aria-label', lifecycleSupported ? '停止总控台' : unavailableTitle);
   stopConsoleBtn.title = lifecycleSupported ? '停止总控台' : unavailableTitle;
-  /* 侧栏计数：启动台 = 运行中应用数；服务监控 = 我的服务数 */
   const apps = state.data.apps || [];
   const runningApps = apps.filter(a => a.running).length;
   const mineCount = (state.data.services || [])
     .filter(s => s.group === 'mine' && !s.hidden).length;
-  setText(navCountLaunch, runningApps ? String(runningApps) : '');
-  setText(navCountSvc, mineCount ? String(mineCount) : '');
   setText(sideStats, '运行 ' + runningApps + ' · 服务 ' + mineCount +
     (state.data.consolePort ? ' · :' + state.data.consolePort : ''));
   applyUiTheme(currentUiTheme());
@@ -707,8 +715,6 @@ document.addEventListener('keydown', e => {
 setChildren(restartConsoleIcon, icon('refresh-cw', 14));
 setChildren(stopConsoleIcon, icon('power', 14));
 setChildren($('#githubLink'), icon('github', 15));
-setChildren($('#navIconLaunch'), icon('layout-grid', 15));
-setChildren($('#navIconSvc'), icon('activity', 15));
 setChildren($('#railIconLaunch'), icon('rocket', 19));
 setChildren($('#railIconSvc'), icon('activity', 19));
 setChildren($('#cmdkIcon'), icon('search', 14));

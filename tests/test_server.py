@@ -1331,7 +1331,13 @@ class ConsoleRestartTests(unittest.TestCase):
 class DiagnoseTests(unittest.TestCase):
     def _run(self, app, log="", cfg_apps=None):
         cfg = {"apps": cfg_apps or [app]}
-        with mock.patch.object(server, "read_log_tail", return_value=log):
+        payload = {
+            "text": log,
+            "taskHistory": {"applicable": False},
+        }
+        with mock.patch.object(
+            server, "read_app_log_payload", return_value=payload,
+        ):
             return server.diagnose_app(cfg, app)
 
     def test_missing_node_modules_suggests_lockfile_manager(self):
@@ -1352,6 +1358,27 @@ class DiagnoseTests(unittest.TestCase):
                "port": 4000, "lastExit": {"code": 2}}
         r = self._run(app, log="ERROR Cannot find module 'hexo' from '/x'")
         self.assertTrue(any(i["kind"] == "deps-missing" for i in r["issues"]))
+
+    def test_diagnosis_uses_external_runtime_logs_shown_in_log_drawer(self):
+        app = {"id": "aabbccdd", "cwd": None, "command": "hexo s",
+               "port": 4000, "lastExit": {"code": 2},
+               "dockerResource": {"kind": "container", "id": "a" * 64}}
+        payload = {
+            "text": "ERROR Cannot find module 'hexo' from '/x'",
+            "taskHistory": {"applicable": False},
+        }
+        with mock.patch.object(server, "read_log_tail", return_value=""), \
+                mock.patch.object(
+                    server, "read_app_log_payload", return_value=payload,
+                ) as read_payload:
+            result = server.diagnose_app({"apps": [app]}, app)
+
+        read_payload.assert_called_once_with(app, 150)
+        self.assertTrue(any(
+            issue["kind"] == "deps-missing"
+            for issue in result["issues"]
+        ))
+        self.assertNotIn("暂无日志", result["summary"])
 
     def test_missing_script_lists_available_scripts(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1407,7 +1434,7 @@ class ThemeTests(unittest.TestCase):
         listed = server.list_themes()
         self.assertEqual([theme["id"] for theme in listed], ["ops"])
         themes = {t["id"]: t for t in listed}
-        self.assertEqual(themes["ops"]["name"], "Ops 指挥台")
+        self.assertEqual(themes["ops"]["name"], "Tactical Editorial Console")
         self.assertTrue(themes["ops"]["colors"])
 
     def test_config_defaults_ui_theme(self):

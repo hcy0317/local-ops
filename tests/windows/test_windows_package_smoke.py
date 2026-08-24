@@ -517,11 +517,27 @@ class WindowsPackageSmokeTests(unittest.TestCase):
                 _, pid = win32process.GetWindowThreadProcessId(hwnd)
                 if int(pid) not in tracked_pids:
                     return True
+                controls = []
+
+                def collect_control(control, _child_context):
+                    try:
+                        text = win32gui.GetWindowText(control)
+                        if text:
+                            controls.append({
+                                "class": win32gui.GetClassName(control),
+                                "text": text,
+                            })
+                    except pywintypes.error:
+                        pass
+                    return True
+
+                win32gui.EnumChildWindows(hwnd, collect_control, None)
                 windows.append({
                     "pid": int(pid),
                     "class": win32gui.GetClassName(hwnd),
                     "title": win32gui.GetWindowText(hwnd),
                     "visible": bool(win32gui.IsWindowVisible(hwnd)),
+                    "controls": controls,
                 })
             except pywintypes.error:
                 pass

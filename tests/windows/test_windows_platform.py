@@ -1076,6 +1076,7 @@ class WindowsPlatformTests(unittest.TestCase):
                         "CONSOLE_LOG_DIR": os.path.join(temp_dir, "logs"),
                     }):
                 platform = WindowsPlatform(os.getcwd(), "server.py")
+                platform.controller_elevated = False
                 app_id = "a1b2c3d4"
                 generation_id = "00000000-0000-4000-8000-000000000001"
                 receipt_path = platform._runtime_files(

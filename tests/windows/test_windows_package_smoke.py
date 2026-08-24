@@ -528,6 +528,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
                 startup = win32process.STARTUPINFO()
                 startup.dwFlags |= win32con.STARTF_USESHOWWINDOW
                 startup.wShowWindow = win32con.SW_HIDE
+                startup.lpDesktop = r"winsta0\default"
                 command = subprocess.list2cmdline([
                     str(self.executable),
                     "--no-browser",
@@ -542,10 +543,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
                         None,
                         None,
                         False,
-                        (
-                            win32process.CREATE_NO_WINDOW
-                            | win32process.CREATE_UNICODE_ENVIRONMENT
-                        ),
+                        win32process.CREATE_UNICODE_ENVIRONMENT,
                         self.child_environment,
                         str(self.work_dir),
                         startup,

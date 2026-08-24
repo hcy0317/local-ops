@@ -383,6 +383,8 @@ class ScheduledTaskHttpTests(unittest.TestCase):
         self.logs_patch.start()
         self.harness = HttpHarness()
         self.headers = self.harness.session_headers()
+        session_id = self.headers["Cookie"].split("=", 1)[1]
+        self.harness.httpd.set_browser_session_elevated(session_id, True)
         self.harness.cfg.update(
             lambda data: data["apps"].append(scheduled_app("service"))
         )
@@ -406,6 +408,24 @@ class ScheduledTaskHttpTests(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertIn(("stop_scheduled_task", TASK_PATH), self.platform.calls)
         self.assertEqual(len(self.harness.cfg.snapshot()["apps"]), 1)
+
+    def test_cli_bearer_cannot_control_brokered_scheduled_task(self):
+        headers = {
+            "Authorization": "Bearer " + self.harness.httpd.cli_token,
+            "Content-Type": "application/json",
+        }
+        status, body, _ = self.harness.request(
+            "POST",
+            "/api/apps/deadbeef/stop",
+            {"expectedGeneration": None, "force": False},
+            headers,
+        )
+
+        self.assertEqual(status, 403)
+        self.assertEqual(body["code"], "BROWSER_SESSION_REQUIRED")
+        self.assertNotIn(
+            "stop_scheduled_task", [call[0] for call in self.platform.calls]
+        )
 
     def test_disable_endpoint_changes_only_the_bound_scheduled_task(self):
         status, body, _ = self.harness.request(

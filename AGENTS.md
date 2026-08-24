@@ -8,7 +8,7 @@
 - `localops/platform/` — macOS/Windows 原生边界；Windows 运行依赖只允许从 `requirements-windows.txt` 安装
 - `localops/windows/` — Windows runner、Job Object 和 HMAC/receipt 协议；runner 是每个 Job 的唯一长期句柄持有者，不写主配置
 - `localops/docker_resources.py` — Docker CLI 只读发现与精确资源控制；Compose 身份为 project/workingDir/configFiles，单容器身份为完整 64 位 ID，只允许 start/stop
-- `localops/elevation_broker.py` / `localops/windows/elevation_broker.py` — Windows 管理员程序代理的密码、会话、固定任务与 Named Pipe 协议；代理只能由冻结 onedir 经一次 UAC 安装
+- `localops/elevation_broker.py` / `localops/windows/elevation_broker.py` — Windows 管理员程序代理的密码、会话、固定任务与 Named Pipe 协议；代理只能由冻结 onedir 经一次 UAC 安装，并负责对受保护程序的精确观察与停止
 - `localops/windows/packaged_entry.py` — PyInstaller windowed 入口；同一冻结 executable 同时分派 console 与 runner，并在无标准流时绑定私有 `console.log`
 - `tools/build_windows.py` / `requirements-build-windows.txt` — Python 3.12、PyInstaller onedir/windowed/x64 的确定性 unsigned zip 构建、sidecar/manifest 生成与内容审计；构建依赖不进入源码运行时依赖
 - `static/index.html` / `static/app.js`（入口）/ `static/js/{core,launchpad,lifecycle,services,overlays,ports,widgets}.js`（原生 ES Modules，无构建）/ `static/icons.js` — 前端（原生，禁框架/CDN/构建）；`core.js` 承载工具/API/浮层/状态/主题注册，`lifecycle.js` 冻结 generation 意图并执行 fail-closed 状态判断，`launchpad.js` 卡片+拖拽+诊断+启动台 KPI/分区过滤，`services.js` 表格+监控 KPI 火花线，`overlays.js` 模态+抽屉，`ports.js` 端口归一化纯函数，`widgets.js` 右侧信息栏（实时动态/告警、TOP5、小贴士、快捷操作）与导航轨状态；模块间用 `window.__poll` 共享轮询入口
@@ -103,6 +103,8 @@
 - `POST /api/windows/elevation-broker/install` `{password}` → `{ok}`（仅 Windows 冻结包；派生 verifier 后通过一次 UAC 安装固定无触发器 broker）
 - `POST /api/windows/elevation-broker/unlock` `{password}` → `{ok}`（令牌只驻留当前 Local Ops 进程内存，并绑定 PID/create-time/SID）
 - `POST /api/windows/elevation-broker/lock` `{}` → `{ok}`
+- `POST /api/session/bootstrap` `{token}` → `{ok}`（只消费一次 URL fragment 中的短期 token，换取 HttpOnly/SameSite 浏览器会话；所有敏感 GET 与写接口都必须携带浏览器会话或受保护的 CLI bearer。经受信 Tailscale Serve/Caddy 回环代理时，只有 `.ts.net` HTTPS 同源、有效 `Tailscale-User-Login` 与私有代理 bearer 同时成立的只读 `GET /api/state` 首请求可换取 Secure 浏览器会话；代理头本身不能授权写请求）
+- `POST /api/console/open` `{}` → `{ok}`（仅受保护 CLI bearer；由已运行实例签发新的 fragment bootstrap 并打开浏览器）
 
 ### 总控台自身
 - `POST /api/console/restart` → `{ok, pid, helperPid, port}`（先返回响应，再由独立 helper 等待旧进程退出并优先复用原端口；启动台应用不随总控台停止）
@@ -123,10 +125,14 @@
 - **应用状态**：每次启动生成随机 `runToken`，常驻外层 shell 在 argv 中持有标记并等待内层命令及其后台作业。新版进程只有同时命中 `lastPgid` / 当前 UID / token 的进程组才算 running；升级前缺少 token 的旧进程，只有配置 `lastPid`、监听端口、当前 UID 与真实 cwd 全部一致时才兼容认领。用户明确从服务监控认领的 `attached` 卡片允许监听子进程换 PID，但必须在配置端口上按当前 UID + 真实 cwd 唯一命中；任一条件不符仍按外部端口占用处理。`ports` 来自受控进程组成员实际监听的端口。
 - **应用启停**：多张卡片可保存相同端口（例如多个默认使用 3000 的项目）；启动前只拒绝失效配置和当时真实被占用的端口。重启先做健康预检，失败时不会先停掉仍工作的旧服务。停止时先校验 token，然后只对该受控进程组发 `SIGTERM`，**绝不按端口杀其他监听者**。服务手动 stop 不记录退出历史；任务自然结束记录四态结果，总控台中止记录 `stopped`。批处理不做“长期服务存活探测”，避免把快速成功误判成失败
 - **Windows 受管生命周期**：只控制 Local Ops 以 `CREATE_SUSPENDED` 创建并加入专属 Named Job Object 的进程树。公开身份恰好 11 个字段；所有变更使用 generation CAS。普通停止超时保留身份，显式 Force 才能在重验完整证据后调用该 Job 的 `TerminateJobObject`。外部 attach/kill 与 console restart 保持禁用。
-- **Docker 控制**：Compose 只调用精确 project/workingDir/configFiles 对应的 `up --detach` / `stop`，单容器只调用完整 ID 的 `container start` / `container stop`；不得 `down`、删除、prune 或按显示名控制。
-- **Windows 计划任务控制**：关联卡片的启动/停止分别调用 Task Scheduler COM `Run` / `Stop(0)`；启禁只设置精确注册项的 `Enabled`。不得按 PID 结束进程，且不得修改触发器、动作、主体、运行级别、`MultipleInstances` 或注册；强制停止和重启保持禁用。日志读取 Operational 频道的结构化 XML，并与 Local Ops 操作审计和当前 COM 状态合并；频道关闭时由日志抽屉提供显式启用入口，未修改任务 action 或接管 stdout/stderr。
+- **Docker 控制**：Compose 只调用精确 project/workingDir/configFiles 对应的 `up --detach` / `stop`，单容器只调用完整 ID 的 `container start` / `container stop`；不得 `down`、删除、prune 或按显示名控制。Windows 冻结 windowless 控制器调用 Docker CLI 时必须带 `CREATE_NO_WINDOW`，不得因 2 秒轮询反复创建可见 `cmd/conhost`。
+- **Windows 计划任务控制**：关联卡片的启动/停止分别调用 Task Scheduler COM `Run` / `Stop(0)`；启禁只设置精确注册项的 `Enabled`。Limited 控制器若被拒绝连接 COM，则已认证 broker v3 仅代理规范化路径的 list/query/run/stop/toggle/history 固定操作，写操作还要求当前浏览器 elevation，会话/CLI 不得借用。不得按 PID 结束进程，且不得修改触发器、动作、主体、运行级别、`MultipleInstances` 或注册；强制停止和重启保持禁用。日志读取 Operational 频道的结构化 XML，并与 Local Ops 操作审计和当前状态合并；频道关闭时由日志抽屉提供显式启用入口，未修改任务 action 或接管 stdout/stderr。
 - **Windows 程序观察与停止**：程序卡片观察同名 EXE；可读进程必须属于当前用户，真实路径等于所选 EXE 或位于其父目录内，带参数时还要匹配完整参数尾部。仅当全部命中实例同时具备当前用户 SID、完整 EXE 路径和创建时间时，状态返回 `programStopAvailable=true` 与 `observedProcesses[{pid,createTime}]`，前端确认后才允许停止；请求和平台边界都会复验该快照，拒绝 PID 复用、路径变化、其他用户或部分可验证的混合实例。Windows 完全隐藏 token/path/command line 时，仅接受当前会话内唯一、同名且无参数的候选用于只读观察，并标记 `observedRestricted`，不授予停止权限。程序观察仍不创建受管 Job 身份，也不提供 restart。
-- **Windows 管理员程序代理**：Task Scheduler 只注册固定 `\\LocalOps-ElevationBroker`，无触发器且 action 固定到 Program Files 中经哈希验证的冻结包。首次安装经 `runas` UAC；安装请求路径与摘要必须复验。密码只保存 PBKDF2 verifier，Named Pipe 会话绑定实际客户端 PID/create-time/SID；Local Ops token 只在进程内存中，进程退出后必须重新输入。只接受 absolute `.exe` + args[] + absolute cwd 并以 `shell=False` 启动；代理只负责启动，不接受 stop/restart。已验证的当前用户程序由 Windows platform boundary 按 PID + EXE + creation-time 复验后停止；受保护或其他用户进程保持只读。源码 checkout 不得安装 broker。
+- **Windows 管理员程序代理**：Task Scheduler 只注册固定 `\\LocalOps-ElevationBroker`，无触发器且 action 固定到 Program Files 中经哈希验证的冻结包。首次安装经 `runas` UAC；安装事务固定到 `%LOCALAPPDATA%\LocalOps\runtime\elevation-install`，不得跟随 `CONSOLE_DATA_DIR`。升级在新定义注册后精确停止旧 broker 实例，再由解锁启动新协议。安装请求路径与摘要必须复验。密码只保存 PBKDF2 verifier，Named Pipe 会话绑定实际客户端 PID/create-time/SID；broker token 只驻留控制器内存，浏览器的管理员授权另按 HttpOnly 会话隔离，任一失效都必须重新输入。代理只接受 absolute `.exe` + args[] + absolute cwd 并以 `shell=False` 启动；停止前先由代理观察并冻结当前用户 SID + 完整 EXE + creation-time 身份，再对请求中的全部实例复验后终止，不接受 force/restart。源码 checkout 不得安装 broker。
+- **Windows 总控台权限边界**：常驻 `LocalOps-Console` 必须以 `RunLevel Limited` 运行受保护 `%ProgramFiles%` onedir 中的 `LocalOps.exe`。管理员 token 下的控制器必须拒绝创建普通受管 Job，防止普通服务继承管理员权限；不得把用户可写的 `server.py`、venv 或 `Highest` 任务作为常驻控制器。`tools/install_windows_console_task.ps1` 只接受 broker 保护目录中的冻结 EXE，激活升级时先等待旧任务实例离开 Running/Queued，再注册和启动新定义，并验证 Limited 注册结果。
+- **Windows 单实例锁**：每数据目录 Mutex 的安全属性必须显式 `bInheritHandle=False`；当前命名空间与旧版可继承锁隔离，避免仍运行的业务子进程在控制器退出后继续阻塞新版控制器。
+- **Tailscale 远程会话**：HTTP 服务仍只绑定 `127.0.0.1`。可选 Tailscale Serve 网关必须只监听回环、保留真实 Host/Origin/Referer、先按 Tailscale 用户身份过滤，再用 `%LOCALAPPDATA%\LocalOps\tailscale-proxy-secret` 的只读挂载覆盖 `X-LocalOps-Tailscale-Proxy-Authorization`。只有安全只读首请求可签发普通会话；跨站、错误密钥、缺身份和直接写请求全部 fail closed，管理员能力仍需浏览器内再次输入密码。禁止 Funnel/公网暴露。
+- **管理员程序观察性能**：broker 观察必须先按廉价进程名和完整 EXE 路径过滤，再查询 owner SID 与 creation-time；不得对每个收藏重复为全机所有进程打开 token。过滤顺序只减少噪声查询，不减少停止前的完整身份复验。
 - **Windows TokenOwner 边界**：Windows 新对象 owner 来自 access token 的 `TokenOwner`。平台只接受 `TokenOwner` 为当前用户或 Builtin Administrators；仅在 creation-time apply 路径观察到 Admin 默认 owner 时，才通过一次安全描述符更新把 owner 归一为当前用户并同时写入原 protected DACL。verify-only 的既有记录必须已经由当前用户拥有，Admin-owned 记录同样拒绝，不能先修复再信任。
 - **Windows runtime 原子性与清理**：request/receipt 临时文件必须先应用并验证私有 DACL，再 `os.replace`；重连与清理只做 verify-only，不得自动修复已放宽 ACL。释放 active generation 前必须同时证明目录恰好包含三个私有 runtime records、terminal receipt 签名有效、Job 已空且 runner 不再存在；将目录原子 rename 为严格派生的 cleanup tombstone 是 release commit。commit 后的恢复只删除 private、nonlink tombstone 中三个 runtime record 的 allowlisted subset，且不得观察或控制任何进程；未知项、宽 ACL 或 link 一律 fail closed。
 - **Windows 生命周期测试**：只有隔离夹具作用域或 hosted runner 可以设置 `LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS=1`，且测试只能结束自身创建的 fixture 进程；禁止针对现有用户进程运行。

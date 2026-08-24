@@ -18,7 +18,7 @@ import uuid
 import webbrowser
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Literal, Mapping
+from typing import Literal, Mapping, Sequence
 from xml.etree import ElementTree
 
 import ntsecuritycon
@@ -56,6 +56,8 @@ from localops.elevation_broker import (
     broker_task_sddl,
     broker_task_spec,
     normalize_elevated_launch,
+    normalize_elevated_stop,
+    normalize_scheduled_request,
     verify_broker_task,
 )
 from localops.windows.elevation_broker import public_config_path
@@ -116,6 +118,7 @@ _RUNNER_PREPARE_TIMEOUT = 10.0
 _CPU_SAMPLE_MIN_INTERVAL = 0.1
 _CPU_SAMPLE_MAX_AGE = 300.0
 _MAX_CLEANUP_RECOVERY_ENTRIES = 256
+_INSTANCE_MUTEX_PREFIX = "Local\\LocalOps-Console-v2-"
 _RUNTIME_RECORD_NAMES = frozenset({"request.json", "token.bin", "receipt.json"})
 _CLEANUP_TOMBSTONE_PREFIX = ".cleanup-"
 _TASK_SCHEDULER_EVENT_CHANNEL = (
@@ -224,6 +227,7 @@ class WindowsPlatform:
         if self._default_owner_sid not in {self._sid, _ADMINISTRATORS_SID}:
             raise PermissionError("current Windows token has an unsupported default owner")
         self._principal = Principal(self._sid)
+        self.controller_elevated = bool(shell.IsUserAnAdmin())
         self._elevation_token: str | None = None
         self._cpu_samples: dict[int, tuple[float, float, float, float]] = {}
         self._cpu_samples_lock = threading.Lock()
@@ -267,6 +271,15 @@ class WindowsPlatform:
             root,
             logs,
             os.path.join(root, "runtime"),
+        )
+
+    @staticmethod
+    def _elevation_install_root() -> str:
+        local_app_data = shell.SHGetKnownFolderPath(
+            shell.FOLDERID_LocalAppData, 0, None
+        )
+        return os.path.join(
+            local_app_data, "LocalOps", "runtime", "elevation-install"
         )
 
     def current_principal(self) -> Principal:
@@ -431,6 +444,7 @@ class WindowsPlatform:
         descriptor.SetSecurityDescriptorDacl(True, self._private_acl(False), False)
         attributes = win32security.SECURITY_ATTRIBUTES()
         attributes.SECURITY_DESCRIPTOR = descriptor
+        attributes.bInheritHandle = False
         return attributes
 
     def acquire_instance_lock(self, identity: str) -> WindowsInstanceLock | None:
@@ -439,7 +453,7 @@ class WindowsPlatform:
             (self._sid + "\0" + data_dir).encode("utf-8")
         ).hexdigest()[:32]
         handle = win32event.CreateMutex(
-            self._security_attributes(), False, "Local\\LocalOps-" + digest
+            self._security_attributes(), False, _INSTANCE_MUTEX_PREFIX + digest
         )
         if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
             win32api.CloseHandle(handle)
@@ -995,7 +1009,134 @@ class WindowsPlatform:
             "enginePids": sorted(set(engine_pids)),
         }
 
-    def scheduled_tasks(self, paths: set[str] | None = None) -> ScheduledTaskSnapshot:
+    def _broker_task_snapshot_cli(self) -> ScheduledTaskSnapshot:
+        executable = os.path.join(
+            os.environ.get("SystemRoot") or r"C:\Windows",
+            "System32", "schtasks.exe",
+        )
+        try:
+            completed = subprocess.run(
+                [executable, "/Query", "/TN", BROKER_TASK_PATH, "/XML"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if completed.returncode != 0:
+                raise OSError("fixed broker task query failed")
+            xml_text = completed.stdout.decode(
+                "utf-16" if completed.stdout.startswith((b"\xff\xfe", b"\xfe\xff"))
+                else "mbcs",
+                errors="strict",
+            )
+            root = ElementTree.fromstring(xml_text)
+            namespace = {"task": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+
+            def text(path: str) -> str:
+                node = root.find(path, namespace)
+                return str(node.text or "") if node is not None else ""
+
+            action = root.find("task:Actions/task:Exec", namespace)
+            triggers = root.find("task:Triggers", namespace)
+            security = text("task:RegistrationInfo/task:SecurityDescriptor")
+            row = {
+                "path": text("task:RegistrationInfo/task:URI") or BROKER_TASK_PATH,
+                "name": BROKER_TASK_PATH.lstrip("\\"),
+                "state": "ready",
+                "enabled": text("task:Settings/task:Enabled").casefold() != "false",
+                "lastRunAt": None,
+                "nextRunAt": None,
+                "lastResult": None,
+                "runLevel": (
+                    "highest"
+                    if text("task:Principals/task:Principal/task:RunLevel")
+                    == "HighestAvailable" else "limited"
+                ),
+                "principalUserId": text(
+                    "task:Principals/task:Principal/task:UserId"
+                ),
+                "principalSid": text(
+                    "task:Principals/task:Principal/task:UserId"
+                ),
+                "multipleInstances": {
+                    "IgnoreNew": "ignoreNew",
+                    "Queue": "queue",
+                    "StopExisting": "stopExisting",
+                    "Parallel": "parallel",
+                }.get(text("task:Settings/task:MultipleInstancesPolicy"), "unknown"),
+                "triggerCount": len(list(triggers)) if triggers is not None else 0,
+                "actions": [],
+                "actionDetails": [],
+                "securityLocked": security == broker_task_sddl(self._sid),
+                "enginePids": [],
+            }
+            try:
+                win32pipe.WaitNamedPipe(broker_pipe_name(self._sid), 0)
+                row["state"] = "running"
+            except pywintypes.error as exc:
+                if exc.winerror in {
+                        winerror.ERROR_PIPE_BUSY, winerror.ERROR_SEM_TIMEOUT}:
+                    row["state"] = "running"
+                elif exc.winerror != winerror.ERROR_FILE_NOT_FOUND:
+                    raise
+            if action is not None:
+                command_node = action.find("task:Command", namespace)
+                arguments_node = action.find("task:Arguments", namespace)
+                working_node = action.find("task:WorkingDirectory", namespace)
+                command = str(command_node.text or "") if command_node is not None else ""
+                arguments = (
+                    str(arguments_node.text or "")
+                    if arguments_node is not None else ""
+                )
+                working = str(working_node.text or "") if working_node is not None else ""
+                row["actions"] = [
+                    (command + (" " + arguments if arguments else "")).strip()
+                ]
+                row["actionDetails"] = [{
+                    "type": "exec", "path": command,
+                    "arguments": arguments, "workingDirectory": working,
+                }]
+            return ScheduledTaskSnapshot(
+                ScanStatus.OK, {BROKER_TASK_PATH.casefold(): row}
+            )
+        except (OSError, subprocess.TimeoutExpired, UnicodeError,
+                ElementTree.ParseError, TypeError, ValueError) as exc:
+            return ScheduledTaskSnapshot(ScanStatus.FAILED, issues=(
+                _issue("scheduled_tasks", "broker_query_failed", str(exc)),
+            ))
+
+    @staticmethod
+    def _run_broker_task_cli() -> ScheduledTaskRunResult:
+        executable = os.path.join(
+            os.environ.get("SystemRoot") or r"C:\Windows",
+            "System32", "schtasks.exe",
+        )
+        try:
+            completed = subprocess.run(
+                [executable, "/Run", "/TN", BROKER_TASK_PATH],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if completed.returncode == 0:
+                return ScheduledTaskRunResult(True, BROKER_TASK_PATH)
+            return ScheduledTaskRunResult(
+                False, BROKER_TASK_PATH,
+                "fixed broker task could not be started",
+                "BROKER_START_FAILED",
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return ScheduledTaskRunResult(
+                False, BROKER_TASK_PATH, str(exc), "BROKER_START_FAILED"
+            )
+
+    def _scheduled_tasks_direct(
+            self, paths: set[str] | None = None) -> ScheduledTaskSnapshot:
         pythoncom.CoInitialize()
         service = task = folder = registered = children = None
         pending: list[object] = []
@@ -1059,6 +1200,17 @@ class WindowsPlatform:
             task = folder = registered = children = service = None
             gc.collect()
             pythoncom.CoUninitialize()
+
+    def scheduled_tasks(self, paths: set[str] | None = None) -> ScheduledTaskSnapshot:
+        direct = self._scheduled_tasks_direct(paths)
+        if direct.status is not ScanStatus.FAILED:
+            return direct
+        if (paths is not None and len(paths) == 1
+                and next(iter(paths)).casefold() == BROKER_TASK_PATH.casefold()):
+            return self._broker_task_snapshot_cli()
+        if self._elevation_token is not None:
+            return self._broker_scheduled_tasks(paths)
+        return direct
 
     @staticmethod
     def _scheduled_task_event_row(xml_text: str) -> dict[str, object]:
@@ -1221,7 +1373,7 @@ class WindowsPlatform:
             status, tuple(events), history_enabled, tuple(issues)
         )
 
-    def set_scheduled_task_history_enabled(
+    def _set_scheduled_task_history_enabled_direct(
             self, enabled: bool) -> ScheduledTaskHistoryResult:
         executable = os.path.join(
             os.environ.get("SystemRoot") or r"C:\Windows",
@@ -1253,7 +1405,7 @@ class WindowsPlatform:
             "SCHEDULED_TASK_HISTORY_UPDATE_FAILED",
         )
 
-    def run_scheduled_task(self, path: str) -> ScheduledTaskRunResult:
+    def _run_scheduled_task_direct(self, path: str) -> ScheduledTaskRunResult:
         normalized, folder_path, name = self._scheduled_task_parts(path)
         pythoncom.CoInitialize()
         service = task = None
@@ -1269,6 +1421,8 @@ class WindowsPlatform:
             task.Run("")
             return ScheduledTaskRunResult(True, normalized)
         except (OSError, AttributeError, pywintypes.error, pythoncom.com_error) as exc:
+            if normalized.casefold() == BROKER_TASK_PATH.casefold():
+                return self._run_broker_task_cli()
             return ScheduledTaskRunResult(
                 False, normalized, str(exc), "SCHEDULED_TASK_RUN_FAILED"
             )
@@ -1277,7 +1431,7 @@ class WindowsPlatform:
             gc.collect()
             pythoncom.CoUninitialize()
 
-    def stop_scheduled_task(self, path: str) -> ScheduledTaskRunResult:
+    def _stop_scheduled_task_direct(self, path: str) -> ScheduledTaskRunResult:
         """Stop all running instances of one exact registered task.
 
         This leaves the registration, enabled state, triggers, principal, and
@@ -1304,7 +1458,7 @@ class WindowsPlatform:
             gc.collect()
             pythoncom.CoUninitialize()
 
-    def set_scheduled_task_enabled(
+    def _set_scheduled_task_enabled_direct(
             self, path: str, enabled: bool) -> ScheduledTaskRunResult:
         """Set only the enabled bit on one exact registered task."""
         normalized, folder_path, name = self._scheduled_task_parts(path)
@@ -1324,6 +1478,76 @@ class WindowsPlatform:
             task = service = None
             gc.collect()
             pythoncom.CoUninitialize()
+
+    def _broker_scheduled_control(
+            self, request: Mapping[str, object], path: str,
+    ) -> ScheduledTaskRunResult:
+        try:
+            response = self._broker_scheduled_exchange(request)
+            return ScheduledTaskRunResult(
+                bool(response.get("ok")), path,
+                None if response.get("ok") else str(
+                    response.get("error") or "broker task control failed"
+                ),
+                None if response.get("ok") else str(
+                    response.get("code") or "BROKER_SCHEDULED_FAILED"
+                ),
+            )
+        except (OSError, TypeError, ValueError, pywintypes.error) as exc:
+            return ScheduledTaskRunResult(
+                False, path, str(exc), "BROKER_SCHEDULED_FAILED"
+            )
+
+    def run_scheduled_task(self, path: str) -> ScheduledTaskRunResult:
+        direct = self._run_scheduled_task_direct(path)
+        if (direct.ok or path.casefold() == BROKER_TASK_PATH.casefold()
+                or self._elevation_token is None):
+            return direct
+        return self._broker_scheduled_control({
+            "operation": "run", "path": path,
+        }, path)
+
+    def stop_scheduled_task(self, path: str) -> ScheduledTaskRunResult:
+        direct = self._stop_scheduled_task_direct(path)
+        if direct.ok or self._elevation_token is None:
+            return direct
+        return self._broker_scheduled_control({
+            "operation": "stop", "path": path,
+        }, path)
+
+    def set_scheduled_task_enabled(
+            self, path: str, enabled: bool) -> ScheduledTaskRunResult:
+        direct = self._set_scheduled_task_enabled_direct(path, enabled)
+        if direct.ok or self._elevation_token is None:
+            return direct
+        return self._broker_scheduled_control({
+            "operation": "toggle", "path": path, "enabled": enabled,
+        }, path)
+
+    def set_scheduled_task_history_enabled(
+            self, enabled: bool) -> ScheduledTaskHistoryResult:
+        direct = self._set_scheduled_task_history_enabled_direct(enabled)
+        if direct.ok or self._elevation_token is None:
+            return direct
+        try:
+            response = self._broker_scheduled_exchange({
+                "operation": "history", "enabled": enabled,
+            })
+            return ScheduledTaskHistoryResult(
+                bool(response.get("ok")),
+                bool(response.get("enabled", enabled))
+                if response.get("ok") else not enabled,
+                None if response.get("ok") else str(
+                    response.get("error") or "broker history update failed"
+                ),
+                None if response.get("ok") else str(
+                    response.get("code") or "BROKER_SCHEDULED_FAILED"
+                ),
+            )
+        except (OSError, TypeError, ValueError, pywintypes.error) as exc:
+            return ScheduledTaskHistoryResult(
+                False, not enabled, str(exc), "BROKER_SCHEDULED_FAILED"
+            )
 
     @staticmethod
     def _file_sha256(path: str) -> str:
@@ -1365,16 +1589,34 @@ class WindowsPlatform:
             self, message: Mapping[str, object], timeout_ms: int = 5000,
     ) -> dict[str, object]:
         pipe_name = broker_pipe_name(self._sid)
-        win32pipe.WaitNamedPipe(pipe_name, timeout_ms)
-        pipe = win32file.CreateFile(
-            pipe_name,
-            win32con.GENERIC_READ | win32con.GENERIC_WRITE,
-            0,
-            None,
-            win32con.OPEN_EXISTING,
-            0,
-            None,
-        )
+        deadline = time.monotonic() + max(0.001, timeout_ms / 1000.0)
+        transient_errors = {
+            winerror.ERROR_FILE_NOT_FOUND,
+            winerror.ERROR_PIPE_BUSY,
+            winerror.ERROR_PIPE_NOT_CONNECTED,
+            winerror.ERROR_SEM_TIMEOUT,
+        }
+        pipe = None
+        while pipe is None:
+            remaining_ms = max(
+                1, int((deadline - time.monotonic()) * 1000)
+            )
+            try:
+                win32pipe.WaitNamedPipe(pipe_name, remaining_ms)
+                pipe = win32file.CreateFile(
+                    pipe_name,
+                    win32con.GENERIC_READ | win32con.GENERIC_WRITE,
+                    0,
+                    None,
+                    win32con.OPEN_EXISTING,
+                    0,
+                    None,
+                )
+            except pywintypes.error as exc:
+                if (exc.winerror not in transient_errors
+                        or time.monotonic() >= deadline):
+                    raise
+                time.sleep(min(0.05, max(0.001, deadline - time.monotonic())))
         try:
             win32pipe.SetNamedPipeHandleState(
                 pipe, win32pipe.PIPE_READMODE_MESSAGE, None, None
@@ -1384,6 +1626,59 @@ class WindowsPlatform:
             return decode_message(bytes(data))
         finally:
             win32file.CloseHandle(pipe)
+
+    def _broker_scheduled_exchange(
+            self, request: Mapping[str, object]) -> dict[str, object]:
+        if self._elevation_token is None:
+            raise ValueError("elevation broker session is locked")
+        normalized = normalize_scheduled_request(request)
+        response = self._broker_exchange({
+            "action": "scheduled",
+            "token": self._elevation_token,
+            "request": normalized,
+        }, timeout_ms=15000)
+        if response.get("code") == "BROKER_SESSION_INVALID":
+            self._elevation_token = None
+        return response
+
+    def _broker_scheduled_tasks(
+            self, paths: set[str] | None) -> ScheduledTaskSnapshot:
+        try:
+            request = (
+                {"operation": "list"}
+                if paths is None else
+                {"operation": "query", "paths": sorted(paths, key=str.casefold)}
+            )
+            response = self._broker_scheduled_exchange(request)
+            tasks_value = response.get("tasks")
+            issues_value = response.get("issues") or []
+            if (not response.get("ok") or not isinstance(tasks_value, dict)
+                    or not isinstance(issues_value, list)):
+                raise ValueError(
+                    str(response.get("error") or "broker task query failed")
+                )
+            tasks = {
+                str(key): dict(value)
+                for key, value in tasks_value.items()
+                if isinstance(key, str) and isinstance(value, Mapping)
+            }
+            if len(tasks) != len(tasks_value):
+                raise ValueError("broker task rows are invalid")
+            issues = tuple(
+                _issue(
+                    str(item.get("component") or "scheduled_tasks"),
+                    str(item.get("code") or "broker_issue"),
+                    str(item.get("message") or "broker task issue"),
+                    degrades=bool(item.get("degrades", True)),
+                )
+                for item in issues_value if isinstance(item, Mapping)
+            )
+            status = ScanStatus(str(response.get("status") or "failed"))
+            return ScheduledTaskSnapshot(status, tasks, issues)
+        except (OSError, TypeError, ValueError, pywintypes.error) as exc:
+            return ScheduledTaskSnapshot(ScanStatus.FAILED, issues=(
+                _issue("scheduled_tasks", "broker_query_failed", str(exc)),
+            ))
 
     def elevation_broker_status(self) -> ElevationBrokerStatus:
         try:
@@ -1402,12 +1697,26 @@ class WindowsPlatform:
             verified, code = verify_broker_task(row, spec)
             running = bool(verified and row and row.get("state") == "running")
             unlocked = False
+            stop_supported = False
+            scheduled_supported = False
             if verified and running and self._elevation_token:
                 try:
                     response = self._broker_exchange({
                         "action": "status", "token": self._elevation_token,
                     }, timeout_ms=1000)
                     unlocked = bool(response.get("ok") and response.get("unlocked"))
+                    protocol_version = int(response.get("protocolVersion") or 0)
+                    capabilities = response.get("capabilities") or []
+                    stop_supported = bool(
+                        unlocked
+                        and protocol_version >= 2
+                        and "observe" in capabilities
+                        and "stop" in capabilities
+                    )
+                    scheduled_supported = bool(
+                        unlocked and protocol_version >= 3
+                        and "scheduled" in capabilities
+                    )
                 except (OSError, pywintypes.error):
                     unlocked = False
             if not unlocked:
@@ -1417,6 +1726,8 @@ class WindowsPlatform:
                 verified=verified,
                 running=running,
                 unlocked=unlocked,
+                stop_supported=stop_supported,
+                scheduled_supported=scheduled_supported,
                 issue=(None if verified else _issue(
                     "elevation_broker", code or "BROKER_TASK_MISMATCH",
                     "installed broker task failed verification", degrades=False,
@@ -1436,32 +1747,21 @@ class WindowsPlatform:
             self, password_record: Mapping[str, object],
             package_executable: str | None = None) -> ElevationBrokerResult:
         frozen = bool(getattr(sys, "frozen", False))
-        if frozen:
-            source_executable = os.path.abspath(sys.executable)
-        elif package_executable:
-            try:
-                source_executable = self._validate_broker_package_executable(
-                    package_executable
-                )
-            except (OSError, TypeError, ValueError) as exc:
-                return ElevationBrokerResult(
-                    False, str(exc), "BROKER_PACKAGE_INVALID"
-                )
-        else:
-            source_executable = self._discover_deployed_broker_package()
-        if source_executable is None:
+        if not frozen:
             return ElevationBrokerResult(
                 False,
-                "未找到已部署的 Windows 管理员代理伴随包",
-                "BROKER_PACKAGE_REQUIRED",
+                "管理员代理只能从冻结 Windows 包安装",
+                "BROKER_PACKAGED_REQUIRED",
             )
+        source_executable = os.path.abspath(sys.executable)
         transaction = None
         process_handle = None
         reset_previous = os.environ.get("PYINSTALLER_RESET_ENVIRONMENT")
         try:
-            paths = self.runtime_paths()
-            root = os.path.join(paths.runtime_dir, "elevation-install")
-            for parent in (paths.runtime_dir, root):
+            root = self._elevation_install_root()
+            runtime_dir = os.path.dirname(root)
+            data_dir = os.path.dirname(runtime_dir)
+            for parent in (data_dir, runtime_dir, root):
                 try:
                     os.mkdir(parent)
                 except FileExistsError:
@@ -1537,80 +1837,6 @@ class WindowsPlatform:
                 except OSError:
                     pass
 
-    @staticmethod
-    def _validate_broker_package_executable(value: object) -> str:
-        if not isinstance(value, str) or not value or not os.path.isabs(value):
-            raise ValueError("管理员代理伴随程序必须是绝对 EXE 路径")
-        executable = os.path.abspath(value)
-        if (os.path.basename(executable).casefold() != "localops.exe"
-                or not os.path.isfile(executable)
-                or os.path.islink(executable)):
-            raise ValueError("请选择打包目录中的 LocalOps.exe")
-        bundle = os.path.dirname(executable)
-        build_info_path = os.path.join(bundle, "BUILD-INFO.json")
-        version_path = os.path.join(bundle, "_internal", "VERSION")
-        runtime_path = os.path.join(bundle, "_internal", "python312.dll")
-        try:
-            with open(build_info_path, "r", encoding="utf-8") as stream:
-                build_info = json.load(stream)
-            with open(version_path, "r", encoding="utf-8") as stream:
-                version = stream.read().strip()
-        except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("所选 EXE 不属于完整的 Windows onedir 包") from exc
-        expected = {
-            "architecture": "x64",
-            "elevationBrokerDispatch": "-m localops.windows.elevation_broker",
-            "entrypoint": "localops.windows.packaged_entry",
-            "packaging": "PyInstaller onedir windowed",
-            "product": "Local Ops Console",
-            "schemaVersion": 1,
-        }
-        if (not isinstance(build_info, dict)
-                or any(build_info.get(key) != expected_value
-                       for key, expected_value in expected.items())
-                or build_info.get("version") != version
-                or not isinstance(build_info.get("pythonVersion"), str)
-                or not build_info["pythonVersion"].startswith("3.12.")
-                or not os.path.isfile(runtime_path)):
-            raise ValueError("所选 Windows 包未通过管理员代理完整性检查")
-        return executable
-
-    def _discover_deployed_broker_package(self) -> str | None:
-        def child_directories(path: str) -> list[str]:
-            directories = []
-            with os.scandir(path) as entries:
-                for entry in entries:
-                    if entry.is_dir(follow_symlinks=False):
-                        directories.append(entry.path)
-                    if len(directories) >= 64:
-                        break
-            return directories
-
-        data_root = os.path.dirname(self.runtime_paths().runtime_dir)
-        packages_root = os.path.join(data_root, "packages")
-        candidates: list[str] = []
-        try:
-            for release in child_directories(packages_root):
-                candidates.append(os.path.join(release, "LocalOps.exe"))
-                candidates.extend(
-                    os.path.join(bundle, "LocalOps.exe")
-                    for bundle in child_directories(release)
-                )
-        except OSError:
-            return None
-        ranked = []
-        for candidate in candidates:
-            try:
-                ranked.append((os.path.getmtime(candidate), candidate))
-            except OSError:
-                continue
-        for _, candidate in sorted(ranked, reverse=True):
-            try:
-                return self._validate_broker_package_executable(candidate)
-            except (OSError, TypeError, ValueError):
-                continue
-        return None
-
     def unlock_elevation_broker(self, password: str) -> ElevationBrokerResult:
         status = self.elevation_broker_status()
         if not status.installed or not status.verified:
@@ -1685,6 +1911,97 @@ class WindowsPlatform:
                 str(response.get("code") or "BROKER_LAUNCH_FAILED"),
             )
         return ElevationBrokerResult(True, process_id=int(response["pid"]))
+
+    def observe_elevated(
+            self, command_spec: Mapping[str, object],
+            cwd: str | None) -> ProcessSnapshot:
+        if self._elevation_token is None:
+            return ProcessSnapshot(ScanStatus.FAILED, issues=(_issue(
+                "elevation_broker", "BROKER_SESSION_LOCKED",
+                "elevation broker session is locked", degrades=False,
+            ),))
+        try:
+            normalized = normalize_command_spec(command_spec)
+            request = normalize_elevated_launch({
+                "executable": normalized.get("executable"),
+                "args": normalized.get("args"),
+                "cwd": cwd or os.path.dirname(
+                    str(normalized.get("executable") or "")
+                ),
+            })
+            response = self._broker_exchange({
+                "action": "observe", "token": self._elevation_token,
+                "request": request,
+            })
+            if not response.get("ok"):
+                if response.get("code") == "BROKER_SESSION_INVALID":
+                    self._elevation_token = None
+                raise ValueError(
+                    str(response.get("error") or "broker observation failed")
+                )
+            processes = {}
+            for row in response.get("processes") or []:
+                if not isinstance(row, dict):
+                    raise ValueError("broker process observation is invalid")
+                pid = int(row["pid"])
+                created = float(row["createTime"])
+                executable = str(row["executable"])
+                if (pid <= 0 or created <= 0 or not os.path.isabs(executable)
+                        or not executable.casefold().endswith(".exe")):
+                    raise ValueError("broker process identity is invalid")
+                processes[pid] = {
+                    "owner": self._sid,
+                    "uid": None,
+                    "createTime": created,
+                    "etime": max(0, int(row.get("etime") or 0)),
+                    "cpu": 0.0,
+                    "mem": 0.0,
+                    "comm": executable,
+                    "args": str(row.get("commandLine") or ""),
+                    "ppid": 0,
+                    "sessionId": win32ts.ProcessIdToSessionId(pid),
+                    "restricted": False,
+                }
+            return ProcessSnapshot(ScanStatus.OK, processes)
+        except (CommandSpecError, OSError, TypeError, ValueError,
+                pywintypes.error) as exc:
+            return ProcessSnapshot(ScanStatus.FAILED, issues=(_issue(
+                "elevation_broker", "BROKER_OBSERVE_FAILED", str(exc),
+                degrades=False,
+            ),))
+
+    def stop_elevated(
+            self, favorite_executable: str,
+            processes: Sequence[Mapping[str, object]]) -> StopResult:
+        if self._elevation_token is None:
+            return StopResult(
+                False, "本次 Local Ops 会话尚未解锁管理员程序控制",
+                still_running=True, code="BROKER_SESSION_LOCKED",
+            )
+        try:
+            request = normalize_elevated_stop({
+                "favoriteExecutable": favorite_executable,
+                "processes": list(processes),
+            })
+            response = self._broker_exchange({
+                "action": "stop", "token": self._elevation_token,
+                "request": request,
+            })
+        except (OSError, TypeError, ValueError, pywintypes.error) as exc:
+            return StopResult(
+                False, str(exc), still_running=True,
+                code="BROKER_STOP_FAILED",
+            )
+        if not response.get("ok"):
+            if response.get("code") == "BROKER_SESSION_INVALID":
+                self._elevation_token = None
+            return StopResult(
+                False,
+                str(response.get("error") or "管理员程序停止失败"),
+                still_running=bool(response.get("running", True)),
+                code=str(response.get("code") or "BROKER_STOP_FAILED"),
+            )
+        return StopResult(True, still_running=False, status="stopped")
 
     @staticmethod
     def _windows_powershell() -> str | None:
@@ -2322,6 +2639,12 @@ class WindowsPlatform:
         return response, refreshed
 
     def launch(self, app: LaunchRequest) -> ManagedRuntime:
+        if self.controller_elevated:
+            return ManagedRuntime(
+                False,
+                "Local Ops controller must run without administrator elevation",
+                code="CONTROLLER_ELEVATED_UNSAFE",
+            )
         if app.command_spec is None or app.generation_id is None:
             return ManagedRuntime(
                 False,
@@ -2801,4 +3124,8 @@ class WindowsPlatform:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
 
     def platform_metadata(self) -> Mapping[str, object]:
-        return {"platform": self.name, "capabilities": asdict(self.capabilities)}
+        return {
+            "platform": self.name,
+            "capabilities": asdict(self.capabilities),
+            "controllerElevated": self.controller_elevated,
+        }

@@ -29,6 +29,27 @@ Current local verification:
 - common: 10/10; project checks: 6/6; compile: 45; Ruff/diff: PASS;
 - latest local audited package smoke: 1/1 PASS in 24.209s.
 
+An additional 2026-08-24 uncommitted local security-hardening worktree has
+live Windows 11 and private-tailnet evidence, but no new exact-commit CI claim.
+The installed Limited controller comes from audited v6 archive SHA-256
+`4c5337d88bcebedc09e35c2e98d7ef3437ff2a592b028234900d007cc0527257`;
+its EXE SHA-256 is
+`92d576f47b8716590898d91f16949769d0f08fb1194d737a7a24b1426642301c`.
+The installed Highest broker comes from audited v7 archive SHA-256
+`6de97598b614b4122480a0a3566d12e342da2c582759e612d9b18649338030b8`;
+its EXE SHA-256 is
+`e882f747884a1b2c1f8ce814d321986b6c61727e92da3e8d9bc14833670b4344`.
+Package smokes passed 1/1 in 23.331s and 21.901s respectively. The persistent
+task is Running with `RunLevel Limited` on port 9600. Authenticated live state
+is non-degraded and preserves 11 scheduled-task references, two Docker Compose
+references and three administrator-program favorites. The Tailscale identity
+gateway now requires both the Tailscale user and a protected proxy bearer;
+remote cold state fell from about 12.7s to 2.47–2.64s and the browser remained
+connected with all 16 cards. Instance-lock handles are non-inheritable, Docker
+polling creates no Local Ops console windows, and the installer waits for the
+old task before replacement. These results do not change `phaseStatus`,
+`lastGreenPhase` or Beta readiness.
+
 The package smoke extracted the bundle under a read-only Chinese-and-space
 path, stripped the packaged child's `PATH`, and completed real start, log
 marker, listener, controller close/reopen, Force stop, release, and delete.

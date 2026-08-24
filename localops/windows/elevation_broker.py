@@ -37,6 +37,8 @@ from localops.elevation_broker import (
     broker_pipe_name,
     broker_task_spec,
     normalize_elevated_launch,
+    normalize_elevated_stop,
+    normalize_scheduled_request,
 )
 from localops.windows.runner_protocol import decode_message, encode_message
 
@@ -147,7 +149,7 @@ def _protect_bundle(root: Path, owner_sid: str) -> None:
 
 def _register_task(spec: Mapping[str, str]) -> None:
     pythoncom.CoInitialize()
-    service = folder = definition = action = None
+    service = folder = definition = action = registered = None
     try:
         service = win32com.client.Dispatch("Schedule.Service")
         service.Connect()
@@ -169,12 +171,22 @@ def _register_task(spec: Mapping[str, str]) -> None:
         action.Path = spec["executable"]
         action.Arguments = spec["arguments"]
         action.WorkingDirectory = spec["workingDirectory"]
-        folder.RegisterTaskDefinition(
+        registered = folder.RegisterTaskDefinition(
             BROKER_TASK_PATH.lstrip("\\"), definition, 6,
             spec["ownerSid"], None, 3, spec["sddl"],
         )
+        if int(registered.State or 0) == 4:
+            registered.Stop(0)
+            deadline = time.monotonic() + 10.0
+            while (int(registered.State or 0) == 4
+                   and time.monotonic() < deadline):
+                time.sleep(0.05)
+            if int(registered.State or 0) == 4:
+                raise TimeoutError(
+                    "previous elevation broker instance did not stop"
+                )
     finally:
-        action = definition = folder = service = None
+        registered = action = definition = folder = service = None
         pythoncom.CoUninitialize()
 
 
@@ -283,6 +295,152 @@ def _launch(request: dict[str, object]) -> int:
     return int(process.pid)
 
 
+def _observe(request: dict[str, object], owner_sid: str) -> dict[str, object]:
+    normalized = normalize_elevated_launch(request)
+    favorite = os.path.normcase(os.path.realpath(normalized["executable"]))
+    favorite_dir = os.path.dirname(favorite)
+    favorite_name = os.path.basename(favorite)
+    expected_args = list(normalized["args"])
+    now = time.time()
+    matches = []
+    for process in psutil.process_iter(("pid", "name")):
+        try:
+            pid = int(process.pid)
+            if (pid == os.getpid()
+                    or os.path.normcase(process.name()) != favorite_name):
+                continue
+            executable = os.path.normcase(os.path.realpath(process.exe()))
+            if (executable != favorite
+                    and os.path.commonpath(
+                        [favorite_dir, executable]
+                    ) != favorite_dir):
+                continue
+            if _owner_sid(pid).casefold() != owner_sid.casefold():
+                continue
+            command = process.cmdline()
+            if expected_args and command[-len(expected_args):] != expected_args:
+                continue
+            created = float(process.create_time())
+            matches.append({
+                "pid": pid,
+                "createTime": created,
+                "executable": executable,
+                "commandLine": subprocess.list2cmdline(command),
+                "etime": max(0, int(now - created)),
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError, ValueError,
+                pywintypes.error):
+            continue
+    matches.sort(key=lambda row: int(row["pid"]))
+    return {"ok": True, "processes": matches}
+
+
+def _stop(request: dict[str, object], owner_sid: str) -> dict[str, object]:
+    normalized = normalize_elevated_stop(request)
+    validated = []
+    stopped = []
+    for row in normalized["processes"]:
+        pid = int(row["pid"])
+        if pid == os.getpid():
+            return {
+                "ok": False, "code": "BROKER_STOP_IDENTITY_MISMATCH",
+                "error": "broker cannot stop itself", "running": True,
+            }
+        try:
+            process = psutil.Process(pid)
+            if _owner_sid(pid).casefold() != owner_sid.casefold():
+                raise ValueError("process owner changed")
+            actual_executable = os.path.normcase(os.path.realpath(process.exe()))
+            expected_executable = os.path.normcase(
+                os.path.realpath(str(row["executable"]))
+            )
+            if actual_executable != expected_executable:
+                raise ValueError("process executable changed")
+            if abs(float(process.create_time()) - float(row["createTime"])) > 0.001:
+                raise ValueError("process creation time changed")
+            validated.append((pid, process))
+        except psutil.NoSuchProcess:
+            stopped.append(pid)
+        except (psutil.AccessDenied, OSError, ValueError, pywintypes.error) as exc:
+            return {
+                "ok": False, "code": "BROKER_STOP_IDENTITY_MISMATCH",
+                "error": str(exc), "running": True,
+            }
+
+    running = []
+    for pid, process in validated:
+        try:
+            process.terminate()
+            process.wait(timeout=5.0)
+            stopped.append(pid)
+        except psutil.NoSuchProcess:
+            stopped.append(pid)
+        except psutil.TimeoutExpired:
+            running.append(pid)
+        except (psutil.AccessDenied, OSError) as exc:
+            return {
+                "ok": False, "code": "BROKER_STOP_FAILED",
+                "error": str(exc), "stopped": stopped,
+                "running": [pid, *running],
+            }
+    if running:
+        return {
+            "ok": False, "code": "STOP_TIMEOUT",
+            "error": "one or more programs did not exit before timeout",
+            "stopped": stopped, "running": running,
+        }
+    return {"ok": True, "stopped": stopped, "running": []}
+
+
+def _scheduled(request: dict[str, object], owner_sid: str) -> dict[str, object]:
+    normalized = normalize_scheduled_request(request)
+    from localops.platform.windows import WindowsPlatform
+
+    platform = WindowsPlatform(os.getcwd(), sys.executable)
+    if platform.current_principal().identifier.casefold() != owner_sid.casefold():
+        return {
+            "ok": False, "code": "BROKER_SCHEDULED_OWNER_MISMATCH",
+            "error": "scheduled task owner SID changed",
+        }
+    operation = str(normalized["operation"])
+    if operation in {"list", "query"}:
+        snapshot = platform.scheduled_tasks(
+            None if operation == "list" else set(normalized["paths"])
+        )
+        return {
+            "ok": snapshot.status.value != "failed",
+            "operation": operation,
+            "status": snapshot.status.value,
+            "tasks": snapshot.tasks,
+            "issues": [{
+                "component": issue.component,
+                "code": issue.code,
+                "message": issue.message,
+                "degrades": issue.degrades,
+            } for issue in snapshot.issues],
+        }
+    if operation == "run":
+        result = platform.run_scheduled_task(str(normalized["path"]))
+    elif operation == "stop":
+        result = platform.stop_scheduled_task(str(normalized["path"]))
+    elif operation == "toggle":
+        result = platform.set_scheduled_task_enabled(
+            str(normalized["path"]), bool(normalized["enabled"])
+        )
+    else:
+        result = platform.set_scheduled_task_history_enabled(
+            bool(normalized["enabled"])
+        )
+    return {
+        "ok": result.ok,
+        "operation": operation,
+        "path": getattr(result, "task_path", None),
+        "enabled": getattr(result, "enabled", None),
+        "error": result.error,
+        "code": result.code,
+    }
+
+
 def _pipe_security(owner_sid: str) -> object:
     descriptor = win32security.SECURITY_DESCRIPTOR()
     descriptor.SetSecurityDescriptorDacl(
@@ -314,6 +472,9 @@ def serve() -> int:
             and abs(psutil.Process(pid).create_time() - created) <= 0.01
         ),
         launch=_launch,
+        observe=lambda request: _observe(request, owner_sid),
+        stop=lambda request: _stop(request, owner_sid),
+        scheduled=lambda request: _scheduled(request, owner_sid),
     )
     pipe_name = broker_pipe_name(owner_sid)
     failed_unlocks = 0
@@ -387,9 +548,10 @@ def _validate_install_paths(request_path: Path, response_path: Path) -> None:
     local_app_data = shell.SHGetKnownFolderPath(
         shell.FOLDERID_LocalAppData, 0, None
     )
-    data_root = Path(os.environ.get("CONSOLE_DATA_DIR") or (
-        Path(local_app_data) / "LocalOps"
-    )).resolve()
+    # ShellExecuteEx("runas") does not preserve process-local data overrides
+    # reliably. Broker installation therefore uses one fixed current-user
+    # transaction root even when the controller stores normal data elsewhere.
+    data_root = (Path(local_app_data) / "LocalOps").resolve()
     expected_root = (data_root / "runtime" / "elevation-install").resolve()
     parent = request_path.resolve().parent
     if (response_path.resolve().parent != parent

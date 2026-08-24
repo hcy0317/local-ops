@@ -218,8 +218,14 @@ launcher forms without executing them.
 
 Import never auto-discovers a source, never imports logs, and never overwrites
 an existing target app. Browser requests require the existing same-origin
-control session. Headerless loopback CLI JSON remains compatible and is still
-subject to the existing Host, content-type, and bounded-body checks.
+control session. Local CLI JSON requires the exact per-process bearer published
+in the current user's protected Local Ops data directory and remains subject to
+the Host, content-type, and bounded-body checks. Headerless loopback requests
+are rejected. An optional Tailscale Serve/Caddy loopback proxy may bootstrap a
+normal browser session only on the first read-only `GET /api/state` when the
+request has an HTTPS `.ts.net` same origin, one valid `Tailscale-User-Login`,
+and the exact bearer from the protected `tailscale-proxy-secret`. The response
+cookie is also `Secure`; proxy headers alone never authorize a mutation.
 
 ### Preview
 

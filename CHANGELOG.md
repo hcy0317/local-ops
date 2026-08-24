@@ -10,6 +10,7 @@
 
 ### Added
 
+- 增加可选的 Tailscale Serve 身份代理会话：回环 Caddy 网关以 Tailscale 用户头和受保护代理 bearer 双重证明身份，只读 `/api/state` 首请求可换取 Secure/HttpOnly/SameSite 浏览器会话；写请求和管理员能力仍分别要求会话与二次密码解锁。
 - 增加 Windows Phase 5 本地打包候选：Python 3.12 + PyInstaller onedir/windowed/x64 unsigned zip、确定性 checksum/manifest sidecars、包内容/版本/依赖/许可/敏感数据审计，以及只操作隔离夹具的最终 package smoke。
 - 增加冻结 windowed 入口；在无标准流时把诊断写入受保护的 Local AppData console log，并由同一 executable 分派 HTTP console 与 per-generation runner。
 - 增加 Windows Phase 4 生命周期源码候选：per-app runner、受保护 Named Pipe/回执、`CREATE_SUSPENDED` 启动、Named Job Object、generation compare-and-swap，以及普通停止与显式 Force 的分离流程。
@@ -38,6 +39,13 @@
 
 ### Changed
 
+- Windows 常驻总控台改为受保护 onedir `LocalOps.exe` 的 `RunLevel Limited` 计划任务；控制器若意外处于提权 token，会在创建普通受管进程前 fail closed。计划任务引用/启停、Docker Compose/单容器引用/启停和管理员程序启停能力保持不变。
+- Windows 管理员代理协议升级为 v2：除结构化启动外，还负责受保护程序的精确观察与非 Force 停止；旧 launch-only 代理必须显式升级后才显示停止入口。
+- 管理员代理升级会在新任务定义注册成功后精确停止旧固定实例，再由解锁流程启动新协议，避免旧进程继续占用 Named Pipe。
+- 管理员代理的 UAC 安装事务固定到当前用户 `%LOCALAPPDATA%\LocalOps\runtime\elevation-install`，不依赖提权进程可能丢失的 `CONSOLE_DATA_DIR` 环境覆盖，修复自定义数据目录下只显示 ACL 校验失败的问题。
+- broker 计划任务启动后，控制器会在有界期限内重试 Named Pipe 尚未出现、繁忙或短暂断开的状态，修复安装成功后立即解锁却提示 `WaitNamedPipe` 找不到文件的问题。
+- 管理员代理协议升级为 v3：当 Limited 控制器被系统拒绝连接 Task Scheduler COM 时，代理仅按规范化路径执行固定的计划任务查询、运行、停止、启禁和历史频道操作；写操作要求当前浏览器管理员会话，CLI 不继承权限。
+- 浏览器控制改为一次性 fragment bootstrap 换取 HttpOnly/SameSite 会话；本地 CLI 改用当前用户私有目录中的每进程 bearer，敏感 GET 与所有写接口不再接受 headerless loopback 请求。
 - Windows Phase 5 exact-CI engineering candidate `5daddece8a06d1fdd382d1814e58be7b777ceae4` 已通过 run `31780819809` 的 common、macOS full/source-release 与 Windows lifecycle/package gates，并上传可审计 unsigned artifact；完整 Phase 5 外部验收仍未关闭，因此状态保持 `IMPLEMENTED_UNVERIFIED`、`windowsBetaReady=false`。
 - Windows capability 现在只为完整验证的 Local Ops Job 开启 `launch_managed/stop_managed/force_stop_managed`；`kill_external/attach_external/restart_console` 保持关闭。
 - Windows 浏览器界面现在同时按全局 capability 与每应用 `lifecycleStatus/controlAvailable` 呈现操作，并为每次启动、停止、重启、运行中修改和删除冻结 `expectedGeneration`；外部进程控制入口仍保持禁用。
@@ -55,6 +63,11 @@
 
 ### Fixed
 
+- 修复管理员程序解锁后 `/api/state` 冷缓存约 12.7 秒、导致远程页面周期误报断连的问题：broker 现在先按进程名和完整 EXE 路径过滤，再只对匹配候选查询 SID/创建时间；现场冷缓存降至约 2.5–2.6 秒。
+- 收紧管理员代理安装边界：源码 checkout 现在会在包发现、路径选择和 UAC 前拒绝安装；HTTP 安装接口不再接受 `packageExecutable` 覆盖，只有当前冻结 Windows 包可以安装或升级自身。
+- 修复 Windows 单实例 Mutex 句柄默认可继承的问题：句柄现显式不可继承并轮换到新命名空间，旧控制器退出后，仍在运行的业务子进程不会阻塞新的 Limited 控制器。
+- 修复冻结 windowless 总控台轮询 Docker 时反复创建可见 `cmd/conhost` 窗口的问题；Docker CLI 默认 runner 现在始终使用 Windows `CREATE_NO_WINDOW`，Guard/Watchdog 定义未改动。
+- 修复受保护 `LocalOps-Console` 任务升级时停止后立即启动、与旧实例退出争抢 Mutex 的竞态；安装脚本会等待旧任务离开 Running/Queued 后再注册并启动新定义。
 - 修复 Windows 源码 venv redirector 在启动后立即退出、使短命 PID 被误作 runner 根身份的问题：runner 改由 base Python 承载，并通过 `__PYVENV_LAUNCHER__` 保留目标 venv 上下文。
 - 修复 runner 继承控制台导致目标没有私有 console group、冻结同 executable child 复用 PyInstaller 父进程环境、`win32timezone` 漏打包和相对 executable 解析不稳定的问题；现在先 `FreeConsole`/`AllocConsole`，为冻结 child 设置 `PYINSTALLER_RESET_ENVIRONMENT=1`，显式加入 hidden import，并在创建目标前解析绝对 executable。
 - 修复从服务监控加入启动台时只创建卡片、未认领来源进程的问题；创建与进程认领现由后端原子完成，项目命令识别完成前不能提前保存。明确认领的服务在 Next/Vite 等框架重建监听子进程、PID 变化后，会按端口、当前用户与真实项目目录唯一重新关联。
@@ -73,6 +86,10 @@
 
 ### Security
 
+- 管理员代理安装、解锁、启动和停止现在只接受完成 bootstrap 的浏览器会话；broker token 与逐浏览器 elevation 标记双重校验，避免另一个页面或本地 CLI 复用已解锁的管理员权限。
+- 管理员程序停止由 Highest broker 对完整 `pid + executable + createTime + owner SID` 集合先全部复验再执行；受限、混合、过期或部分可验证身份不授予停止，且不提供 force/restart。
+- 增加受保护 `control-credential.json` 与 CLI-only `/api/console/open`；浏览器 URL 中的短期 token 只放在 fragment、消费一次后立即从地址栏移除，不写配置或日志。
+- 增加 `tools/install_windows_console_task.ps1`，拒绝用户可写源码/venv 和 `Highest` 控制器入口，只允许受保护 `%ProgramFiles%\LocalOps\Broker` 冻结 EXE 注册为 Limited 常驻任务。
 - Windows Phase 5 发行审计拒绝用户数据、日志、runtime/token、凭据、缓存、个人绝对路径、不受支持的架构和缺失许可；本地 unsigned artifact 不会因 stripped child PATH smoke 被误标为干净无 Python VM 或 Beta。
 - Windows 受管生命周期仅信任当前 SID、generation、runner/root PID 创建时间、HMAC 回执和 Job Object 成员关系；普通停止不会自动升级为 Force，强制停止只终止验证通过的专属 Job。
 - raw control token 仅保存在受保护 runtime 文件和 runner 内存中，不进入配置、前端、命令行、日志或诊断；runner 异常退出通过 Job kill-on-close 仅清理自己的进程树。

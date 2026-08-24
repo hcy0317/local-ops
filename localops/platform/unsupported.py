@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Literal, Mapping
+from typing import Literal, Mapping, Sequence
 
 from .contracts import (
     CwdSnapshot,
@@ -177,6 +177,16 @@ class UnsupportedPlatform:
             self, command_spec: Mapping[str, object], cwd: str | None,
     ) -> ElevationBrokerResult:
         return ElevationBrokerResult(False, self._issue.message, self._issue.code)
+
+    def observe_elevated(
+            self, command_spec: Mapping[str, object],
+            cwd: str | None) -> ProcessSnapshot:
+        return ProcessSnapshot(ScanStatus.FAILED, issues=(self._issue,))
+
+    def stop_elevated(
+            self, favorite_executable: str,
+            processes: Sequence[Mapping[str, object]]) -> StopResult:
+        return StopResult(False, self._issue.message, code=self._issue.code)
 
     @staticmethod
     def extract_executable_icon(executable: str) -> bytes | None:

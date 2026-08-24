@@ -40,6 +40,54 @@
 - Reason: The smoke harness still has Python and test dependencies, and headless API contracts cannot prove OS integration or release reputation checks.
 - Consequence: The exact-CI engineering candidate may have `scopedTargetStatus=PASS` while Phase 5 remains `IMPLEMENTED_UNVERIFIED` and `lastGreenPhase=P4`. No local or hosted result may be relabeled as Windows 10, clean-machine, signed, or Beta evidence.
 
+## P5-D006 — Authenticate loopback control with process-scoped credentials
+
+- Status: Accepted in source and verified on the local Windows 11 host
+- Phase: P5
+- Decision: Leave static shell assets and `/api/health` readable on the exact loopback origin, but require every sensitive GET and all mutations to present either an HttpOnly/SameSite browser session obtained from a one-time URL-fragment bootstrap or the exact bearer stored in the current user's protected per-process control credential. Browser elevation is a second session-local authorization state; CLI bearer access can never install, unlock, launch, or stop through the elevation broker.
+- Reason: Loopback reachability, Host checks and JSON content type do not authenticate a local caller. A global broker-unlocked bit would also let an unrelated browser tab or CLI inherit administrator control.
+- Consequence: Headerless loopback clients fail closed. Duplicate launchers use the protected credential only to call `/api/console/open`, which causes the running process to issue a fresh one-time browser bootstrap without putting credentials in query strings, logs or configuration.
+
+## P5-D007 — Keep the controller Limited and put protected stop in the broker
+
+- Status: Accepted in source and verified on the local Windows 11 host
+- Phase: P5
+- Decision: Run the persistent `LocalOps-Console` task as the current user with `RunLevel Limited` from a protected `%ProgramFiles%` onedir package. An elevated controller refuses ordinary managed launch before creating runtime state. Keep one fixed Highest broker for administrator programs and extend its bounded authenticated protocol to observe and stop only a complete owner-SID, executable and creation-time identity set; never provide force or restart. Only a frozen Windows package may install itself as broker; source checkout fails before package discovery, path selection or UAC.
+- Reason: A Highest controller executing user-writable source turns any source replacement or ordinary favorite launch into administrator code execution. Conversely, an unelevated controller cannot safely revalidate protected process identity for administrator-program stop.
+- Consequence: Scheduled-task, Docker Compose/container and ordinary Job features remain in the Limited controller. Administrator start and stop remain available through the protected broker, but an older launch-only broker must be explicitly upgraded before stop is advertised. `tools/install_windows_console_task.ps1` rejects source/venv actions and verifies the final Limited task definition.
+
+## P5-D008 — Broker only fixed scheduled-task operations when Limited COM is denied
+
+- Status: Accepted in source and verified on the local Windows 11 host
+- Phase: P5
+- Decision: When the Limited controller cannot connect to Task Scheduler COM, broker protocol v3 accepts only normalized task paths and the fixed `list/query/run/stop/toggle/history` operations. Writes additionally require the current browser elevation session; CLI bearer access cannot borrow that authorization.
+- Reason: The persistent controller must remain Limited, but existing scheduled-task references still need truthful state and exact Run/Stop/Enabled/history control on hosts whose scheduler ACL denies Limited COM access.
+- Consequence: No shell text, task registration, action/trigger/principal mutation or PID control crosses the broker boundary. Live verification recovered all 11 configured references with zero `missing` rows after browser unlock.
+
+## P5-D009 — Make windowless polling and console replacement non-inheriting
+
+- Status: Accepted in source and verified on the local Windows 11 host
+- Phase: P5
+- Decision: Mark the per-data-directory Mutex handle non-inheritable and rotate its name away from the legacy namespace, add `CREATE_NO_WINDOW` to the default Docker CLI runner, and make the protected task installer wait for the previous console instance to leave Running/Queued before registering and starting its replacement.
+- Reason: The default pywin32 security attributes inherited the Mutex into managed children, leaving a stale writer lock after controller exit. A frozen windowless controller also caused Docker polling to create short-lived visible console hosts, while immediate task replacement could race the old process during upgrade.
+- Consequence: Existing business processes may keep running without blocking the replacement controller; Local Ops polling no longer creates `cmd`/`conhost` windows; future upgrades do not rely on a timing race. Guard and Watchdog task definitions remain unchanged.
+
+## P5-D010 — Bootstrap tailnet browsers only through an identity gateway and proxy bearer
+
+- Status: Accepted in source and verified on the live private tailnet route
+- Phase: P5
+- Decision: Keep Local Ops bound to `127.0.0.1`. An optional Tailscale Serve/Caddy gateway may preserve the real HTTPS Host/Origin/Referer and forward one Tailscale user identity plus a bearer read from the protected `tailscale-proxy-secret`. Only a read-only first `GET /api/state` with all proxy, `.ts.net` same-origin and identity evidence may receive a `Secure; HttpOnly; SameSite=Strict` browser session. Proxy headers never directly authorize writes or elevation.
+- Reason: The public shell was reachable through `hcy-ops`, but the new loopback session model correctly returned 403 for state. Trusting a user header alone would be locally spoofable, while rewriting Origin to localhost would hide cross-site requests.
+- Consequence: The private tailnet UI works without anonymous API access. Wrong/missing proxy bearer, missing identity, cross-site requests and direct writes fail closed. Administrator operations still require the current page to unlock the broker password; Funnel/public exposure remains prohibited.
+
+## P5-D011 — Filter administrator observations before token-owner queries
+
+- Status: Accepted in source and verified with the live v7 broker
+- Phase: P5
+- Decision: In the Highest broker, reject processes whose cheap basename and full EXE path cannot match the favorite before opening a process token for owner SID and before reading command line/creation time. Keep the existing full two-stage stop revalidation unchanged.
+- Reason: Three favorites each queried owner SID for every system process, producing a repeatable 12.6–12.8 second cold state build and periodic false disconnects through the 7-second browser timeout.
+- Consequence: Live remote cold state builds are 2.47–2.64 seconds and hot cache hits are 22–34ms; 12/12 measured requests returned 200 with `degraded=false`, while only matching candidates reach SID verification.
+
 ## P4-D001 — Bind every managed app generation to one runner-owned Job
 
 - Status: Accepted

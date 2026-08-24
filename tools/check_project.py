@@ -78,6 +78,7 @@ WINDOWS_REQUIRED_FILES = (
     "localops/windows/runner.py",
     "localops/windows/runner_protocol.py",
     "tools/build_windows.py",
+    "tools/install_windows_console_task.ps1",
     "tests/windows/test_command_spec.py",
     "tests/windows/test_runner.py",
     "tests/windows/test_runner_protocol.py",

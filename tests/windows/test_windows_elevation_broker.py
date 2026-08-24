@@ -1,6 +1,7 @@
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import server
@@ -13,6 +14,8 @@ from localops.platform.contracts import (
     Principal,
     ProcessSnapshot,
     ScanStatus,
+    ScheduledTaskRunResult,
+    ScheduledTaskSnapshot,
     StopResult,
 )
 from localops.platform.fake import FakePlatform
@@ -52,6 +55,7 @@ def broker_platform(*, installed=True, verified=True, unlocked=True):
         verified=verified,
         running=unlocked,
         unlocked=unlocked,
+        stop_supported=unlocked,
     )
     return FakePlatform(
         name="windows",
@@ -168,6 +172,40 @@ class ElevationBrokerStateTests(unittest.TestCase):
         self.assertEqual(app["lifecycleStatus"], "running")
         self.assertIsNone(app["runtimeIdentity"])
 
+    def test_broker_observation_restores_exact_stop_identity_for_protected_program(self):
+        platform = broker_platform(unlocked=True)
+        platform.processes = ProcessSnapshot(ScanStatus.PARTIAL, {
+            1300: {
+                "owner": None, "uid": None, "comm": "AdminTool.exe",
+                "args": r'AdminTool.exe --profile "alpha beta"',
+                "etime": 12, "createTime": None, "restricted": True,
+                "sessionId": 1,
+            },
+        })
+        platform.elevated_processes = ProcessSnapshot(ScanStatus.OK, {
+            1300: {
+                "owner": OWNER_SID, "uid": None, "comm": EXECUTABLE,
+                "args": r'C:\Tools\AdminTool.exe --profile "alpha beta"',
+                "etime": 12, "createTime": 1000.5, "restricted": False,
+                "sessionId": 1,
+            },
+        })
+        cfg = dict(server.Config.DEFAULT)
+        cfg["apps"] = [program_app()]
+
+        with mock.patch.object(server, "PLATFORM", platform), \
+                mock.patch.object(server, "SELF_PRINCIPAL", platform.principal), \
+                mock.patch.object(server, "build_services", return_value=([], set())), \
+                mock.patch.object(server, "build_watched", return_value=[]):
+            state = server.build_state(cfg, 9600, {})
+
+        app = state["apps"][0]
+        self.assertTrue(app["programIdentityVerified"])
+        self.assertTrue(app["programStopAvailable"])
+        self.assertIn(
+            "observe_elevated", [call[0] for call in platform.calls]
+        )
+
     def test_ambiguous_restricted_processes_are_not_observed(self):
         platform = broker_platform(unlocked=True)
         row = {
@@ -230,15 +268,19 @@ class ElevationBrokerHttpTests(unittest.TestCase):
         self.platform_patch.stop()
         self.log_dir.cleanup()
 
+    def unlock_browser_session(self):
+        status, body, _ = self.harness.request(
+            "POST", "/api/windows/elevation-broker/unlock",
+            {"password": "correct horse battery staple"}, self.headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+
     def test_install_derives_password_verifier_before_platform_boundary(self):
         password = "correct horse battery staple"
-        package_executable = r"C:\Local Ops\LocalOps.exe"
         status, body, _ = self.harness.request(
             "POST", "/api/windows/elevation-broker/install",
-            {
-                "password": password,
-                "packageExecutable": package_executable,
-            }, self.headers,
+            {"password": password}, self.headers,
         )
 
         self.assertEqual(status, 200)
@@ -248,7 +290,7 @@ class ElevationBrokerHttpTests(unittest.TestCase):
         password_record, selected_executable = call[1]
         self.assertNotIn(password, repr(password_record))
         self.assertIn("verifier", password_record)
-        self.assertEqual(selected_executable, package_executable)
+        self.assertIsNone(selected_executable)
 
     def test_unlock_is_session_only_and_not_written_to_config(self):
         before = self.harness.cfg.snapshot()
@@ -265,12 +307,69 @@ class ElevationBrokerHttpTests(unittest.TestCase):
             ("unlock_elevation_broker", "correct horse battery staple"),
         )
 
-    def test_install_rejects_non_string_package_executable(self):
+    def test_cli_bearer_cannot_unlock_or_reuse_browser_elevation(self):
+        headers = {
+            "Authorization": "Bearer " + self.harness.httpd.cli_token,
+            "Content-Type": "application/json",
+        }
+        status, body, _ = self.harness.request(
+            "POST", "/api/windows/elevation-broker/unlock",
+            {"password": "correct horse battery staple"}, headers,
+        )
+
+        self.assertEqual(status, 403)
+        self.assertEqual(body["code"], "BROWSER_SESSION_REQUIRED")
+        self.assertNotIn(
+            "unlock_elevation_broker", [call[0] for call in self.platform.calls]
+        )
+
+    def test_state_projects_elevation_control_to_current_browser_session(self):
+        status, state, _ = self.harness.request(
+            "GET", "/api/state", headers=self.headers)
+        self.assertEqual(status, 200)
+        self.assertFalse(state["elevationBroker"]["sessionAuthorized"])
+        self.assertFalse(state["apps"][0]["controlAvailable"])
+
+        self.unlock_browser_session()
+        status, state, _ = self.harness.request(
+            "GET", "/api/state", headers=self.headers)
+        self.assertEqual(status, 200)
+        self.assertTrue(state["elevationBroker"]["sessionAuthorized"])
+        self.assertTrue(state["apps"][0]["controlAvailable"])
+
+        cli_headers = {
+            "Authorization": "Bearer " + self.harness.httpd.cli_token,
+        }
+        status, state, _ = self.harness.request(
+            "GET", "/api/state", headers=cli_headers)
+        self.assertEqual(status, 200)
+        self.assertFalse(state["elevationBroker"]["sessionAuthorized"])
+        self.assertFalse(state["apps"][0]["controlAvailable"])
+
+    def test_state_revokes_stale_browser_elevation_when_broker_locks(self):
+        self.unlock_browser_session()
+        self.platform.elevation_status = ElevationBrokerStatus(
+            installed=True,
+            verified=True,
+            running=False,
+            unlocked=False,
+            stop_supported=False,
+        )
+        server.invalidate_state_cache()
+
+        status, state, _ = self.harness.request(
+            "GET", "/api/state", headers=self.headers)
+
+        self.assertEqual(status, 200)
+        self.assertFalse(state["elevationBroker"]["sessionAuthorized"])
+        self.assertFalse(state["apps"][0]["controlAvailable"])
+
+    def test_install_rejects_source_package_override(self):
         status, body, _ = self.harness.request(
             "POST", "/api/windows/elevation-broker/install",
             {
                 "password": "correct horse battery staple",
-                "packageExecutable": 42,
+                "packageExecutable": r"C:\Local Ops\LocalOps.exe",
             }, self.headers,
         )
 
@@ -286,6 +385,19 @@ class ElevationBrokerHttpTests(unittest.TestCase):
             {"expectedGeneration": None}, self.headers,
         )
 
+        self.assertEqual(status, 403)
+        self.assertEqual(body["code"], "ELEVATION_SESSION_REQUIRED")
+        self.assertNotIn(
+            "launch_elevated", [call[0] for call in self.platform.calls]
+        )
+
+        self.unlock_browser_session()
+
+        status, body, _ = self.harness.request(
+            "POST", "/api/apps/deadbeef/start",
+            {"expectedGeneration": None}, self.headers,
+        )
+
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
         self.assertEqual(body["pid"], 4321)
@@ -295,6 +407,7 @@ class ElevationBrokerHttpTests(unittest.TestCase):
 
     def test_owned_elevated_program_stop_requires_exact_observed_processes(self):
         self.platform.stop_result = StopResult(True)
+        self.unlock_browser_session()
         self.platform.processes = ProcessSnapshot(ScanStatus.OK, {
             1200: {
                 "owner": OWNER_SID,
@@ -325,18 +438,19 @@ class ElevationBrokerHttpTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
-        self.assertIn(
-            ("stop_external_process", (1200, False, EXECUTABLE, 1000.5)),
-            self.platform.calls,
-        )
-        self.assertIn(
-            ("stop_external_process", (
-                1201, False, r"C:\Tools\bin\AdminTool.exe", 1001.5,
-            )),
-            self.platform.calls,
-        )
+        self.assertIn((
+            "stop_elevated",
+            (
+                EXECUTABLE,
+                (
+                    (1200, 1000.5, EXECUTABLE),
+                    (1201, 1001.5, r"C:\Tools\bin\AdminTool.exe"),
+                ),
+            ),
+        ), self.platform.calls)
 
     def test_elevated_program_stop_rejects_stale_observation(self):
+        self.unlock_browser_session()
         self.platform.processes = ProcessSnapshot(ScanStatus.OK, {
             1200: {
                 "owner": OWNER_SID,
@@ -358,7 +472,7 @@ class ElevationBrokerHttpTests(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(body["code"], "PROGRAM_OBSERVATION_MISMATCH")
         self.assertNotIn(
-            "stop_external_process", [call[0] for call in self.platform.calls]
+            "stop_elevated", [call[0] for call in self.platform.calls]
         )
 
     def test_delete_removes_only_favorite_without_broker_uac(self):
@@ -375,8 +489,180 @@ class ElevationBrokerHttpTests(unittest.TestCase):
         self.assertEqual(self.harness.cfg.snapshot()["apps"], [])
 
 
+@unittest.skipUnless(sys.platform == "win32", "Windows broker runtime only")
+class ElevationBrokerRuntimeTests(unittest.TestCase):
+    def test_broker_queries_and_stops_only_normalized_scheduled_task_path(self):
+        platform = mock.Mock()
+        platform.current_principal.return_value = Principal(OWNER_SID)
+        platform.scheduled_tasks.return_value = ScheduledTaskSnapshot(
+            ScanStatus.OK,
+            {r"\memos-guard": {
+                "path": r"\Memos-Guard", "state": "running",
+            }},
+        )
+        platform.stop_scheduled_task.return_value = ScheduledTaskRunResult(
+            True, r"\Memos-Guard"
+        )
+        with mock.patch(
+                "localops.platform.windows.WindowsPlatform",
+                return_value=platform):
+            queried = broker_runtime._scheduled({
+                "operation": "query", "paths": [r"\Memos-Guard"],
+            }, OWNER_SID)
+            stopped = broker_runtime._scheduled({
+                "operation": "stop", "path": r"\Memos-Guard",
+            }, OWNER_SID)
+
+        self.assertTrue(queried["ok"])
+        self.assertEqual(queried["tasks"][r"\memos-guard"]["state"], "running")
+        self.assertTrue(stopped["ok"])
+        platform.scheduled_tasks.assert_called_once_with({r"\Memos-Guard"})
+        platform.stop_scheduled_task.assert_called_once_with(r"\Memos-Guard")
+
+    def test_broker_observes_and_stops_only_exact_owned_process_identity(self):
+        process = mock.Mock()
+        process.pid = 4301
+        process.name.return_value = "AdminTool.exe"
+        process.exe.return_value = EXECUTABLE
+        process.cmdline.return_value = [
+            EXECUTABLE, "--profile", "alpha beta",
+        ]
+        process.create_time.return_value = 1000.25
+
+        launch_request = {
+            "executable": EXECUTABLE,
+            "args": ["--profile", "alpha beta"],
+            "cwd": r"C:\Tools",
+        }
+        with mock.patch.object(
+                broker_runtime.psutil, "process_iter", return_value=[process]), \
+                mock.patch.object(
+                    broker_runtime, "_owner_sid", return_value=OWNER_SID):
+            observed = broker_runtime._observe(launch_request, OWNER_SID)
+
+        self.assertTrue(observed["ok"])
+        self.assertEqual(observed["processes"][0]["pid"], 4301)
+
+        stop_request = {
+            "favoriteExecutable": EXECUTABLE,
+            "processes": [{
+                "pid": 4301,
+                "createTime": 1000.25,
+                "executable": EXECUTABLE,
+            }],
+        }
+        with mock.patch.object(
+                broker_runtime.psutil, "Process", return_value=process), \
+                mock.patch.object(
+                    broker_runtime, "_owner_sid", return_value=OWNER_SID):
+            stopped = broker_runtime._stop(stop_request, OWNER_SID)
+
+        self.assertTrue(stopped["ok"])
+        process.terminate.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=5.0)
+
+    def test_broker_observation_queries_owner_only_for_matching_executable_name(self):
+        noise = mock.Mock()
+        noise.pid = 4200
+        noise.name.return_value = "unrelated.exe"
+        noise.exe.side_effect = AssertionError(
+            "noise process must be rejected before executable or owner queries"
+        )
+        match = mock.Mock()
+        match.pid = 4301
+        match.name.return_value = "AdminTool.exe"
+        match.exe.return_value = EXECUTABLE
+        match.cmdline.return_value = [EXECUTABLE]
+        match.create_time.return_value = 1000.25
+
+        with mock.patch.object(
+                broker_runtime.psutil, "process_iter",
+                return_value=[noise, match]), mock.patch.object(
+                    broker_runtime, "_owner_sid",
+                    return_value=OWNER_SID) as owner_sid:
+            observed = broker_runtime._observe({
+                "executable": EXECUTABLE,
+                "args": [],
+                "cwd": r"C:\Tools",
+            }, OWNER_SID)
+
+        self.assertTrue(observed["ok"])
+        self.assertEqual([row["pid"] for row in observed["processes"]], [4301])
+        owner_sid.assert_called_once_with(4301)
+
+    def test_broker_rejects_stale_identity_before_termination(self):
+        process = mock.Mock()
+        process.exe.return_value = EXECUTABLE
+        process.create_time.return_value = 1001.0
+        request = {
+            "favoriteExecutable": EXECUTABLE,
+            "processes": [{
+                "pid": 4301,
+                "createTime": 1000.25,
+                "executable": EXECUTABLE,
+            }],
+        }
+        with mock.patch.object(
+                broker_runtime.psutil, "Process", return_value=process), \
+                mock.patch.object(
+                    broker_runtime, "_owner_sid", return_value=OWNER_SID):
+            result = broker_runtime._stop(request, OWNER_SID)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "BROKER_STOP_IDENTITY_MISMATCH")
+        process.terminate.assert_not_called()
+
+
 @unittest.skipUnless(sys.platform == "win32", "Windows installer helper only")
 class ElevationBrokerInstallerTests(unittest.TestCase):
+    def test_install_path_validation_ignores_custom_console_data_override(self):
+        with tempfile.TemporaryDirectory() as root:
+            local_app_data = Path(root) / "LocalAppData"
+            transaction = (
+                local_app_data / "LocalOps" / "runtime"
+                / "elevation-install" / ("a" * 32)
+            )
+            request_path = transaction / "request.json"
+            response_path = transaction / "response.json"
+
+            with mock.patch.dict(
+                    "os.environ",
+                    {"CONSOLE_DATA_DIR": str(Path(root) / "CustomData")}), \
+                    mock.patch.object(
+                        broker_runtime.shell, "SHGetKnownFolderPath",
+                        return_value=str(local_app_data)):
+                broker_runtime._validate_install_paths(
+                    request_path, response_path
+                )
+
+    def test_task_upgrade_stops_the_previous_broker_instance(self):
+        service = mock.Mock()
+        folder = mock.Mock()
+        definition = mock.Mock()
+        action = mock.Mock()
+        registered = mock.Mock()
+        registered.State = 4
+        registered.Stop.side_effect = lambda _flags: setattr(
+            registered, "State", 3
+        )
+        service.GetFolder.return_value = folder
+        service.NewTask.return_value = definition
+        definition.Actions.Create.return_value = action
+        folder.RegisterTaskDefinition.return_value = registered
+
+        with mock.patch.object(
+                broker_runtime.win32com.client, "Dispatch",
+                return_value=service):
+            broker_runtime._register_task({
+                "ownerSid": OWNER_SID,
+                "executable": r"C:\Program Files\LocalOps\Broker\v2\LocalOps.exe",
+                "arguments": "-m localops.windows.elevation_broker serve",
+                "workingDirectory": r"C:\Program Files\LocalOps\Broker\v2",
+                "sddl": "D:P(A;;FA;;;SY)",
+            })
+
+        registered.Stop.assert_called_once_with(0)
+
     def test_elevated_helper_rejects_a_modified_install_transaction(self):
         request = {
             "schema": "localops-elevation-install.v1",

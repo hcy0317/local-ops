@@ -2,7 +2,7 @@
 
 **Preview / Alpha · 源码预览**
 
-总控台是一个本地服务、Docker 资源、批处理任务与常用程序快速启动和运行监测工具。macOS 版本保留完整现有功能；Windows 当前是通过 exact-commit CI 的 Phase 5 unsigned engineering candidate，提供安全的本地监听与进程观察、结构化命令配置、显式 macOS 配置导入，以及仅面向 Local Ops 自己创建的 Job Object 进程树控制。Windows 10、独立干净无 Python VM、Defender/SmartScreen、原生集成、品牌审核与签名门禁尚未完成，因此仍是 Preview / Alpha，而不是 Windows Beta。共享核心只绑定回环地址；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
+总控台是一个本地服务、Docker 资源、批处理任务与常用程序快速启动和运行监测工具。macOS 版本保留完整现有功能；Windows 当前是通过 exact-commit CI 的 Phase 5 unsigned engineering candidate，提供安全的本地监听与进程观察、结构化命令配置、显式 macOS 配置导入，以及仅面向 Local Ops 自己创建的 Job Object 进程树控制。Windows 10、独立干净无 Python VM、Defender/SmartScreen、原生集成、品牌审核与签名门禁尚未完成，因此仍是 Preview / Alpha，而不是 Windows Beta。共享核心只绑定回环地址；可选远程入口必须经私有 tailnet 的 Tailscale Serve 身份网关与 Local Ops 代理密钥双重验证，禁止 Funnel/公网暴露。前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
 
 > 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整；`总控台.app` 目前不是可单独复制的自包含应用，也尚不代表经过签名、公证的最终 macOS 发行版。
 
@@ -62,7 +62,7 @@ Windows 用户数据固定写入 `%LOCALAPPDATA%\LocalOps\`。最终私有对象
 
 Windows 不会自动发现或导入项目内旧 `data/` 或 macOS 配置。设置中心的导入向导只接受用户明确选择的本地 JSON 文件，并按“预览 → 路径映射 → 选择 → 提交”执行；预览零写入，提交不覆盖同 ID 应用、清空旧运行身份，并可在目标未发生后续修改时回滚。UNC/设备路径不会被探测或导入。
 
-Windows runner 是每个受管应用 Job Object 的唯一长期句柄持有者。目标进程先以 `CREATE_SUSPENDED` 创建，加入受保护 Job 并持久化精确 runtime identity 后才允许恢复；普通停止超时会保留身份，只有用户明确确认的 Force 操作才能通过 `TerminateJobObject` 结束该 Job。控制台关闭不会关闭 Job，runner 异常退出则通过 kill-on-close 清理自己的 Job。
+Windows runner 是每个受管应用 Job Object 的唯一长期句柄持有者。目标进程先以 `CREATE_SUSPENDED` 创建，加入受保护 Job 并持久化精确 runtime identity 后才允许恢复；普通停止超时会保留身份，只有用户明确确认的 Force 操作才能通过 `TerminateJobObject` 结束该 Job。控制台关闭不会关闭 Job，runner 异常退出则通过 kill-on-close 清理自己的 Job。常驻 Windows 控制器必须从受保护 `%ProgramFiles%` onedir 以 `RunLevel Limited` 运行；检测到控制器自身已提权时，普通服务/任务启动会在创建任何 runtime record 或子进程前拒绝，避免把管理员 token 传给非管理员收藏项。
 
 request/receipt 原子写入会先保护临时文件的 DACL，再替换为公开可见的最终文件。释放 active generation 前必须验证目录恰好包含三个私有 runtime records、terminal receipt 签名有效、Job 已空且 runner 不再存在；随后将 active 目录原子 rename 为严格派生的 cleanup tombstone，这次 rename 是 release commit。commit 后的恢复只删除 private、nonlink tombstone 中三个 runtime record 的 allowlisted subset，不做任何进程观察或控制；未知项、宽 ACL 或 link 会 fail closed 并保留 tombstone。
 
@@ -79,6 +79,8 @@ Windows 仍不支持外部进程认领、外部进程结束和总控台重启。
 - 外部任务不是 Local Ops Job。“停止”只调用 Task Scheduler COM `Stop(0)` 停止该注册项的运行实例，不按 PID 结束进程，也不禁用或删除任务；强制停止和重启仍不提供。删除卡片只移除监控配置，不停止、禁用或删除 Windows 计划任务。
 - 受保护系统进程或工作目录不可读取属于预期的 Windows 可见性限制，只显示提示，不再把健康状态错误标记为“降级”。任务库读取失败、配置损坏或关键组件扫描失败仍会进入降级状态。
 
+常驻 Limited 控制器会先尝试原生 Task Scheduler COM。若本机把 COM 服务整体限制为管理员访问，已解锁的固定 broker 会按规范化任务路径代理只读查询以及 run/stop/toggle/history 固定操作；这些写操作同时要求当前 HttpOnly 浏览器会话已完成管理员解锁，CLI bearer 与其他页面不能复用。
+
 接口和状态字段见 [`docs/windows-task-scheduler.md`](docs/windows-task-scheduler.md)。
 
 ### Docker 收藏
@@ -93,9 +95,20 @@ Windows 仍不支持外部进程认领、外部进程结束和总控台重启。
 
 ### Windows 管理员程序
 
-管理员启动使用一个固定、无触发器的 Task Scheduler broker，而不是为每个 EXE 新建提权任务。首次安装代理时会出现一次 UAC，并设置至少 8 个字符的自定义密码；此后每次 Local Ops 进程启动只需输入一次密码，解锁状态只保存在该进程内存中。Local Ops 退出、进程身份变化、代理重启或会话令牌失效后都必须重新输入。
+管理员启动使用一个固定、无触发器的 Task Scheduler broker，而不是为每个 EXE 新建提权任务。首次安装或升级代理时会出现一次 UAC，并设置至少 8 个字符的自定义密码；此后每次 Local Ops 进程启动只需输入一次密码。broker token 只保存在控制器内存中，管理员操作权限还会单独绑定到完成解锁的 HttpOnly 浏览器会话；另一个页面、本地 CLI、Local Ops 退出、进程身份变化、代理重启或任一会话失效都不能复用该权限。
 
-代理只接受绝对 `.exe` 路径、字符串参数数组和绝对工作目录，并以 `shell=False` 启动。添加 EXE 时会通过固定的系统图标 API 读取关联图标，不执行目标程序；用户选择的 glyph 或后续上传图片仍会覆盖自动图标。删除程序不会卸载代理。可读进程按当前用户、同名 EXE、受限安装目录和参数观察；只有当前用户 SID、完整 EXE 路径和创建时间全部可验证的实例才显示停止入口，确认后服务端与 Windows 边界再次核对 `pid + executable + createTime`。Windows 完全隐藏身份和路径时，只接受当前会话内唯一、同名且无参数的候选用于只读观察，不授予停止权限。打包版可直接安装代理；源码模式会自动发现数据目录 `packages/` 下最近部署且通过元数据与运行时检查的 Windows onedir `LocalOps.exe`，只有未发现有效包时才打开人工选择兜底，再由该打包程序完成 UAC 安装。计划任务始终固定到复制进 `%ProgramFiles%\LocalOps\Broker\<hash>` 的受保护 EXE，不会指向用户可写的 Python 源码。新代理与首次 UAC 路径仍属于本分支的工程实现，尚未完成签名包、干净 VM、Defender/SmartScreen 和真实 UAC 材料门禁，因此不改变 `phaseStatus=IMPLEMENTED_UNVERIFIED` 或 `windowsBetaReady=false`。
+代理只接受绝对 `.exe` 路径、字符串参数数组和绝对工作目录，并以 `shell=False` 启动。添加 EXE 时会通过固定的系统图标 API 读取关联图标，不执行目标程序；用户选择的 glyph 或后续上传图片仍会覆盖自动图标。删除程序不会卸载代理。管理员程序的观察与停止也在代理内执行：只有当前用户 SID、完整 EXE 路径和创建时间全部可验证，且与收藏 EXE 的名称和受限目录一致的全部实例才显示停止入口；确认后代理会先复验全部身份，再执行非 Force 停止。受限、混合、过期或部分可验证的实例保持只读，管理员程序不提供强制停止或重启。只有冻结 Windows 包可以安装或升级代理；源码 checkout 在包发现、路径选择和 UAC 之前 fail closed。代理任务与常驻 Limited 总控台任务都固定到复制进 `%ProgramFiles%\LocalOps\Broker\<hash>` 的受保护 EXE，不会指向用户可写的 Python 源码。新代理与 UAC 路径仍属于本分支的工程实现，尚未完成签名包、干净 VM、Defender/SmartScreen 和真实 UAC 材料门禁，因此不改变 `phaseStatus=IMPLEMENTED_UNVERIFIED` 或 `windowsBetaReady=false`。
+
+完成受保护包安装后，用管理员 PowerShell 注册常驻非提权控制器；`-Activate` 会在验证新任务定义后切换当前实例：
+
+```powershell
+.\tools\install_windows_console_task.ps1 `
+  -PackageExecutable 'C:\Program Files\LocalOps\Broker\<hash>\LocalOps.exe' `
+  -Port 9600 -Activate
+```
+
+脚本只接受受保护 broker 根目录中的冻结 EXE，注册 `LocalOps-Console` 为当前用户交互式 `RunLevel Limited`，不会再让 `Highest` 任务执行源码 `server.py` 或 `.venv`。
+激活升级会等待旧控制台任务实例退出后再启动新定义；Windows 单实例 Mutex 不向业务子进程继承，冻结控制台的 Docker/固定系统 CLI 也不会创建可见 `cmd/conhost` 窗口。
 
 安装、解锁、会话与安全边界见 [`docs/windows-elevation-broker.md`](docs/windows-elevation-broker.md)。
 
@@ -128,6 +141,8 @@ exact-commit CI run `31780819809` 的 common job `94705997033`、macOS full/sour
 1. 从 Windows CI artifact 或本地 `tools\build_windows.py build` 输出取得 `local-ops-<VERSION>-windows-x64-unsigned.zip`、同名 `.sha256` 与 manifest。
 2. 校验 SHA-256，并将 ZIP 完整解压到当前用户可读取的固定目录；不要只移动 `LocalOps.exe`，它依赖同目录的 `_internal` 与静态资源。
 3. 双击 `LocalOps.exe`。程序只绑定回环地址，并自动打开浏览器；用户配置、图标、日志和 runtime records 写入 `%LOCALAPPDATA%\LocalOps\`，不会写入程序目录。
+
+可选的 Tailscale 入口不能直接把 9600 暴露给 tailnet。身份网关必须只监听回环，先校验 Tailscale 用户身份，再把 `%LOCALAPPDATA%\LocalOps\tailscale-proxy-secret` 以只读 Docker secret 注入专用代理 bearer，并保留真实 HTTPS Host/Origin/Referer。首次只读状态请求会获得 Secure 浏览器会话；写操作不能直接借用代理头，管理员程序与 broker 计划任务控制仍需在当前页面输入密码。
 
 当前 ZIP 明确标记为 `UNSIGNED DEVELOPMENT BUILD`，不是 Windows Beta 或签名发行版。若 Defender/SmartScreen 阻止运行，应保留并记录结果，使用源码模式或自行从已审核源码构建；不要关闭系统安全保护来绕过门禁。
 

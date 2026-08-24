@@ -100,6 +100,8 @@ class ElevationBrokerStatus:
     verified: bool = False
     running: bool = False
     unlocked: bool = False
+    stop_supported: bool = False
+    scheduled_supported: bool = False
     issue: PlatformIssue | None = None
 
 
@@ -331,6 +333,13 @@ class PlatformBackend(Protocol):
     def launch_elevated(
         self, command_spec: Mapping[str, object], cwd: str | None,
     ) -> ElevationBrokerResult: ...
+    def observe_elevated(
+        self, command_spec: Mapping[str, object], cwd: str | None,
+    ) -> ProcessSnapshot: ...
+    def stop_elevated(
+        self, favorite_executable: str,
+        processes: Sequence[Mapping[str, object]],
+    ) -> StopResult: ...
     def extract_executable_icon(self, executable: str) -> bytes | None: ...
     def pick_path(self, kind: Literal["dir", "script", "exe"]) -> PickResult: ...
     def open_browser(self, url: str) -> None: ...

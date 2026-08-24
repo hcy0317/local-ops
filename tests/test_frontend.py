@@ -392,9 +392,9 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn('id="brokerPasswordMask"', html)
         self.assertIn("'/api/windows/elevation-broker/install'", overlays)
         self.assertIn("'/api/windows/elevation-broker/unlock'", overlays)
-        self.assertIn("'BROKER_PACKAGE_REQUIRED'", overlays)
-        self.assertIn("packageExecutable", overlays)
-        self.assertIn("系统会自动使用已部署的 Windows 伴随包", overlays)
+        self.assertNotIn("'BROKER_PACKAGE_REQUIRED'", overlays)
+        self.assertNotIn("packageExecutable", overlays)
+        self.assertIn("只能由冻结 Windows 包安装或升级", overlays)
         self.assertRegex(
             overlays,
             r"post\('/api/pick', \{\s*what: modalKind === 'program'"
@@ -867,6 +867,27 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 self.assertTrue((ROOT / "static/assets" / name).is_file())
+
+    def test_browser_control_session_bootstraps_from_one_time_fragment(self):
+        app = (ROOT / "static/app.js").read_text(encoding="utf-8")
+        core = (ROOT / "static/js/core.js").read_text(encoding="utf-8")
+
+        self.assertIn("bootstrapControlSession", app)
+        self.assertIn("await bootstrapControlSession()", app)
+        self.assertIn("window.location.hash", core)
+        self.assertIn("'/api/session/bootstrap'", core)
+        self.assertIn("history.replaceState", core)
+        self.assertNotIn("localStorage.setItem('console-control", core)
+
+    def test_settings_can_upgrade_the_protected_elevation_broker(self):
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+        widgets = (ROOT / "static/js/widgets.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="setBrokerUpgrade"', html)
+        self.assertIn("openBrokerPassword('install')", widgets)
+        self.assertIn("openBrokerPassword(mode", overlays)
+        self.assertIn("mode === 'install'", overlays)
 
 
 if __name__ == "__main__":

@@ -349,7 +349,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             return port
         raise AssertionError("no free Local Ops console port is available")
 
-    def _headerless_json_api(
+    def _authenticated_json_api(
         self,
         port: int,
         method: str,
@@ -361,11 +361,18 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         body = None
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        with (self.data_dir / "control-credential.json").open(
+                "r", encoding="utf-8") as stream:
+            credential = json.load(stream)
+        if credential.get("port") != port or not isinstance(
+                credential.get("token"), str):
+            raise AssertionError("control credential does not match console port")
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
         try:
-            # Host is the only automatically generated trust header. No Origin,
-            # Sec-Fetch-* metadata, cookie, or control token is sent.
             connection.putrequest(method, path, skip_accept_encoding=True)
+            connection.putheader(
+                "Authorization", "Bearer " + credential["token"]
+            )
             if body is not None:
                 connection.putheader("Content-Type", "application/json")
                 connection.putheader("Content-Length", str(len(body)))
@@ -442,7 +449,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
                     "(exit=%d, log=%r)" % (returncode, self._console_log_tail())
                 )
             try:
-                status, state = self._headerless_json_api(
+                status, state = self._authenticated_json_api(
                     port, "GET", "/api/state", timeout=3.0
                 )
                 if (
@@ -473,7 +480,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             self.current_console = None
 
     def _state_row(self, port: int) -> tuple[dict[str, object], dict[str, object] | None]:
-        status, state = self._headerless_json_api(port, "GET", "/api/state")
+        status, state = self._authenticated_json_api(port, "GET", "/api/state")
         self.assertEqual(status, 200)
         row = next(
             (app for app in state.get("apps", []) if app.get("id") == self.app_id),
@@ -591,7 +598,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             )
 
     def _stop_through_api(self, port: int, generation: str):
-        status, stopped = self._headerless_json_api(
+        status, stopped = self._authenticated_json_api(
             port,
             "POST",
             "/api/apps/%s/stop" % self.app_id,
@@ -605,7 +612,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             self.assertEqual(fresh_identity.get("generationId"), generation)
             self.assertEqual(fresh.get("lifecycleStatus"), "running")
             self.assertTrue(fresh.get("controlAvailable"))
-            status, stopped = self._headerless_json_api(
+            status, stopped = self._authenticated_json_api(
                 port,
                 "POST",
                 "/api/apps/%s/stop" % self.app_id,
@@ -778,7 +785,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             "text": self._powershell_tcp_fixture(service_port),
             "needsReview": False,
         }
-        status, created = self._headerless_json_api(
+        status, created = self._authenticated_json_api(
             self.console_port,
             "POST",
             "/api/apps",
@@ -796,7 +803,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         self.assertFalse(created["commandSpec"]["needsReview"])
 
         self.lifecycle_requested = True
-        status, started = self._headerless_json_api(
+        status, started = self._authenticated_json_api(
             self.console_port,
             "POST",
             "/api/apps/%s/start" % self.app_id,
@@ -842,7 +849,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         self.assertEqual(running_row["port"], service_port)
 
         def log_is_ready():
-            status, log = self._headerless_json_api(
+            status, log = self._authenticated_json_api(
                 int(self.console_port),
                 "GET",
                 "/api/apps/%s/logs?tail=200" % self.app_id,
@@ -921,7 +928,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             message="packaged runtime records were not cleaned",
         )
 
-        status, deleted = self._headerless_json_api(
+        status, deleted = self._authenticated_json_api(
             self.console_port,
             "DELETE",
             "/api/apps/%s" % self.app_id,

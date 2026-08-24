@@ -565,6 +565,24 @@ class MacOSPlatform:
         )
 
     @staticmethod
+    def observe_elevated(
+            command_spec: Mapping[str, object],
+            cwd: str | None) -> ProcessSnapshot:
+        return ProcessSnapshot(ScanStatus.FAILED, issues=(_issue(
+            "elevation_broker", "UNSUPPORTED_PLATFORM",
+            "Windows elevation broker is unavailable on macOS",
+        ),))
+
+    @staticmethod
+    def stop_elevated(
+            favorite_executable: str,
+            processes: Sequence[Mapping[str, object]]) -> StopResult:
+        return StopResult(
+            False, "Windows elevation broker is unavailable on macOS",
+            code="UNSUPPORTED_PLATFORM",
+        )
+
+    @staticmethod
     def extract_executable_icon(executable: str) -> bytes | None:
         return None
 

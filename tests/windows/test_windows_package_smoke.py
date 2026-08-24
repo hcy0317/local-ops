@@ -482,17 +482,26 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         if status == 200 and payload.get("ok") is not False:
             return
         self.fail(
-            "%s failed (status=%d, code=%r, error=%r)"
+            "%s failed (status=%d, code=%r, error=%r, console=%r, app=%r)"
             % (
                 action,
                 status,
                 self._sanitize(payload.get("code")),
                 self._sanitize(payload.get("error")),
+                self._console_log_tail(),
+                self._app_log_tail(),
             )
         )
 
     def _console_log_tail(self) -> str:
-        path = self.log_dir / "console.log"
+        return self._log_tail(self.log_dir / "console.log")
+
+    def _app_log_tail(self) -> str:
+        if not self.app_id:
+            return "<unavailable:no-app-id>"
+        return self._log_tail(self.log_dir / (self.app_id + ".log"))
+
+    def _log_tail(self, path: Path) -> str:
         try:
             with path.open("rb") as stream:
                 stream.seek(0, os.SEEK_END)

@@ -630,7 +630,10 @@ class WindowsPackageSmokeTests(unittest.TestCase):
                         None,
                         None,
                         False,
-                        win32process.CREATE_UNICODE_ENVIRONMENT,
+                        (
+                            win32process.CREATE_BREAKAWAY_FROM_JOB
+                            | win32process.CREATE_UNICODE_ENVIRONMENT
+                        ),
                         self.child_environment,
                         str(self.work_dir),
                         startup,

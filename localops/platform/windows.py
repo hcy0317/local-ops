@@ -575,6 +575,7 @@ class WindowsPlatform:
                 processes[pid] = {
                     "owner": owner,
                     "uid": None,
+                    "createTime": float(info.get("create_time") or 0.0),
                     "etime": max(0, int(now - (info.get("create_time") or now))),
                     "cpu": cpu,
                     "mem": float(info.get("memory_percent") or 0.0),
@@ -702,6 +703,7 @@ class WindowsPlatform:
                 processes[pid] = {
                     "owner": owner,
                     "uid": None,
+                    "createTime": float(info.get("create_time") or 0.0),
                     "etime": max(0, int(now - (info.get("create_time") or now))),
                     "cpu": cpu,
                     "mem": float(info.get("memory_percent") or 0.0),
@@ -719,6 +721,7 @@ class WindowsPlatform:
                     processes[pid] = {
                         "owner": owner,
                         "uid": None,
+                        "createTime": None,
                         "etime": None,
                         "cpu": 0.0,
                         "mem": 0.0,
@@ -2644,9 +2647,65 @@ class WindowsPlatform:
                 code=getattr(exc, "code", "RUNTIME_CONTROL_FAILED"),
             )
 
-    @staticmethod
-    def stop_external_process(pid: int, force: bool = False) -> StopResult:
-        return StopResult(False, "Windows external process control is disabled")
+    def stop_external_process(
+        self,
+        pid: int,
+        force: bool = False,
+        *,
+        expected_executable: str | None = None,
+        expected_create_time: float | None = None,
+    ) -> StopResult:
+        """Stop one current-user process after revalidating its immutable identity."""
+        pid = int(pid)
+        if pid == self.self_pid:
+            return StopResult(
+                False, "cannot stop the Local Ops console process",
+                code="EXTERNAL_PROCESS_SELF",
+            )
+        try:
+            process = psutil.Process(pid)
+            if self._process_owner_sid(pid) != self._sid:
+                return StopResult(
+                    False, "external process is not owned by the current user",
+                    still_running=True,
+                    code="EXTERNAL_PROCESS_IDENTITY_MISMATCH",
+                )
+            if expected_executable is not None:
+                actual_executable = self._canonical_path(process.exe())
+                if actual_executable != self._canonical_path(expected_executable):
+                    return StopResult(
+                        False, "external process executable changed",
+                        still_running=True,
+                        code="EXTERNAL_PROCESS_IDENTITY_MISMATCH",
+                    )
+            if expected_create_time is not None:
+                actual_create_time = float(process.create_time())
+                if abs(actual_create_time - float(expected_create_time)) > 0.001:
+                    return StopResult(
+                        False, "external process creation time changed",
+                        still_running=True,
+                        code="EXTERNAL_PROCESS_IDENTITY_MISMATCH",
+                    )
+            if force:
+                process.kill()
+            else:
+                process.terminate()
+            process.wait(timeout=5.0)
+            return StopResult(True, status="stopped")
+        except psutil.NoSuchProcess:
+            return StopResult(True, status="stopped")
+        except psutil.TimeoutExpired:
+            return StopResult(
+                False, "external process did not exit before timeout",
+                still_running=True,
+                status="running",
+                code="STOP_TIMEOUT",
+            )
+        except (psutil.AccessDenied, OSError, ValueError, pywintypes.error) as exc:
+            return StopResult(
+                False, str(exc), still_running=True, status="unknown",
+                code="EXTERNAL_PROCESS_CONTROL_FAILED",
+            )
 
     @staticmethod
     def process_group_id(pid: int) -> None:

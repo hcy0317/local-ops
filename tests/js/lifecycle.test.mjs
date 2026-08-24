@@ -84,6 +84,52 @@ test('running Docker resource is controllable without a managed generation', () 
   }
 });
 
+test('owned elevated program freezes exact observed processes for stop control', () => {
+  const app = {
+    lifecycleStatus: 'running',
+    controlAvailable: true,
+    running: true,
+    runtimeIdentity: null,
+    runtimeSource: 'windowsElevationBroker',
+    observedProcesses: [
+      { pid: 1201, createTime: 1001.5 },
+      { pid: 1200, createTime: 1000.5 },
+    ],
+  };
+  const snapshot = lifecycleSnapshot(app, 'windows');
+
+  assert.equal(snapshot.expectedGeneration, null);
+  assert.equal(snapshot.canManage, true);
+  assert.deepEqual(snapshot.expectedProcesses, [
+    { pid: 1200, createTime: 1000.5 },
+    { pid: 1201, createTime: 1001.5 },
+  ]);
+  assert.deepEqual(lifecyclePayload(snapshot, { force: false }), {
+    expectedGeneration: null,
+    expectedProcesses: [
+      { pid: 1200, createTime: 1000.5 },
+      { pid: 1201, createTime: 1001.5 },
+    ],
+    force: false,
+  });
+});
+
+test('elevated program stop intent fails closed when an observed PID is reused', () => {
+  const app = {
+    lifecycleStatus: 'running',
+    controlAvailable: true,
+    running: true,
+    runtimeIdentity: null,
+    runtimeSource: 'windowsElevationBroker',
+    observedProcesses: [{ pid: 1200, createTime: 1000.5 }],
+  };
+  const snapshot = lifecycleSnapshot(app, 'windows');
+
+  assert.equal(sameLifecycleGeneration(snapshot, app, 'windows'), true);
+  app.observedProcesses = [{ pid: 1200, createTime: 2000.5 }];
+  assert.equal(sameLifecycleGeneration(snapshot, app, 'windows'), false);
+});
+
 test('captured intent never substitutes a newer generation', () => {
   const app = runningApp();
   const snapshot = lifecycleSnapshot(app, 'windows');

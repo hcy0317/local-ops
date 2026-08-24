@@ -29,15 +29,25 @@ export function lifecycleSnapshot(app, platform = 'unknown') {
   const externalDocker = !!app
     && (app.runtimeSource === 'dockerCompose'
       || app.runtimeSource === 'dockerContainer');
+  const externalProgram = !!app
+    && app.runtimeSource === 'windowsElevationBroker';
   const status = (!windows && !macos) || (windows && (!hasExplicitStatus || !hasExplicitControl))
     ? 'unknown' : normalizedStatus(app);
   const generation = generationId(app);
+  const expectedProcesses = externalProgram && Array.isArray(app.observedProcesses)
+    ? app.observedProcesses
+      .filter(item => item && Number.isInteger(item.pid) && item.pid > 0
+        && Number.isFinite(item.createTime) && item.createTime > 0)
+      .map(item => Object.freeze({ pid: item.pid, createTime: item.createTime }))
+      .sort((left, right) => left.pid - right.pid)
+    : [];
   const controlAvailable = windows
     ? !!app && app.controlAvailable === true
     : macos && app && typeof app.controlAvailable === 'boolean'
       ? app.controlAvailable
       : macos && (status === 'stopped' || status === 'running');
-  const generationReady = externalScheduled || externalDocker || macos || status === 'stopped'
+  const generationReady = externalScheduled || externalDocker
+    || (externalProgram && expectedProcesses.length > 0) || macos || status === 'stopped'
     || (status === 'running' && UUID_RE.test(generation || ''));
   const canStart = controlAvailable && status === 'stopped';
   const canManage = controlAvailable && status === 'running' && generationReady;
@@ -45,6 +55,7 @@ export function lifecycleSnapshot(app, platform = 'unknown') {
   return Object.freeze({
     status,
     expectedGeneration: status === 'stopped' ? null : generation,
+    expectedProcesses: Object.freeze(expectedProcesses),
     canStart,
     canManage,
     canDelete: externalScheduled || externalDocker || (!!app && app.deleteAvailable === true)
@@ -55,14 +66,19 @@ export function lifecycleSnapshot(app, platform = 'unknown') {
 }
 
 export function lifecyclePayload(snapshot, extra = {}) {
-  return { ...extra, expectedGeneration: snapshot.expectedGeneration };
+  const payload = { ...extra, expectedGeneration: snapshot.expectedGeneration };
+  if (snapshot.expectedProcesses && snapshot.expectedProcesses.length) {
+    payload.expectedProcesses = snapshot.expectedProcesses;
+  }
+  return payload;
 }
 
 export function sameLifecycleGeneration(snapshot, app, platform = 'unknown') {
   if (!snapshot || snapshot.status !== 'running') return false;
   const current = lifecycleSnapshot(app, platform);
   return current.canManage
-    && current.expectedGeneration === snapshot.expectedGeneration;
+    && current.expectedGeneration === snapshot.expectedGeneration
+    && JSON.stringify(current.expectedProcesses) === JSON.stringify(snapshot.expectedProcesses);
 }
 
 export function isGenerationMismatch(result) {

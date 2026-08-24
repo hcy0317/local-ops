@@ -429,6 +429,47 @@ class WindowsPlatformTests(unittest.TestCase):
         self.assertIsNone(observation)
         handle.Close.assert_called_once_with()
 
+    def test_external_process_stop_revalidates_owner_path_and_creation_time(self):
+        process = mock.Mock(pid=4321)
+        process.exe.return_value = r"C:\Tools\AdminTool.exe"
+        process.create_time.return_value = 1000.5
+        process.wait.return_value = 0
+        with mock.patch("psutil.Process", return_value=process), \
+                mock.patch.object(
+                    self.platform, "_process_owner_sid",
+                    return_value=self.platform.current_principal().identifier,
+                ):
+            result = self.platform.stop_external_process(
+                4321,
+                False,
+                expected_executable=r"C:\Tools\AdminTool.exe",
+                expected_create_time=1000.5,
+            )
+
+        self.assertTrue(result.ok)
+        process.terminate.assert_called_once_with()
+        process.kill.assert_not_called()
+
+    def test_external_process_stop_rejects_reused_pid(self):
+        process = mock.Mock(pid=4321)
+        process.exe.return_value = r"C:\Tools\AdminTool.exe"
+        process.create_time.return_value = 2000.5
+        with mock.patch("psutil.Process", return_value=process), \
+                mock.patch.object(
+                    self.platform, "_process_owner_sid",
+                    return_value=self.platform.current_principal().identifier,
+                ):
+            result = self.platform.stop_external_process(
+                4321,
+                False,
+                expected_executable=r"C:\Tools\AdminTool.exe",
+                expected_create_time=1000.5,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "EXTERNAL_PROCESS_IDENTITY_MISMATCH")
+        process.terminate.assert_not_called()
+
     def test_listener_snapshot_preserves_ipv4_and_ipv6(self):
         connections = [
             SimpleNamespace(

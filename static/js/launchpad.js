@@ -231,13 +231,11 @@ function setPrimary(btn, running, kind, lifecycleState = '') {
   const label = lifecycleState === 'starting' ? '启动中'
     : lifecycleState === 'stopping' ? '停止中'
       : lifecycleState === 'authorize' ? '解锁'
-        : lifecycleState === 'relaunch' ? '再次启动'
         : lifecycleState === 'unavailable' ? '不可用'
         : running ? (kind === 'task' ? '中止' : '停止')
           : (kind === 'task' ? '运行' : '启动');
   const glyph = lifecycleState === 'starting' || lifecycleState === 'stopping'
     ? 'clock' : lifecycleState === 'authorize' ? 'wrench'
-      : lifecycleState === 'relaunch' ? 'play'
       : lifecycleState === 'unavailable' ? 'power'
       : running ? 'square' : 'play';
   setChildren(btn, icon(glyph, 13));
@@ -326,7 +324,6 @@ function updateAppCard(card, app) {
           ? 'Docker Compose' : 'Docker 容器')
           : elevatedProgram ? '通过管理员代理启动'
             : regularProgram ? '使用当前用户权限启动' : '';
-  const launchOnlyObserved = isElevated && !!app.running;
   const scheduledState = isScheduled && app.scheduledTask
     ? app.scheduledTask.state : '';
   const scheduledReady = isScheduled
@@ -366,9 +363,12 @@ function updateAppCard(card, app) {
   } else if (isDocker && lifecycle.status === 'stopped') {
     stTxt = '已停止 · ' + (app.runtimeSource === 'dockerCompose'
       ? 'Docker Compose' : 'Docker 容器');
-  } else if (launchOnlyObserved) {
-    stTxt = app.observedRestricted
-      ? '运行中 · 受保护进程' : '运行中 · 只读观察';
+  } else if (isElevated && app.running) {
+    stTxt = app.programStopAvailable
+      ? '运行中 · 可停止'
+      : app.observedRestricted
+        ? '运行中 · 受保护进程' : '运行中 · 停止不可用';
+    stFail = !app.programStopAvailable;
   } else if (isElevated && !app.controlAvailable) {
     stTxt = app.elevationBroker && app.elevationBroker.installed
       ? '等待本次会话解锁' : '管理员代理未安装';
@@ -483,17 +483,16 @@ function updateAppCard(card, app) {
     r.stUp.hidden = true;
     setText(r.stUp, '');
   }
-  const needsBrokerAccess = isElevated && !lifecycle.canStart;
+  const needsBrokerAccess = isElevated && !app.running && !lifecycle.canStart;
   const primaryState = needsBrokerAccess ? 'authorize'
-    : launchOnlyObserved ? 'relaunch' : lifecycle.busy ? lifecycle.status
+    : lifecycle.busy ? lifecycle.status
     : lifecycle.uncertain || (!lifecycle.canStart && !lifecycle.canManage)
       ? 'unavailable' : '';
-  setPrimary(r.primary, launchOnlyObserved ? false : !!app.running, kind, primaryState);
+  setPrimary(r.primary, !!app.running, kind, primaryState);
   const appName = app.name || (isTask ? '任务' : '应用');
   const primaryVerb = primaryState === 'starting' ? '启动中'
     : primaryState === 'stopping' ? '停止中'
       : primaryState === 'authorize' ? '解锁管理员启动'
-        : primaryState === 'relaunch' ? '再次启动'
         : primaryState === 'unavailable' ? '控制不可用'
         : app.running ? (isTask ? '中止' : '停止')
           : (isTask ? '运行' : '启动');
@@ -514,7 +513,7 @@ function updateAppCard(card, app) {
       : isScheduled ? 'run_scheduled_tasks' : 'launch_managed'
   );
   const canStop = hasCapability(
-    isElevated ? 'launch_elevated' : isDocker ? 'control_docker'
+    isElevated ? 'stop_managed' : isDocker ? 'control_docker'
       : isScheduled ? 'stop_scheduled_tasks' : 'stop_managed'
   );
   const canBrokerAccess = needsBrokerAccess
@@ -580,7 +579,7 @@ async function setScheduledTaskEnabled(app, button) {
   }
 }
 
-async function toggleApp(id, button, capturedIntent) {
+async function toggleApp(id, button, capturedIntent, confirmed = false) {
   const app = findApp(id);
   if (!app) return;
   const isTask = (app.kind || 'service') === 'task';
@@ -590,12 +589,24 @@ async function toggleApp(id, button, capturedIntent) {
   const isElevated = app.runtimeSource === 'windowsElevationBroker';
   const intent = capturedIntent || lifecycleSnapshot(app, currentPlatform());
   const starting = intent.status === 'stopped';
-  if (isElevated && !intent.canStart) {
+  if (isElevated && !app.running && !intent.canStart) {
     openBrokerPassword();
     return;
   }
+  if (isElevated && !starting && confirmed !== true) {
+    openConfirm({
+      title: '停止程序',
+      bodyHtml: '确定要停止 <b>' + escapeHtml(app.name || '程序') + '</b> 吗？' +
+        '<div class="confirm-detail">仅会停止当前卡片已验证的程序实例；' +
+        '执行前仍会复验用户、EXE 路径和进程创建时间。</div>',
+      okText: '停止程序',
+      onOk: () => toggleApp(id, button, intent, true),
+    });
+    return;
+  }
   const capability = starting ? 'launch_managed' : 'stop_managed';
-  const effectiveCapability = isElevated ? 'launch_elevated'
+  const effectiveCapability = isElevated
+    ? (starting ? 'launch_elevated' : 'stop_managed')
     : isDocker ? 'control_docker' : isScheduled
     ? (starting ? 'run_scheduled_tasks' : 'stop_scheduled_tasks')
     : capability;
@@ -659,7 +670,8 @@ async function toggleApp(id, button, capturedIntent) {
       );
       const latestElevated = latest
         && latest.runtimeSource === 'windowsElevationBroker';
-      const latestCapability = latestElevated ? 'launch_elevated'
+      const latestCapability = latestElevated
+        ? (latestLifecycle.canManage ? 'stop_managed' : 'launch_elevated')
         : latestDocker ? 'control_docker' : latestScheduled
         ? (latestLifecycle.canManage ? 'stop_scheduled_tasks' : 'run_scheduled_tasks')
         : latestLifecycle.canManage ? 'stop_managed' : 'launch_managed';

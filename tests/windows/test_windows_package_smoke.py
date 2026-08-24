@@ -148,6 +148,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         self.fixture_account: str | None = None
         self.fixture_account_password: str | None = None
         self.fixture_account_sid: str | None = None
+        self.fixture_account_has_batch_right = False
 
         self._assert_supported_host()
         self.manifest = self._audit_and_extract()
@@ -346,6 +347,17 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         })
         try:
             sid, _, _ = win32security.LookupAccountName(None, username)
+            policy = win32security.LsaOpenPolicy(
+                None,
+                win32security.POLICY_LOOKUP_NAMES
+                | win32security.POLICY_CREATE_ACCOUNT,
+            )
+            try:
+                win32security.LsaAddAccountRights(
+                    policy, sid, ("SeBatchLogonRight",)
+                )
+            finally:
+                policy.Close()
             computer = os.environ.get("COMPUTERNAME") or "."
             self.fixture_username = username
             self.fixture_account = "%s\\%s" % (computer, username)
@@ -353,6 +365,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             self.fixture_account_sid = str(
                 win32security.ConvertSidToStringSid(sid)
             )
+            self.fixture_account_has_batch_right = True
             self.addCleanup(self._remove_limited_fixture_account)
         except Exception:
             win32net.NetUserDel(None, username)
@@ -364,6 +377,20 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         if not username:
             return
         try:
+            if self.fixture_account_has_batch_right and self.fixture_account_sid:
+                sid = win32security.ConvertStringSidToSid(
+                    self.fixture_account_sid
+                )
+                policy = win32security.LsaOpenPolicy(
+                    None,
+                    win32security.POLICY_LOOKUP_NAMES,
+                )
+                try:
+                    win32security.LsaRemoveAccountRights(
+                        policy, sid, False, ("SeBatchLogonRight",)
+                    )
+                finally:
+                    policy.Close()
             win32net.NetUserDel(None, username)
         except win32net.error as exc:
             if getattr(exc, "winerror", None) != 2221:
@@ -372,6 +399,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             self.fixture_username = None
             self.fixture_account = None
             self.fixture_account_sid = None
+            self.fixture_account_has_batch_right = False
 
     def _fixture_security_sids(self) -> tuple[str, ...]:
         values = [self._current_user_sid()]
@@ -718,6 +746,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         definition.Principal.RunLevel = TASK_RUNLEVEL_LUA
         definition.Settings.Enabled = True
         definition.Settings.Hidden = True
+        definition.Settings.AllowDemandStart = True
         definition.Settings.StartWhenAvailable = False
         definition.Settings.DisallowStartIfOnBatteries = False
         definition.Settings.StopIfGoingOnBatteries = False

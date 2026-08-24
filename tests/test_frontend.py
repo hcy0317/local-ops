@@ -173,16 +173,18 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("gap: 1px", telemetry)
         self.assertIn("border: 1px solid var(--line-2)", telemetry)
 
-    def test_tactical_editorial_motion_is_visible_and_reduced_motion_safe(self):
+    def test_tactical_editorial_motion_omits_sweeping_light_effects(self):
         ops = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
         core = (ROOT / "static/js/core.js").read_text(encoding="utf-8")
 
-        self.assertIn("@keyframes telemetry-sweep", ops)
+        self.assertNotIn("@keyframes telemetry-sweep", ops)
         self.assertIn("@keyframes status-pulse", ops)
         self.assertIn("@keyframes signal-enter", ops)
         self.assertIn("@keyframes signal-exit", ops)
         self.assertIn("@keyframes view-out", ops)
-        self.assertIn("animation: telemetry-sweep 7s", ops)
+        self.assertNotIn("animation: telemetry-sweep", ops)
+        self.assertNotIn(".topbar::after", ops)
+        self.assertNotIn(".ov-row::after", ops)
         self.assertIn("animation: status-pulse 2.4s", ops)
         self.assertIn(
             "node.classList.remove('flash');\n"
@@ -206,7 +208,7 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertRegex(
             ops,
             r"(?s)@media \(prefers-reduced-motion: reduce\)\s*\{.*?"
-            r"\.ov-row::after,\s*\.status-dot\.running::after\s*"
+            r"\.status-dot\.running::after\s*"
             r"\{[^}]*display:\s*none;",
         )
 
@@ -379,6 +381,7 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         html = (ROOT / "static/index.html").read_text(encoding="utf-8")
         overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
         launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        lifecycle = (ROOT / "static/js/lifecycle.js").read_text(encoding="utf-8")
         app = (ROOT / "static/app.js").read_text(encoding="utf-8")
 
         self.assertIn('id="programGrid"', html)
@@ -401,8 +404,11 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("elevated", overlays)
         self.assertIn("app.runtimeSource === 'windowsElevationBroker'", launchpad)
         self.assertIn("'launch_elevated'", launchpad)
-        self.assertIn("const launchOnlyObserved = isElevated && !!app.running", launchpad)
-        self.assertIn("'再次启动'", launchpad)
+        self.assertIn("app.programStopAvailable", launchpad)
+        self.assertIn("expectedProcesses", lifecycle)
+        self.assertIn("title: '停止程序'", launchpad)
+        self.assertIn("toggleApp(id, button, intent, true)", launchpad)
+        self.assertNotIn("launchOnlyObserved", launchpad)
         self.assertIn("app.observedRestricted", launchpad)
         self.assertIn("promptForElevationSession", app)
         self.assertIn("brokerPromptedConsolePid", app)
@@ -757,6 +763,12 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
             "margin: 0",
         ):
             self.assertIn(declaration, spark)
+
+        spark_line = theme_block(base, ".spark polyline")
+        self.assertIn("stroke-linecap: round", spark_line)
+        self.assertNotIn("stroke-dasharray", spark_line)
+        self.assertNotIn("animation:", spark_line)
+        self.assertNotIn("@keyframes telemetry-dash", ops)
 
     def test_launchpad_cards_have_keyboard_sorting_contract(self):
         html = (ROOT / "static/index.html").read_text(encoding="utf-8")

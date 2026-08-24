@@ -13,6 +13,7 @@ from localops.platform.contracts import (
     Principal,
     ProcessSnapshot,
     ScanStatus,
+    StopResult,
 )
 from localops.platform.fake import FakePlatform
 from tests.windows.test_windows_server import HttpHarness
@@ -87,18 +88,18 @@ class ElevationBrokerStateTests(unittest.TestCase):
         self.assertTrue(app["controlAvailable"])
         self.assertTrue(state["elevationBroker"]["unlocked"])
 
-    def test_program_running_is_observed_without_granting_stop_control(self):
+    def test_owned_program_running_is_observed_with_bounded_stop_control(self):
         platform = broker_platform(unlocked=True)
         platform.processes = ProcessSnapshot(ScanStatus.OK, {
             1200: {
                 "owner": OWNER_SID, "comm": EXECUTABLE,
-                "etime": 45,
+                "etime": 45, "createTime": 1000.5,
                 "args": r'C:\Tools\AdminTool.exe --profile "alpha beta"',
             },
             1201: {
                 "owner": OWNER_SID,
                 "comm": r"C:\Tools\bin\AdminTool.exe",
-                "etime": 30,
+                "etime": 30, "createTime": 1001.5,
                 "args": r'C:\Tools\bin\AdminTool.exe --profile "alpha beta"',
             },
             1202: {
@@ -130,8 +131,13 @@ class ElevationBrokerStateTests(unittest.TestCase):
         self.assertEqual(app["pid"], 1200)
         self.assertEqual(app["uptimeSec"], 45)
         self.assertEqual(app["observedPids"], [1200, 1201])
-        self.assertTrue(app["observedOnly"])
-        self.assertEqual(app["lifecycleStatus"], "stopped")
+        self.assertEqual(app["observedProcesses"], [
+            {"pid": 1200, "createTime": 1000.5},
+            {"pid": 1201, "createTime": 1001.5},
+        ])
+        self.assertFalse(app["observedOnly"])
+        self.assertTrue(app["programStopAvailable"])
+        self.assertEqual(app["lifecycleStatus"], "running")
         self.assertIsNone(app["runtimeIdentity"])
 
     def test_one_restricted_same_session_process_is_observed_without_control(self):
@@ -156,8 +162,10 @@ class ElevationBrokerStateTests(unittest.TestCase):
         self.assertTrue(app["running"])
         self.assertEqual(app["observedPids"], [1300])
         self.assertTrue(app["observedRestricted"])
+        self.assertTrue(app["observedOnly"])
+        self.assertFalse(app["programStopAvailable"])
         self.assertIsNone(app["uptimeSec"])
-        self.assertEqual(app["lifecycleStatus"], "stopped")
+        self.assertEqual(app["lifecycleStatus"], "running")
         self.assertIsNone(app["runtimeIdentity"])
 
     def test_ambiguous_restricted_processes_are_not_observed(self):
@@ -284,6 +292,74 @@ class ElevationBrokerHttpTests(unittest.TestCase):
         self.assertIn((
             "launch_elevated", (program_app()["commandSpec"], r"C:\Tools"),
         ), self.platform.calls)
+
+    def test_owned_elevated_program_stop_requires_exact_observed_processes(self):
+        self.platform.stop_result = StopResult(True)
+        self.platform.processes = ProcessSnapshot(ScanStatus.OK, {
+            1200: {
+                "owner": OWNER_SID,
+                "comm": EXECUTABLE,
+                "args": r'C:\Tools\AdminTool.exe --profile "alpha beta"',
+                "etime": 45,
+                "createTime": 1000.5,
+            },
+            1201: {
+                "owner": OWNER_SID,
+                "comm": r"C:\Tools\bin\AdminTool.exe",
+                "args": r'C:\Tools\bin\AdminTool.exe --profile "alpha beta"',
+                "etime": 30,
+                "createTime": 1001.5,
+            },
+        })
+
+        status, body, _ = self.harness.request(
+            "POST", "/api/apps/deadbeef/stop", {
+                "expectedGeneration": None,
+                "expectedProcesses": [
+                    {"pid": 1200, "createTime": 1000.5},
+                    {"pid": 1201, "createTime": 1001.5},
+                ],
+                "force": False,
+            }, self.headers,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertIn(
+            ("stop_external_process", (1200, False, EXECUTABLE, 1000.5)),
+            self.platform.calls,
+        )
+        self.assertIn(
+            ("stop_external_process", (
+                1201, False, r"C:\Tools\bin\AdminTool.exe", 1001.5,
+            )),
+            self.platform.calls,
+        )
+
+    def test_elevated_program_stop_rejects_stale_observation(self):
+        self.platform.processes = ProcessSnapshot(ScanStatus.OK, {
+            1200: {
+                "owner": OWNER_SID,
+                "comm": EXECUTABLE,
+                "args": r'C:\Tools\AdminTool.exe --profile "alpha beta"',
+                "etime": 45,
+                "createTime": 1000.5,
+            },
+        })
+
+        status, body, _ = self.harness.request(
+            "POST", "/api/apps/deadbeef/stop", {
+                "expectedGeneration": None,
+                "expectedProcesses": [{"pid": 1200, "createTime": 999.0}],
+                "force": False,
+            }, self.headers,
+        )
+
+        self.assertEqual(status, 409)
+        self.assertEqual(body["code"], "PROGRAM_OBSERVATION_MISMATCH")
+        self.assertNotIn(
+            "stop_external_process", [call[0] for call in self.platform.calls]
+        )
 
     def test_delete_removes_only_favorite_without_broker_uac(self):
         status, body, _ = self.harness.request(

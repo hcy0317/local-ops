@@ -67,7 +67,7 @@
 - `group`: `"mine"` | `"background"`；`icon`/`emoji`/`port`/`cwd`/`project`/`appId`/`appName`/`lastExit` 可为 `null`
 - `lastExit`：最近一次退出结果。任务状态为 `succeeded`（exit 0）/`canceled`（脚本主动 exit 130）/`failed`（其他自然退出）/`stopped`（总控台中止，code=null）；旧数据可能只有 `code/at`，API 输出时会兼容推导但不改写磁盘。批处理启动时保留上一次完成历史，自然退出或中止后覆盖
 - `health`：每次状态读取时只读检查配置，返回 `status: ok|error|unknown`、`blocking` 与 `issues[{kind,severity,title,detail,fix,action}]`。明确缺失的 cwd、脚本或运行时会阻止启动；复杂 Shell 命令无法静态判断时为 unknown，不阻止运行
-- `kind`：`"service"`（长期服务，有端口语义）| `"task"`（批处理任务）| `"program"`（仅启动的程序收藏）；task/program 强制 port=null。旧数据缺省视为 `service`，启动台按 kind 分三区渲染
+- `kind`：`"service"`（长期服务，有端口语义）| `"task"`（批处理任务）| `"program"`（程序入口；具备完整进程证据时可停止）；task/program 强制 port=null。旧数据缺省视为 `service`，启动台按 kind 分三区渲染
 - `running`：仅表示存在通过本次启动 token、进程组与当前用户三重校验的受控进程；不再以“配置端口有任意监听者”作为运行依据
 - `attached`：用户从服务监控明确认领的外部服务身份。此类服务的监听子进程换 PID 后，可按配置端口 + 当前 UID + 真实 cwd 唯一重新关联；普通卡片仍不得仅凭端口自动认领
 - 服务行的 `key` 保持 `name:port` 以兼容隐藏/置顶配置；`instanceKey` 使用 `pid:port` 区分同名同端口后来出现的新进程实例，前端发现与 DOM 对账均使用它
@@ -90,7 +90,7 @@
 - `PUT /api/apps/{id}`（部分更新同字段，可带 `stopBeforeUpdate:true`）→ app 对象；运行中修改 command/cwd/port/kind 时，缺少该标记返回 `{ok:false, requiresStop:true}`，带标记则安全停止后原子保存
 - `DELETE /api/apps/{id}` → `{ok, cleanupPending?}`（Windows body 必须携带观察到的 `expectedGeneration`；运行中先安全停止再删；已验证终态但 runner 清理滞留时只删卡片并后台继续释放，绝不因此获取进程控制权限；连同图标/日志）
 - `POST /api/apps/{id}/start` `{expectedGeneration:null}` → `{ok, pid, generationId?, lifecycleStatus?}` / `{ok:false, error, code?, health?}`（Windows 必须从停止状态 CAS；启动前复查配置健康，明确失效返回 422）
-- `POST /api/apps/{id}/stop` `{expectedGeneration, force?}` → `{ok}` / `{ok:false, error, code?}`（Windows 普通停止超时保留身份，`force:true` 是单独确认后的显式操作）
+- `POST /api/apps/{id}/stop` `{expectedGeneration, expectedProcesses?, force?}` → `{ok}` / `{ok:false, error, code?}`（Windows 普通停止超时保留身份，`force:true` 是单独确认后的显式操作；管理员程序停止必须携带状态快照中的 `expectedProcesses[{pid,createTime}]`，服务端再次核对当前用户、EXE 路径与创建时间）
 - `POST /api/apps/{id}/restart` `{expectedGeneration}` → `{ok, pid, generationId?}` / `{ok:false, error, code?}`（仅重启完整身份校验通过的受管进程；等待旧进程退出后再启动，不自动 Force）
 - `POST /api/apps/{id}/diagnose` → `{ok, issues:[{kind,title,detail,fix,action?}], summary}`（本地规则诊断，不调外部 AI：合并运行前健康检查，并覆盖依赖未装/模块缺失、npm 脚本名错误、运行时端口占用、权限不足、pip 包缺失与退出码兜底判读；前端在配置失效或运行失败时显示诊断入口）
 - `POST /api/apps/{id}/attach` `{pid}` → `{ok, pid, cwdUpdated?, cwd?}` / `{ok:false, error}`（把已在监听配置端口的当前用户进程**认领**为本卡片受管进程：走 legacy 身份通道 lastPid+端口+UID+真实 cwd 四重校验，cwd 不一致时原子同步为进程实际目录；拒绝 task、无端口、已运行、非当前用户、他卡已认领与未监听该端口的进程。前端在端口诊断弹窗提供「认领为本卡片」）
@@ -125,8 +125,8 @@
 - **Windows 受管生命周期**：只控制 Local Ops 以 `CREATE_SUSPENDED` 创建并加入专属 Named Job Object 的进程树。公开身份恰好 11 个字段；所有变更使用 generation CAS。普通停止超时保留身份，显式 Force 才能在重验完整证据后调用该 Job 的 `TerminateJobObject`。外部 attach/kill 与 console restart 保持禁用。
 - **Docker 控制**：Compose 只调用精确 project/workingDir/configFiles 对应的 `up --detach` / `stop`，单容器只调用完整 ID 的 `container start` / `container stop`；不得 `down`、删除、prune 或按显示名控制。
 - **Windows 计划任务控制**：关联卡片的启动/停止分别调用 Task Scheduler COM `Run` / `Stop(0)`；启禁只设置精确注册项的 `Enabled`。不得按 PID 结束进程，且不得修改触发器、动作、主体、运行级别、`MultipleInstances` 或注册；强制停止和重启保持禁用。日志读取 Operational 频道的结构化 XML，并与 Local Ops 操作审计和当前 COM 状态合并；频道关闭时由日志抽屉提供显式启用入口，未修改任务 action 或接管 stdout/stderr。
-- **Windows 程序观察**：程序卡片只读观察同名 EXE；可读进程必须属于当前用户，真实路径等于所选 EXE 或位于其父目录内，带参数时还要匹配完整参数尾部。Windows 完全隐藏 token/path/command line 时，仅接受当前会话内唯一、同名且无参数的候选，并标记 `observedRestricted`。观察结果只返回 `observedOnly/observedPids/pid/uptimeSec`，不创建受管身份、不提供停止权限，前端主按钮为「再次启动」。
-- **Windows 管理员程序代理**：Task Scheduler 只注册固定 `\\LocalOps-ElevationBroker`，无触发器且 action 固定到 Program Files 中经哈希验证的冻结包。首次安装经 `runas` UAC；安装请求路径与摘要必须复验。密码只保存 PBKDF2 verifier，Named Pipe 会话绑定实际客户端 PID/create-time/SID；Local Ops token 只在进程内存中，进程退出后必须重新输入。只接受 absolute `.exe` + args[] + absolute cwd 并以 `shell=False` 启动；程序收藏没有 stop/restart 或 PID 控制权。源码 checkout 不得安装 broker。
+- **Windows 程序观察与停止**：程序卡片观察同名 EXE；可读进程必须属于当前用户，真实路径等于所选 EXE 或位于其父目录内，带参数时还要匹配完整参数尾部。仅当全部命中实例同时具备当前用户 SID、完整 EXE 路径和创建时间时，状态返回 `programStopAvailable=true` 与 `observedProcesses[{pid,createTime}]`，前端确认后才允许停止；请求和平台边界都会复验该快照，拒绝 PID 复用、路径变化、其他用户或部分可验证的混合实例。Windows 完全隐藏 token/path/command line 时，仅接受当前会话内唯一、同名且无参数的候选用于只读观察，并标记 `observedRestricted`，不授予停止权限。程序观察仍不创建受管 Job 身份，也不提供 restart。
+- **Windows 管理员程序代理**：Task Scheduler 只注册固定 `\\LocalOps-ElevationBroker`，无触发器且 action 固定到 Program Files 中经哈希验证的冻结包。首次安装经 `runas` UAC；安装请求路径与摘要必须复验。密码只保存 PBKDF2 verifier，Named Pipe 会话绑定实际客户端 PID/create-time/SID；Local Ops token 只在进程内存中，进程退出后必须重新输入。只接受 absolute `.exe` + args[] + absolute cwd 并以 `shell=False` 启动；代理只负责启动，不接受 stop/restart。已验证的当前用户程序由 Windows platform boundary 按 PID + EXE + creation-time 复验后停止；受保护或其他用户进程保持只读。源码 checkout 不得安装 broker。
 - **Windows TokenOwner 边界**：Windows 新对象 owner 来自 access token 的 `TokenOwner`。平台只接受 `TokenOwner` 为当前用户或 Builtin Administrators；仅在 creation-time apply 路径观察到 Admin 默认 owner 时，才通过一次安全描述符更新把 owner 归一为当前用户并同时写入原 protected DACL。verify-only 的既有记录必须已经由当前用户拥有，Admin-owned 记录同样拒绝，不能先修复再信任。
 - **Windows runtime 原子性与清理**：request/receipt 临时文件必须先应用并验证私有 DACL，再 `os.replace`；重连与清理只做 verify-only，不得自动修复已放宽 ACL。释放 active generation 前必须同时证明目录恰好包含三个私有 runtime records、terminal receipt 签名有效、Job 已空且 runner 不再存在；将目录原子 rename 为严格派生的 cleanup tombstone 是 release commit。commit 后的恢复只删除 private、nonlink tombstone 中三个 runtime record 的 allowlisted subset，且不得观察或控制任何进程；未知项、宽 ACL 或 link 一律 fail closed。
 - **Windows 生命周期测试**：只有隔离夹具作用域或 hosted runner 可以设置 `LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS=1`，且测试只能结束自身创建的 fixture 进程；禁止针对现有用户进程运行。

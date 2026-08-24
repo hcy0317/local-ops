@@ -211,8 +211,17 @@ class FakePlatform:
         self.calls.append(("stop_managed", (identity, force, timeout)))
         return self.stop_result
 
-    def stop_external_process(self, pid: int, force: bool = False) -> StopResult:
-        self.calls.append(("stop_external_process", (pid, force)))
+    def stop_external_process(
+        self,
+        pid: int,
+        force: bool = False,
+        *,
+        expected_executable: str | None = None,
+        expected_create_time: float | None = None,
+    ) -> StopResult:
+        self.calls.append(("stop_external_process", (
+            pid, force, expected_executable, expected_create_time,
+        )))
         return self.stop_result
 
     def process_group_id(self, pid: int) -> int | None:

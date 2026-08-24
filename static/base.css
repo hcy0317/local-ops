@@ -810,8 +810,8 @@
 }
 .spark polyline {
   stroke: var(--accent); stroke-width: 1.5;
-  stroke-dasharray: 8 6;
-  animation: telemetry-dash 6s linear infinite;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 #sparkMem polyline { stroke: var(--accent); }
 

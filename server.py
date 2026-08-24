@@ -1904,6 +1904,18 @@ def elevated_program_app_row(app, broker_status, program_processes=None):
         default=None,
     )
     running = bool(observed)
+    observed_processes = [
+        {"pid": pid, "createTime": float(info["createTime"])}
+        for pid, info in observed
+        if (info.get("restricted") is not True
+            and process_owned_by_current(info)
+            and isinstance(info.get("createTime"), (int, float))
+            and not isinstance(info.get("createTime"), bool)
+            and float(info["createTime"]) > 0)
+    ]
+    program_stop_available = (
+        running and len(observed_processes) == len(observed)
+    )
     unlocked = (
         spec_valid and broker["installed"]
         and broker["verified"] and broker["unlocked"]
@@ -1939,14 +1951,21 @@ def elevated_program_app_row(app, broker_status, program_processes=None):
         "dockerResource": None, "docker": None,
         "elevated": True,
         "elevationBroker": broker,
-        "lifecycleStatus": "stopped",
+        "lifecycleStatus": "running" if running else "stopped",
         "controlAvailable": bool(
+            program_stop_available if running else
             unlocked and getattr(PLATFORM.capabilities, "launch_elevated", False)
         ),
         "deleteAvailable": True,
-        "runtimeIssue": None if unlocked else {
-            "code": "ELEVATION_BROKER_LOCKED", "message": detail,
-        },
+        "runtimeIssue": (
+            None if program_stop_available or (not running and unlocked)
+            else {
+                "code": "PROGRAM_STOP_UNVERIFIED",
+                "message": "程序正在运行，但进程身份受保护，无法安全停止。",
+            } if running else {
+                "code": "ELEVATION_BROKER_LOCKED", "message": detail,
+            }
+        ),
         "importStatus": "ready",
         "platformCompatibility": {"status": "ready", "reasons": []},
         "cwd": app.get("cwd"), "port": None,
@@ -1961,7 +1980,9 @@ def elevated_program_app_row(app, broker_status, program_processes=None):
             ) else None
         ),
         "observedPids": [pid for pid, _ in observed],
-        "observedOnly": True,
+        "observedProcesses": observed_processes,
+        "observedOnly": bool(running and not program_stop_available),
+        "programStopAvailable": program_stop_available,
         "observedRestricted": any(
             info.get("restricted") is True for _, info in observed
         ),
@@ -1975,6 +1996,77 @@ def elevated_program_app_row(app, broker_status, program_processes=None):
         "portOccupied": False, "portOccupiedPid": None, "portOwner": None,
         "portConflict": False, "portConflictApps": [], "legacyManaged": False,
     }
+
+
+def normalize_expected_processes(value):
+    if not isinstance(value, list) or not value:
+        return None
+    normalized = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"pid", "createTime"}:
+            return None
+        pid = item.get("pid")
+        created = item.get("createTime")
+        if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+                or not isinstance(created, (int, float))
+                or isinstance(created, bool) or float(created) <= 0):
+            return None
+        normalized.append({"pid": pid, "createTime": float(created)})
+    normalized.sort(key=lambda item: item["pid"])
+    return normalized
+
+
+def stop_elevated_program_app(platform, app, expected_processes, *, force=False):
+    process_snapshot = build_program_process_snapshot({"apps": [app]})
+    current = elevated_program_app_row(
+        app,
+        None,
+        process_snapshot,
+    )
+    observed = current.get("observedProcesses") or []
+    if observed != expected_processes:
+        return {
+            "ok": False,
+            "error": "程序进程已变化，请刷新状态后重试",
+            "code": "PROGRAM_OBSERVATION_MISMATCH",
+        }
+    if not current.get("programStopAvailable"):
+        return {
+            "ok": False,
+            "error": "程序进程身份无法验证，不能安全停止",
+            "code": "PROGRAM_STOP_UNVERIFIED",
+        }
+    try:
+        executable = normalize_command_spec(app.get("commandSpec"))["executable"]
+    except (CommandSpecError, KeyError, TypeError):
+        return {
+            "ok": False,
+            "error": "收藏的程序不是有效的 absolute EXE",
+            "code": "PROGRAM_STOP_UNVERIFIED",
+        }
+    for process in observed:
+        actual_executable = (process_snapshot.get(process["pid"]) or {}).get(
+            "comm"
+        )
+        result = platform.stop_external_process(
+            process["pid"],
+            bool(force),
+            expected_executable=actual_executable or executable,
+            expected_create_time=process["createTime"],
+        )
+        if not result.ok:
+            payload = {
+                "ok": False,
+                "error": result.error or "程序停止失败",
+                "code": result.code or "EXTERNAL_PROCESS_CONTROL_FAILED",
+            }
+            record_app_action(app, "管理员程序停止", payload)
+            return payload
+    payload = {"ok": True, "status": "stopped"}
+    record_app_action(
+        app, "管理员程序强制停止" if force else "管理员程序停止", payload
+    )
+    return payload
 
 
 def docker_resource(app):
@@ -6100,10 +6192,27 @@ class Handler(BaseHTTPRequestHandler):
         if app is None:
             return
         if elevated_favorite(app):
-            self.send_err(
-                409, "管理员程序只提供启动入口",
-                "ELEVATED_STOP_UNSUPPORTED",
+            if expected_generation is not None:
+                self.send_err(
+                    409, "管理员程序不使用受管运行代次",
+                    "GENERATION_MISMATCH",
+                )
+                return
+            expected_processes = normalize_expected_processes(
+                data.get("expectedProcesses")
             )
+            if expected_processes is None:
+                self.send_err(
+                    400, "expectedProcesses 必须包含程序 PID 与创建时间",
+                    "PROGRAM_OBSERVATION_REQUIRED",
+                )
+                return
+            result = stop_elevated_program_app(
+                PLATFORM, app, expected_processes, force=force
+            )
+            if result.get("ok"):
+                invalidate_state_cache()
+            self.send_json(result, 200 if result.get("ok") else 409)
             return
         if docker_resource(app):
             if expected_generation is not None:

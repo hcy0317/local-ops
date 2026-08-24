@@ -133,10 +133,6 @@ body::after {
   );
   opacity: 0.42;
 }
-@keyframes telemetry-sweep {
-  from { transform: translateX(-150%); }
-  to { transform: translateX(520%); }
-}
 @keyframes status-pulse {
   0% { opacity: 0.7; transform: scale(0.72); }
   72%, 100% { opacity: 0; transform: scale(1.75); }
@@ -199,15 +195,6 @@ kbd {
   background: var(--card);
   border-bottom: 1px solid var(--line-2);
   overflow: hidden;
-}
-.topbar::after {
-  content: '';
-  position: absolute;
-  left: 0; bottom: -1px;
-  width: 24%; height: 2px;
-  pointer-events: none;
-  background: linear-gradient(90deg, transparent, var(--accent), transparent);
-  animation: telemetry-sweep 7s linear infinite;
 }
 .topbar-inner {
   max-width: var(--content-max); margin: 0 auto;
@@ -651,21 +638,6 @@ body.dragging-on { cursor: grabbing; user-select: none; -webkit-user-select: non
   background: var(--line-2);
   overflow: hidden;
 }
-.ov-row::after {
-  content: '';
-  position: absolute;
-  inset: 0 auto 0 0;
-  z-index: 3;
-  width: 18%;
-  pointer-events: none;
-  background: linear-gradient(
-    90deg,
-    transparent,
-    color-mix(in srgb, var(--accent) 14%, transparent),
-    transparent
-  );
-  animation: telemetry-sweep 7s linear infinite;
-}
 .ov {
   position: relative;
   z-index: 1;
@@ -696,9 +668,6 @@ body.dragging-on { cursor: grabbing; user-select: none; -webkit-user-select: non
 @keyframes kpi-flash {
   0% { opacity: 0.25; transform: translateY(7px); color: var(--accent); }
   100% { opacity: 1; transform: translateY(0); color: inherit; }
-}
-@keyframes telemetry-dash {
-  to { stroke-dashoffset: -56; }
 }
 
 /* 新监听端口发现栏 */
@@ -1257,7 +1226,6 @@ body.dragging-on { cursor: grabbing; user-select: none; -webkit-user-select: non
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
-  .ov-row::after, .status-dot.running::after { display: none; }
-  .topbar::after { display: none; }
+  .status-dot.running::after { display: none; }
   html { scroll-behavior: auto; }
 }

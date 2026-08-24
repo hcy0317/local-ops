@@ -448,7 +448,14 @@ class MacOSPlatform:
             return StopResult(False, f"停止受控进程失败: {exc}")
         return StopResult(True)
 
-    def stop_external_process(self, pid: int, force: bool = False) -> StopResult:
+    def stop_external_process(
+        self,
+        pid: int,
+        force: bool = False,
+        *,
+        expected_executable: str | None = None,
+        expected_create_time: float | None = None,
+    ) -> StopResult:
         if pid == self.self_pid:
             return StopResult(False, "不能结束总控台自身进程")
         snapshot = self.process_snapshot({pid}, with_owner=True)

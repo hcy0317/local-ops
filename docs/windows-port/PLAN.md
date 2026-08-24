@@ -78,7 +78,7 @@ flowchart LR
 
 ### D2. 扫描能力与控制所有权完全分离
 
-Windows scanner 可以展示可读取的监听进程，但扫描结果不构成停止权限。所有破坏性操作只接受强类型 `RuntimeIdentity`。
+Windows scanner 可以展示可读取的监听进程，但普通扫描结果不构成停止权限。受管进程破坏性操作只接受强类型 `RuntimeIdentity`；程序入口是独立的窄例外，仅接受前端冻结、服务端与平台双重复验的当前用户 `pid + executable + createTime` 观察快照。
 
 用户影响：即使某个外部进程占用了相同端口，Local Ops 也不会误杀它。
 

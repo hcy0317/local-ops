@@ -33,6 +33,7 @@ if sys.platform == "win32":
     import win32api
     import win32con
     import win32event
+    import win32gui
     import win32process
     import win32security
 
@@ -48,9 +49,12 @@ if sys.platform == "win32":
         def poll(self) -> int | None:
             if self._handle is None:
                 return self._returncode
-            code = int(win32process.GetExitCodeProcess(self._handle))
-            if code == win32con.STILL_ACTIVE:
+            result = win32event.WaitForSingleObject(self._handle, 0)
+            if result == win32event.WAIT_TIMEOUT:
                 return None
+            if result != win32event.WAIT_OBJECT_0:
+                raise OSError("fixture process poll failed")
+            code = int(win32process.GetExitCodeProcess(self._handle))
             self._returncode = code
             return code
 
@@ -483,6 +487,49 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         except OSError as exc:
             return "<unavailable:%s>" % type(exc).__name__
 
+    def _console_process_diagnostics(self, process: ConsoleProcess) -> str:
+        try:
+            root = psutil.Process(process.pid)
+            descendants = root.children(recursive=True)
+            rows = []
+            for candidate in (root, *descendants):
+                try:
+                    rows.append({
+                        "pid": candidate.pid,
+                        "name": candidate.name(),
+                        "status": candidate.status(),
+                        "threads": candidate.num_threads(),
+                        "cmdline": candidate.cmdline(),
+                    })
+                except psutil.Error as exc:
+                    rows.append({
+                        "pid": candidate.pid,
+                        "error": type(exc).__name__,
+                    })
+            tracked_pids = {int(row["pid"]) for row in rows}
+        except psutil.Error as exc:
+            return "process:%s" % type(exc).__name__
+
+        windows = []
+
+        def collect_window(hwnd, _context):
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                if int(pid) not in tracked_pids:
+                    return True
+                windows.append({
+                    "pid": int(pid),
+                    "class": win32gui.GetClassName(hwnd),
+                    "title": win32gui.GetWindowText(hwnd),
+                    "visible": bool(win32gui.IsWindowVisible(hwnd)),
+                })
+            except pywintypes.error:
+                pass
+            return True
+
+        win32gui.EnumWindows(collect_window, None)
+        return self._sanitize({"processes": rows, "windows": windows})
+
     def _start_console(self, port: int) -> ConsoleProcess:
         process_token = win32security.OpenProcessToken(
             win32api.GetCurrentProcess(), win32con.TOKEN_ALL_ACCESS
@@ -587,8 +634,14 @@ class WindowsPackageSmokeTests(unittest.TestCase):
                 last_error = type(exc).__name__
             time.sleep(0.1)
         self.fail(
-            "packaged console was not ready within %.0fs (last=%s, log=%r)"
-            % (self.CONSOLE_READY_TIMEOUT, last_error, self._console_log_tail())
+            "packaged console was not ready within %.0fs "
+            "(last=%s, log=%r, diagnostics=%s)"
+            % (
+                self.CONSOLE_READY_TIMEOUT,
+                last_error,
+                self._console_log_tail(),
+                self._console_process_diagnostics(process),
+            )
         )
 
     def _terminate_console(self, process: ConsoleProcess):

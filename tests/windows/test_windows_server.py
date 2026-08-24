@@ -34,7 +34,12 @@ class HttpHarness:
     def request(self, method, path, payload=None, headers=None):
         body = None if payload is None else json.dumps(payload)
         conn = http.client.HTTPConnection(server.HOST, self.port, timeout=4)
-        conn.request(method, path, body=body, headers=dict(headers or {}))
+        request_headers = dict(headers or {})
+        if headers is None and path.startswith("/api/"):
+            request_headers["Authorization"] = (
+                "Bearer " + self.httpd.cli_token
+            )
+        conn.request(method, path, body=body, headers=request_headers)
         response = conn.getresponse()
         result = json.loads(response.read().decode("utf-8"))
         response_headers = dict(response.getheaders())
@@ -43,14 +48,21 @@ class HttpHarness:
         return status, result, response_headers
 
     def session_headers(self):
-        status, _, headers = self.request("GET", "/api/state")
+        origin = "http://127.0.0.1:%d" % self.port
+        token = self.httpd.issue_browser_bootstrap()
+        status, _, headers = self.request(
+            "POST", "/api/session/bootstrap", {"token": token}, {
+                "Content-Type": "application/json",
+                "Origin": origin,
+                "Sec-Fetch-Site": "same-origin",
+            })
         if status != 200:
             raise AssertionError("cannot establish local session")
         cookie = headers["Set-Cookie"].split(";", 1)[0]
         return {
             "Content-Type": "application/json",
             "Cookie": cookie,
-            "Origin": "http://127.0.0.1:%d" % self.port,
+            "Origin": origin,
             "Sec-Fetch-Site": "same-origin",
         }
 
@@ -58,16 +70,22 @@ class HttpHarness:
 @unittest.skipUnless(sys.platform == "win32", "Windows-only server tests")
 class WindowsServerTests(unittest.TestCase):
     def setUp(self):
+        self.controller_patch = mock.patch.object(
+            server.PLATFORM, "controller_elevated", False
+        )
+        self.controller_patch.start()
         self.harness = HttpHarness()
         self.headers = self.harness.session_headers()
 
     def tearDown(self):
         self.harness.close()
+        self.controller_patch.stop()
 
     def test_state_exposes_owned_job_lifecycle_capabilities(self):
         status, state, _ = self.harness.request("GET", "/api/state")
         self.assertEqual(status, 200)
         self.assertEqual(state["platform"], "windows")
+        self.assertFalse(state["platformInfo"]["controllerElevated"])
         self.assertTrue(state["capabilities"]["monitor_processes"])
         for capability in (
                 "launch_managed", "stop_managed", "force_stop_managed"):

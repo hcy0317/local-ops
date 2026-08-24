@@ -6,6 +6,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import ntpath
 import re
 import secrets
@@ -180,11 +181,126 @@ def normalize_elevated_launch(value: object) -> dict[str, object]:
     }
 
 
+def normalize_elevated_stop(value: object) -> dict[str, object]:
+    if (not isinstance(value, Mapping)
+            or set(value) != {"favoriteExecutable", "processes"}):
+        raise ValueError(
+            "stop request must contain favoriteExecutable and processes only"
+        )
+    favorite = value.get("favoriteExecutable")
+    if (not isinstance(favorite, str) or not favorite
+            or "\x00" in favorite or len(favorite) > 32767
+            or not ntpath.isabs(favorite)
+            or not favorite.casefold().endswith(".exe")):
+        raise ValueError("favoriteExecutable must be an absolute .exe path")
+    favorite = ntpath.normpath(favorite)
+    favorite_dir = ntpath.dirname(favorite)
+    rows = value.get("processes")
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 64:
+        raise ValueError("processes must be a bounded non-empty array")
+    normalized = []
+    seen = set()
+    for row in rows:
+        if (not isinstance(row, Mapping)
+                or set(row) != {"pid", "createTime", "executable"}):
+            raise ValueError("process identity fields are invalid")
+        pid = row.get("pid")
+        created = row.get("createTime")
+        executable = row.get("executable")
+        if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+                or pid in seen):
+            raise ValueError("process pid must be unique and positive")
+        if (not isinstance(created, (int, float)) or isinstance(created, bool)
+                or not math.isfinite(float(created)) or float(created) <= 0):
+            raise ValueError("process createTime is invalid")
+        if (not isinstance(executable, str) or not executable
+                or "\x00" in executable or len(executable) > 32767
+                or not ntpath.isabs(executable)
+                or not executable.casefold().endswith(".exe")):
+            raise ValueError("process executable must be an absolute .exe path")
+        executable = ntpath.normpath(executable)
+        try:
+            inside = ntpath.commonpath(
+                [favorite_dir, executable]
+            ).casefold() == favorite_dir.casefold()
+        except ValueError:
+            inside = False
+        if (ntpath.basename(executable).casefold()
+                != ntpath.basename(favorite).casefold()):
+            raise ValueError("process executable name changed")
+        if executable.casefold() != favorite.casefold() and not inside:
+            raise ValueError("process executable is outside the favorite directory")
+        seen.add(pid)
+        normalized.append({
+            "pid": pid,
+            "createTime": float(created),
+            "executable": executable,
+        })
+    return {
+        "favoriteExecutable": favorite,
+        "processes": normalized,
+    }
+
+
+def _normalize_scheduled_path(value: object) -> str:
+    if (not isinstance(value, str) or not value or len(value) > 1024
+            or any(ord(char) < 32 for char in value)):
+        raise ValueError("scheduled task path is invalid")
+    parts = [
+        part for part in value.strip().replace("/", "\\").split("\\")
+        if part
+    ]
+    if (not parts or any(part in {".", ".."} for part in parts)
+            or any(len(part) > 255 for part in parts)):
+        raise ValueError("scheduled task path is invalid")
+    return "\\" + "\\".join(parts)
+
+
+def normalize_scheduled_request(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError("scheduled request must be an object")
+    operation = value.get("operation")
+    if operation == "list" and set(value) == {"operation"}:
+        return {"operation": operation}
+    if operation == "query" and set(value) == {"operation", "paths"}:
+        paths = value.get("paths")
+        if not isinstance(paths, list) or not 1 <= len(paths) <= 64:
+            raise ValueError("scheduled query paths must be bounded")
+        normalized = [_normalize_scheduled_path(path) for path in paths]
+        if len(normalized) != len(set(path.casefold() for path in normalized)):
+            raise ValueError("scheduled query paths must be unique")
+        return {"operation": operation, "paths": normalized}
+    if operation in {"run", "stop"} and set(value) == {"operation", "path"}:
+        return {
+            "operation": operation,
+            "path": _normalize_scheduled_path(value.get("path")),
+        }
+    if operation == "toggle" and set(value) == {
+            "operation", "path", "enabled"}:
+        enabled = value.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError("scheduled toggle enabled must be boolean")
+        return {
+            "operation": operation,
+            "path": _normalize_scheduled_path(value.get("path")),
+            "enabled": enabled,
+        }
+    if operation == "history" and set(value) == {"operation", "enabled"}:
+        enabled = value.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError("scheduled history enabled must be boolean")
+        return {"operation": operation, "enabled": enabled}
+    raise ValueError("scheduled request operation is invalid")
+
+
 class ElevationBrokerProtocol:
     def __init__(
             self, password_record: object, *, owner_sid: str,
             process_matches: Callable[[int, float, str], bool],
             launch: Callable[[dict[str, object]], int],
+            observe: Callable[[dict[str, object]], dict[str, object]],
+            stop: Callable[[dict[str, object]], dict[str, object]],
+            scheduled: Callable[[dict[str, object]], dict[str, object]],
             token_factory: Callable[[], str] | None = None):
         _record_values(password_record)
         if not isinstance(owner_sid, str) or not owner_sid:
@@ -193,6 +309,9 @@ class ElevationBrokerProtocol:
         self._owner_sid = owner_sid
         self._process_matches = process_matches
         self._launch = launch
+        self._observe = observe
+        self._stop = stop
+        self._scheduled = scheduled
         self._token_factory = token_factory or (lambda: secrets.token_urlsafe(32))
         self._console_pid: int | None = None
         self._console_create_time: float | None = None
@@ -259,7 +378,12 @@ class ElevationBrokerProtocol:
         if not self._authorized(message, client_pid):
             return {"ok": False, "code": "BROKER_SESSION_INVALID"}
         if action == "status":
-            return {"ok": True, "unlocked": True}
+            return {
+                "ok": True,
+                "unlocked": True,
+                "protocolVersion": 3,
+                "capabilities": ["launch", "observe", "stop", "scheduled"],
+            }
         if action == "launch":
             try:
                 request = normalize_elevated_launch(message.get("request"))
@@ -270,4 +394,42 @@ class ElevationBrokerProtocol:
                     "error": str(exc),
                 }
             return {"ok": True, "pid": int(pid)}
+        if action == "observe":
+            try:
+                request = normalize_elevated_launch(message.get("request"))
+                response = self._observe(request)
+                if (not isinstance(response, dict)
+                        or response.get("ok") is not True
+                        or not isinstance(response.get("processes"), list)):
+                    raise ValueError("observe response is invalid")
+            except (OSError, TypeError, ValueError) as exc:
+                return {
+                    "ok": False, "code": "BROKER_OBSERVE_FAILED",
+                    "error": str(exc),
+                }
+            return response
+        if action == "stop":
+            try:
+                request = normalize_elevated_stop(message.get("request"))
+                response = self._stop(request)
+                if not isinstance(response, dict) or "ok" not in response:
+                    raise ValueError("stop response is invalid")
+            except (OSError, TypeError, ValueError) as exc:
+                return {
+                    "ok": False, "code": "BROKER_STOP_FAILED",
+                    "error": str(exc),
+                }
+            return response
+        if action == "scheduled":
+            try:
+                request = normalize_scheduled_request(message.get("request"))
+                response = self._scheduled(request)
+                if not isinstance(response, dict) or "ok" not in response:
+                    raise ValueError("scheduled response is invalid")
+            except (OSError, TypeError, ValueError) as exc:
+                return {
+                    "ok": False, "code": "BROKER_SCHEDULED_FAILED",
+                    "error": str(exc),
+                }
+            return response
         return {"ok": False, "code": "BROKER_REQUEST_INVALID"}

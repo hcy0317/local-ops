@@ -25,6 +25,7 @@
     "RELEASE_CHECKLIST.md",
     "SECURITY.md",
     "THIRD_PARTY_NOTICES.md",
+    "docs/windows-elevation-broker.md",
     "docs/specs/windows-native-port.md",
     "docs/windows-port/PLAN.md",
     "docs/windows-port/BASELINE-CONTRACTS.json",
@@ -37,6 +38,8 @@
     "localops/__init__.py",
     "localops/command_spec.py",
     "localops/config_import.py",
+    "localops/docker_resources.py",
+    "localops/elevation_broker.py",
     "localops/platform/__init__.py",
     "localops/platform/contracts.py",
     "localops/platform/fake.py",
@@ -89,7 +92,8 @@
     "tools/build_windows.py",
     "tools/check_platform_leaks.py",
     "tools/check_project.py",
-    "tools/gen_brand_assets.py"
+    "tools/gen_brand_assets.py",
+    "tools/install_windows_console_task.ps1"
   ],
   "decisions": [
     "P0-D001",
@@ -123,11 +127,18 @@
     "P5-D002",
     "P5-D003",
     "P5-D004",
-    "P5-D005"
+    "P5-D005",
+    "P5-D006",
+    "P5-D007",
+    "P5-D008",
+    "P5-D009",
+    "P5-D010",
+    "P5-D011"
   ],
   "assumptions": [
     "The current Phase 5 local gate ran on Windows 11 x64 with Python 3.12 and controlled only fixture-created processes.",
-    "The package-smoke harness retained Python and its test dependencies while only the packaged child's PATH was stripped; this is not clean-VM evidence."
+    "The package-smoke harness retained Python and its test dependencies while only the packaged child's PATH was stripped; this is not clean-VM evidence.",
+    "The 2026-08-24 security hardening and live migration evidence is from an uncommitted local worktree and does not replace exact-commit CI evidence."
   ],
   "knownBlockers": [],
   "deferredGates": [
@@ -162,8 +173,15 @@
     "Source venv runner launch uses base Python plus __PYVENV_LAUNCHER__ to retain a stable real runner PID; runner console setup is FreeConsole then private AllocConsole; frozen same-executable children set PYINSTALLER_RESET_ENVIRONMENT=1; win32timezone is an explicit hidden import; target executables are resolved absolutely before creation.",
     "Phase 5 exact-CI engineering candidate commit 5daddece8a06d1fdd382d1814e58be7b777ceae4 passed run 31780819809: common job 94705997033, macOS full/source-release job 94705997092, and Windows lifecycle/contracts/frontend/hardening/reproduce/audit/package-smoke/upload job 94706274519 all succeeded.",
     "GitHub artifact 9211730738, named local-ops-windows-x64-unsigned, is 18870044 bytes with outer digest sha256:a084fcc3794e9a57d5cd116992f2b42637df6f11ebd1d71f32568b6f8cff35c6; this is distinct from the inner archive SHA-256.",
-    "Phase 4 implementation commit 06d9b1a37d4b775f4b01f822a021afb93513514c passed exact-commit CI run 31768949592 and remains the last fully closed phase because Phase 5 external gates are incomplete."
+    "Phase 4 implementation commit 06d9b1a37d4b775f4b01f822a021afb93513514c passed exact-commit CI run 31768949592 and remains the last fully closed phase because Phase 5 external gates are incomplete.",
+    "The final 2026-08-24 local security worktree ran 289 Windows tests OK in 42.780 seconds with 15 explicit gates skipped, 59 frontend plus HTTP hardening tests OK including 16 HTTP security cases, 34 shared contracts with one symlink skip, 85 common Python tests with one symlink skip plus 37 Node tests, Docker resource and HTTP 12 of 12, and HCY sidecar contracts 3 of 3.",
+    "The audited v6 controller archive SHA-256 4c5337d88bcebedc09e35c2e98d7ef3437ff2a592b028234900d007cc0527257 passed package smoke 1 of 1 in 23.331 seconds; installed controller EXE SHA-256 is 92d576f47b8716590898d91f16949769d0f08fb1194d737a7a24b1426642301c.",
+    "The audited v7 broker archive SHA-256 6de97598b614b4122480a0a3566d12e342da2c582759e612d9b18649338030b8 passed package smoke 1 of 1 in 21.901 seconds; installed broker EXE SHA-256 is e882f747884a1b2c1f8ce814d321986b6c61727e92da3e8d9bc14833670b4344.",
+    "Live LocalOps-Console PID 70208 is Running at RunLevel Limited from the protected v6 Program Files executable on 127.0.0.1:9600; authenticated state is non-degraded with 11 scheduled-task references, two Docker Compose references and three administrator-program favorites.",
+    "The private hcy-ops Tailscale route returned 200 with one Secure HttpOnly SameSite cookie; an authenticated sensitive GET returned 200, a cross-site request returned 403, and a loopback forged proxy bearer returned 421.",
+    "After the v7 broker prefiltered process names and executable paths before SID queries, 12 of 12 remote states returned 200 with degraded false and 16 apps; cold responses fell from 12.57-12.77 seconds to 2.47-2.64 seconds and hot responses were 22-34ms. Browser polling remained connected for 15 seconds with the disconnect banner hidden.",
+    "Eight authenticated state requests over 21.466 seconds produced no Local Ops-descended cmd, conhost, schtasks or docker process after the Docker CREATE_NO_WINDOW fix; Guard and Watchdog definitions were not changed."
   ],
   "nextAction": "Complete the remaining external Phase 5 gates: Windows 10 when user scope resumes, an independent clean no-Python VM, Defender/SmartScreen, native picker/Notification Center, favicon brand review, and the signing/release decision before considering Beta.",
-  "lastVerifiedAt": "2026-08-14T17:03:13+08:00"
+  "lastVerifiedAt": "2026-08-24T19:24:00+08:00"
 }

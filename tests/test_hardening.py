@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from unittest import mock
 
 import server
@@ -22,7 +23,9 @@ class HttpHarness:
         self.cfg = server.Config(path)
         self.httpd = server.ConsoleServer(
             (server.HOST, 0), server.Handler, self.cfg, 0)
+        self.httpd.tailscale_proxy_token = "test-tailscale-proxy-secret-32-bytes"
         self.port = self.httpd.server_address[1]
+        self.authenticate_by_default = True
         server.invalidate_state_cache()  # 每个用例从空缓存开始，避免跨用例污染
         self.thread = threading.Thread(
             target=self.httpd.serve_forever, daemon=True)
@@ -37,6 +40,12 @@ class HttpHarness:
     def request(self, method, path, body=None, headers=None):
         conn = http.client.HTTPConnection(server.HOST, self.port, timeout=4)
         request_headers = dict(headers or {})
+        if (self.authenticate_by_default and path.startswith("/api/")
+                and "Authorization" not in request_headers
+                and "Cookie" not in request_headers):
+            request_headers["Authorization"] = (
+                "Bearer " + self.httpd.cli_token
+            )
         if body is not None and not isinstance(body, (bytes, bytearray)):
             body = body.encode("utf-8")
         conn.request(method, path, body=body, headers=request_headers)
@@ -55,6 +64,7 @@ class HttpHarness:
 class HttpSecurityTests(unittest.TestCase):
     def setUp(self):
         self.h = HttpHarness()
+        self.h.authenticate_by_default = False
 
     def tearDown(self):
         self.h.close()
@@ -71,12 +81,202 @@ class HttpSecurityTests(unittest.TestCase):
         return headers
 
     def _session_cookie(self):
-        status, _, headers = self.h.request("GET", "/api/state")
+        token = self.h.httpd.issue_browser_bootstrap()
+        status, body, headers = self.h.request(
+            "POST", "/api/session/bootstrap", json.dumps({"token": token}),
+            self._browser_headers())
         self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
         value = headers.get("Set-Cookie", "")
         self.assertIn("HttpOnly", value)
         self.assertIn("SameSite=Strict", value)
         return value.split(";", 1)[0]
+
+    def _tailscale_headers(self, cookie=None, origin=None, site="same-origin"):
+        host = "hcy-ops.long-antares.ts.net"
+        headers = {
+            "Host": host,
+            "Sec-Fetch-Site": site,
+            "Tailscale-User-Login": "hcy@example.com",
+            "X-LocalOps-Tailscale-Proxy-Authorization": (
+                "Bearer " + self.h.httpd.tailscale_proxy_token
+            ),
+        }
+        if origin is not None:
+            headers["Origin"] = origin
+        if cookie:
+            headers["Cookie"] = cookie
+        return headers
+
+    def test_browser_bootstrap_is_one_time_and_sets_only_session_cookie(self):
+        status, _, headers = self.h.request("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertNotIn("Set-Cookie", headers)
+
+        token = self.h.httpd.issue_browser_bootstrap()
+        status, body, headers = self.h.request(
+            "POST", "/api/session/bootstrap", json.dumps({"token": token}),
+            self._browser_headers())
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+
+        status, body, _ = self.h.request(
+            "POST", "/api/session/bootstrap", json.dumps({"token": token}),
+            self._browser_headers())
+        self.assertEqual(status, 403)
+        self.assertFalse(body["ok"])
+
+        status, state, _ = self.h.request(
+            "GET", "/api/state", headers={"Cookie": cookie})
+        self.assertEqual(status, 200)
+        self.assertIn("apps", state)
+
+    def test_private_cli_bearer_authenticates_reads_and_writes(self):
+        headers = {
+            "Authorization": "Bearer " + self.h.httpd.cli_token,
+            "Content-Type": "application/json",
+        }
+        status, state, _ = self.h.request(
+            "GET", "/api/state", headers=headers)
+        self.assertEqual(status, 200)
+        self.assertIn("apps", state)
+
+        status, body, _ = self.h.request(
+            "POST", "/api/ui/theme", json.dumps({"theme": "ops"}), headers)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+
+        headers["Authorization"] = "Bearer wrong"
+        status, body, _ = self.h.request(
+            "GET", "/api/state", headers=headers)
+        self.assertEqual(status, 403)
+        self.assertFalse(body["ok"])
+
+    def test_verified_tailscale_proxy_bootstraps_browser_session_on_state(self):
+        headers = self._tailscale_headers()
+        status, state, response_headers = self.h.request(
+            "GET", "/api/state", headers=headers)
+
+        self.assertEqual(status, 200)
+        self.assertIn("apps", state)
+        cookie = response_headers["Set-Cookie"].split(";", 1)[0]
+        self.assertIn("HttpOnly", response_headers["Set-Cookie"])
+        self.assertIn("SameSite=Strict", response_headers["Set-Cookie"])
+        self.assertIn("Secure", response_headers["Set-Cookie"])
+
+        write_headers = self._tailscale_headers(
+            cookie, "https://hcy-ops.long-antares.ts.net"
+        )
+        write_headers["Content-Type"] = "application/json"
+        status, body, _ = self.h.request(
+            "POST", "/api/ui/theme", json.dumps({"theme": "ops"}),
+            write_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+
+    def test_tailscale_proxy_identity_cannot_directly_authorize_a_write(self):
+        headers = self._tailscale_headers(
+            origin="https://hcy-ops.long-antares.ts.net"
+        )
+        headers["Content-Type"] = "application/json"
+        status, body, response_headers = self.h.request(
+            "POST", "/api/ui/theme", json.dumps({"theme": "ops"}), headers,
+        )
+
+        self.assertEqual(status, 403)
+        self.assertFalse(body["ok"])
+        self.assertNotIn("Set-Cookie", response_headers)
+
+    def test_tailscale_proxy_bootstrap_rejects_cross_site_or_missing_identity(self):
+        cross_site = self._tailscale_headers(
+            origin="https://attacker.example", site="cross-site"
+        )
+        status, body, headers = self.h.request(
+            "GET", "/api/state", headers=cross_site)
+        self.assertEqual(status, 403)
+        self.assertFalse(body["ok"])
+        self.assertNotIn("Set-Cookie", headers)
+
+        for missing in (
+                "Tailscale-User-Login",
+                "X-LocalOps-Tailscale-Proxy-Authorization"):
+            candidate = self._tailscale_headers()
+            candidate.pop(missing)
+            with self.subTest(missing=missing):
+                status, body, headers = self.h.request(
+                    "GET", "/api/state", headers=candidate)
+                self.assertIn(status, (403, 421))
+                self.assertFalse(body["ok"])
+                self.assertNotIn("Set-Cookie", headers)
+
+        wrong_secret = self._tailscale_headers()
+        wrong_secret["X-LocalOps-Tailscale-Proxy-Authorization"] = (
+            "Bearer wrong"
+        )
+        status, body, headers = self.h.request(
+            "GET", "/api/state", headers=wrong_secret)
+        self.assertIn(status, (403, 421))
+        self.assertFalse(body["ok"])
+        self.assertNotIn("Set-Cookie", headers)
+
+    def test_browser_url_carries_only_one_time_fragment_bootstrap(self):
+        url = server.browser_control_url(self.h.httpd)
+        parsed = urllib.parse.urlsplit(url)
+        self.assertEqual(parsed.query, "")
+        self.assertEqual(parsed.hostname, "127.0.0.1")
+        self.assertEqual(parsed.port, self.h.port)
+        token = urllib.parse.parse_qs(parsed.fragment)["control"][0]
+        self.assertIsNotNone(self.h.httpd.consume_browser_bootstrap(token))
+        self.assertIsNone(self.h.httpd.consume_browser_bootstrap(token))
+
+    def test_cli_credential_is_private_and_contains_no_browser_secret(self):
+        path = os.path.join(self.h.tmp.name, "control-credential.json")
+        server.write_control_credential(path, self.h.httpd)
+        with open(path, "r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+
+        self.assertEqual(set(payload), {"schema", "pid", "port", "token"})
+        self.assertEqual(payload["token"], self.h.httpd.cli_token)
+        self.assertNotIn("session", json.dumps(payload).casefold())
+        self.assertEqual(
+            server.read_control_credential(path, self.h.port)["token"],
+            self.h.httpd.cli_token,
+        )
+        self.assertIsNone(server.read_control_credential(path, self.h.port + 1))
+
+    def test_tailscale_proxy_credential_is_private_and_stable(self):
+        path = os.path.join(self.h.tmp.name, "tailscale-proxy-secret")
+        token = server.ensure_tailscale_proxy_credential(path)
+
+        self.assertRegex(token, server.TAILSCALE_PROXY_TOKEN_RE)
+        self.assertEqual(server.read_tailscale_proxy_credential(path), token)
+        self.assertEqual(server.ensure_tailscale_proxy_credential(path), token)
+        with open(path, "r", encoding="ascii") as stream:
+            self.assertEqual(stream.read(), token)
+
+    def test_private_cli_can_ask_running_console_to_open_browser(self):
+        opened = threading.Event()
+        urls = []
+
+        def capture(url):
+            urls.append(url)
+            opened.set()
+
+        headers = {
+            "Authorization": "Bearer " + self.h.httpd.cli_token,
+            "Content-Type": "application/json",
+        }
+        with mock.patch.object(server.PLATFORM, "open_browser", side_effect=capture):
+            status, body, _ = self.h.request(
+                "POST", "/api/console/open", "{}", headers)
+            self.assertEqual(status, 200)
+            self.assertTrue(body["ok"])
+            self.assertTrue(opened.wait(2))
+
+        self.assertEqual(len(urls), 1)
+        self.assertIn("#control=", urls[0])
 
     def test_dns_rebinding_host_is_rejected_without_setting_cookie(self):
         status, body, headers = self.h.request(
@@ -114,18 +314,27 @@ class HttpSecurityTests(unittest.TestCase):
         status, body, _ = self.h.request(
             "POST", "/api/console/stop", "x=1",
             {"Content-Type": "application/x-www-form-urlencoded"})
-        self.assertEqual(status, 415)
+        self.assertEqual(status, 403)
         self.assertFalse(body["ok"])
         # The rejected request must not have scheduled shutdown.
         status, _, _ = self.h.request("GET", "/")
         self.assertEqual(status, 200)
 
-    def test_headerless_local_cli_json_remains_compatible(self):
+    def test_headerless_local_cli_json_requires_authentication(self):
         status, body, _ = self.h.request(
             "POST", "/api/ui/theme", json.dumps({"theme": "ops"}),
             {"Content-Type": "application/json"})
+        self.assertEqual(status, 403)
+        self.assertFalse(body["ok"])
+
+    def test_sensitive_get_requires_authentication_but_static_shell_is_public(self):
+        status, body, _ = self.h.request("GET", "/api/state")
+        self.assertEqual(status, 403)
+        self.assertFalse(body["ok"])
+
+        status, body, _ = self.h.request("GET", "/")
         self.assertEqual(status, 200)
-        self.assertTrue(body["ok"])
+        self.assertIsInstance(body, bytes)
 
     def test_cors_preflight_is_explicitly_denied(self):
         status, _, headers = self.h.request(

@@ -9,7 +9,7 @@ import { $, el, setText, setChildren, icon, escapeHtml,
   openLayer, closeLayer, activeLayer,
   currentMutationEpoch, taskNotificationsEnabled, toggleTaskNotifications,
   localServiceUrl, platformPresentation, shortcutLabel,
-  hasCapability, currentPlatform } from './js/core.js';
+  hasCapability, currentPlatform, bootstrapControlSession } from './js/core.js';
 import { renderLaunchpad, toggleApp, closePortDiagnostic, closeAppDiagnosis } from './js/launchpad.js';
 import { renderServices, observePortDiscovery,
   suspendPortDiscovery } from './js/services.js';
@@ -66,7 +66,7 @@ function promptForElevationSession(data) {
   const hasElevatedFavorite = Array.isArray(data && data.apps)
     && data.apps.some(app => app && app.elevated === true);
   if (data && data.platform === 'windows' && broker
-      && broker.installed && broker.verified && !broker.unlocked
+      && broker.installed && broker.verified && !broker.sessionAuthorized
       && hasElevatedFavorite && Number.isInteger(consolePid) && consolePid > 0
       && brokerPromptedConsolePid !== consolePid) {
     brokerPromptedConsolePid = consolePid;
@@ -731,4 +731,9 @@ initWidgets();
 applyTheme();
 applyUiTheme(currentUiTheme());
 applyView();
+try {
+  await bootstrapControlSession();
+} catch (e) {
+  setConnected(false, e.message);
+}
 poll(true).finally(() => schedulePoll());

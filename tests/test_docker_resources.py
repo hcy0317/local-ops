@@ -1,7 +1,9 @@
 import json
 import os
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from localops.docker_resources import (
     DockerController,
@@ -22,6 +24,20 @@ class Completed:
 
 
 class DockerResourceTests(unittest.TestCase):
+    def test_default_runner_never_opens_a_windows_console_window(self):
+        completed = Completed()
+        with mock.patch(
+                "localops.docker_resources.subprocess.run",
+                return_value=completed) as run:
+            snapshot = DockerController(executable="docker").discover()
+
+        self.assertIs(snapshot.status, ScanStatus.OK)
+        self.assertEqual(snapshot.containers, ())
+        self.assertEqual(
+            run.call_args.kwargs["creationflags"],
+            getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
     def test_container_identity_requires_a_full_immutable_id(self):
         self.assertEqual(normalize_docker_resource({
             "kind": "container",

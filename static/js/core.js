@@ -148,6 +148,22 @@ export const GLYPHS = ['rocket', 'globe', 'terminal', 'server', 'database', 'bot
 /* ---------------- API ---------------- */
 const REQUEST_TIMEOUT_MS = 12000;
 
+export async function bootstrapControlSession() {
+  const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+  const token = fragment.get('control');
+  if (!token) return false;
+  history.replaceState(null, '', window.location.pathname + window.location.search);
+  const response = await fetch('/api/session/bootstrap', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token }),
+  });
+  if (!response.ok) {
+    throw new Error('控制会话引导失败，请重新打开总控台');
+  }
+  return true;
+}
+
 /* 变更代际：每次写操作成功后 +1。轮询响应到达时若代际已变，说明数据
    是操作生效前发出的旧快照，前端会丢弃并立即补一轮，避免旧状态回退。 */
 let mutationEpoch = 0;

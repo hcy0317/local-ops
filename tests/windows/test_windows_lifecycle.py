@@ -47,6 +47,10 @@ class IsolatedWindowsLifecycleTests(unittest.TestCase):
         self.environment.start()
         self.addCleanup(self.environment.stop)
         self.platform = WindowsPlatform(self.repo, os.path.join(self.repo, "server.py"))
+        # Hosted Windows runners use an administrator token. These explicitly
+        # gated fixtures model the production Limited controller and control
+        # only processes created inside this temporary directory.
+        self.platform.controller_elevated = False
         self.identities = []
         self.fixture_app_ids = set()
         self.sentinels = []
@@ -201,7 +205,9 @@ class IsolatedWindowsLifecycleTests(unittest.TestCase):
             "from localops.command_spec import direct_command_spec",
             "from localops.platform.contracts import LaunchRequest, windows_runtime_identity_public",
             "from localops.platform.windows import WindowsPlatform",
+            "assert os.environ.get('LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS') == '1'",
             "platform = WindowsPlatform(os.environ['LOCALOPS_FIXTURE_REPO'], os.path.join(os.environ['LOCALOPS_FIXTURE_REPO'], 'server.py'))",
+            "platform.controller_elevated = False",
             "result = platform.launch(LaunchRequest(app_id=os.environ['LOCALOPS_FIXTURE_APP_ID'], command='fixture', cwd=os.environ['LOCALOPS_FIXTURE_CWD'], log_path=os.environ['LOCALOPS_FIXTURE_LOG'], command_spec=direct_command_spec(sys.executable, ['-c', 'import time; time.sleep(60)']), generation_id=os.environ['LOCALOPS_FIXTURE_GENERATION']))",
             "assert result.ok and result.runtime_identity is not None, (result.code, result.error)",
             "activated = platform.activate_managed(result.runtime_identity)",
@@ -259,13 +265,44 @@ class IsolatedWindowsLifecycleTests(unittest.TestCase):
                 listener.close()
         self.fail("no isolated Local Ops console port is available")
 
-    @staticmethod
-    def _api_json(port, path, payload=None, *, timeout=15.0):
+    def _console_bearer(self, port):
+        credential_path = os.path.join(
+            self.platform.runtime_paths().data_dir, "control-credential.json"
+        )
+        try:
+            if os.path.islink(credential_path):
+                return None
+            self.platform.verify_private_file(credential_path)
+            with open(credential_path, "rb") as stream:
+                raw = stream.read(4097)
+            if len(raw) > 4096:
+                return None
+            credential = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeError, ValueError, TypeError):
+            return None
+        if (
+            not isinstance(credential, dict)
+            or set(credential) != {"schema", "pid", "port", "token"}
+            or credential.get("schema") != "localops-control.v1"
+            or credential.get("port") != port
+            or not isinstance(credential.get("pid"), int)
+            or isinstance(credential.get("pid"), bool)
+            or not isinstance(credential.get("token"), str)
+            or len(credential["token"]) < 32
+        ):
+            return None
+        return credential["token"]
+
+    def _api_json(self, port, path, payload=None, *, timeout=15.0):
         body = None if payload is None else json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"} if body else {}
+        bearer = self._console_bearer(port)
+        if bearer is not None:
+            headers["Authorization"] = "Bearer " + bearer
         request = urllib.request.Request(
             f"http://127.0.0.1:{port}{path}",
             data=body,
-            headers=({"Content-Type": "application/json"} if body else {}),
+            headers=headers,
         )
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.load(response)
@@ -292,11 +329,21 @@ class IsolatedWindowsLifecycleTests(unittest.TestCase):
         stdout_path = os.path.join(self.temp.name, "console-%s.stdout.log" % output_id)
         stderr_path = os.path.join(self.temp.name, "console-%s.stderr.log" % output_id)
         executable, environment = windows_adapter._runner_process_settings()
+        environment = dict(environment or os.environ)
+        environment["LOCALOPS_FIXTURE_CONSOLE_PORT"] = str(port)
+        controller = "\n".join((
+            "import os, sys",
+            "assert os.environ.get('LOCALOPS_RUN_WINDOWS_LIFECYCLE_TESTS') == '1'",
+            "import server",
+            "server.PLATFORM.controller_elevated = False",
+            "sys.argv = ['server.py', '--no-browser', '--preferred-port', os.environ['LOCALOPS_FIXTURE_CONSOLE_PORT']]",
+            "server.main()",
+        ))
         with open(stdout_path, "wb") as stdout_stream, open(stderr_path, "wb") as stderr_stream:
             process = subprocess.Popen(
-                [executable, "server.py", "--no-browser", "--preferred-port", str(port)],
+                [executable, "-c", controller],
                 cwd=self.repo,
-                env=environment or dict(os.environ),
+                env=environment,
                 stdin=subprocess.DEVNULL,
                 stdout=stdout_stream,
                 stderr=stderr_stream,

@@ -7,6 +7,8 @@ from localops.elevation_broker import (
     broker_task_spec,
     new_password_record,
     normalize_elevated_launch,
+    normalize_elevated_stop,
+    normalize_scheduled_request,
     verify_broker_task,
     verify_password,
 )
@@ -71,6 +73,58 @@ class StructuredLaunchTests(unittest.TestCase):
             with self.subTest(request=request), self.assertRaises(ValueError):
                 normalize_elevated_launch(request)
 
+    def test_elevated_stop_requires_exact_bounded_process_identities(self):
+        request = normalize_elevated_stop({
+            "favoriteExecutable": r"C:\Tools\Admin Tool.exe",
+            "processes": [
+                {
+                    "pid": 4301,
+                    "createTime": 1000.25,
+                    "executable": r"C:\Tools\Admin Tool.exe",
+                },
+                {
+                    "pid": 4302,
+                    "createTime": 1001.5,
+                    "executable": r"C:\Tools\bin\Admin Tool.exe",
+                },
+            ],
+        })
+
+        self.assertEqual([row["pid"] for row in request["processes"]], [4301, 4302])
+        invalid = dict(request)
+        invalid["processes"] = [{
+            "pid": 4303,
+            "createTime": 1002.0,
+            "executable": r"C:\Other\Admin Tool.exe",
+        }]
+        with self.assertRaises(ValueError):
+            normalize_elevated_stop(invalid)
+
+        invalid["processes"][0]["executable"] = r"C:\Tools\Other.exe"
+        with self.assertRaises(ValueError):
+            normalize_elevated_stop(invalid)
+
+    def test_scheduled_requests_are_exact_and_path_bounded(self):
+        self.assertEqual(normalize_scheduled_request({
+            "operation": "query",
+            "paths": [r"\Memos-Guard", r"\Folder\Backup"],
+        }), {
+            "operation": "query",
+            "paths": [r"\Memos-Guard", r"\Folder\Backup"],
+        })
+        self.assertEqual(normalize_scheduled_request({
+            "operation": "toggle",
+            "path": r"\Memos-Guard",
+            "enabled": False,
+        })["enabled"], False)
+        for invalid in (
+            {"operation": "query", "paths": []},
+            {"operation": "run", "path": r"\..\unsafe"},
+            {"operation": "toggle", "path": r"\Task", "enabled": 1},
+            {"operation": "shell", "path": r"\Task"},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                normalize_scheduled_request(invalid)
 
 class BrokerTaskContractTests(unittest.TestCase):
     def test_broker_task_is_fixed_to_installed_executable_and_module(self):
@@ -121,6 +175,9 @@ class BrokerTaskContractTests(unittest.TestCase):
 class BrokerSessionTests(unittest.TestCase):
     def setUp(self):
         self.launches = []
+        self.observations = []
+        self.stops = []
+        self.scheduled = []
         self.alive = {(1200, 77.25, "S-1-5-21-1-2-3-1001")}
         self.record = new_password_record(
             "correct horse battery staple",
@@ -134,8 +191,46 @@ class BrokerSessionTests(unittest.TestCase):
                 pid, created, owner
             ) in self.alive,
             launch=lambda request: self.launches.append(request) or 4321,
+            observe=lambda request: self.observations.append(request) or {
+                "ok": True,
+                "processes": [{
+                    "pid": 4301,
+                    "createTime": 1000.25,
+                    "executable": r"C:\Tools\Admin Tool.exe",
+                    "commandLine": r'"C:\Tools\Admin Tool.exe" --profile "alpha beta"',
+                    "etime": 12,
+                }],
+            },
+            stop=lambda request: self.stops.append(request) or {
+                "ok": True, "stopped": [4301, 4302],
+            },
+            scheduled=lambda request: self.scheduled.append(request) or {
+                "ok": True, "operation": request["operation"],
+            },
             token_factory=lambda: "session-token",
         )
+
+    def test_scheduled_task_request_requires_bound_token_and_exact_operation(self):
+        self.protocol.handle({
+            "action": "unlock",
+            "password": "correct horse battery staple",
+            "consolePid": 1200,
+            "consoleCreateTime": 77.25,
+        }, client_pid=1200)
+
+        result = self.protocol.handle({
+            "action": "scheduled",
+            "token": "session-token",
+            "request": {
+                "operation": "stop",
+                "path": r"\Memos-Guard",
+            },
+        }, client_pid=1200)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.scheduled, [{
+            "operation": "stop", "path": r"\Memos-Guard",
+        }])
 
     def test_unlock_binds_token_to_actual_client_pid_and_process_identity(self):
         result = self.protocol.handle({
@@ -176,6 +271,56 @@ class BrokerSessionTests(unittest.TestCase):
             "args": ["--profile", "alpha beta"],
             "cwd": r"C:\Tools",
         }])
+
+    def test_stop_requires_bound_token_and_passes_exact_process_identities(self):
+        self.protocol.handle({
+            "action": "unlock",
+            "password": "correct horse battery staple",
+            "consolePid": 1200,
+            "consoleCreateTime": 77.25,
+        }, client_pid=1200)
+        request = {
+            "favoriteExecutable": r"C:\Tools\Admin Tool.exe",
+            "processes": [{
+                "pid": 4301,
+                "createTime": 1000.25,
+                "executable": r"C:\Tools\Admin Tool.exe",
+            }, {
+                "pid": 4302,
+                "createTime": 1001.5,
+                "executable": r"C:\Tools\bin\Admin Tool.exe",
+            }],
+        }
+        result = self.protocol.handle({
+            "action": "stop",
+            "token": "session-token",
+            "request": request,
+        }, client_pid=1200)
+
+        self.assertEqual(result, {"ok": True, "stopped": [4301, 4302]})
+        self.assertEqual(self.stops, [normalize_elevated_stop(request)])
+
+    def test_observe_requires_bound_token_and_uses_structured_favorite(self):
+        self.protocol.handle({
+            "action": "unlock",
+            "password": "correct horse battery staple",
+            "consolePid": 1200,
+            "consoleCreateTime": 77.25,
+        }, client_pid=1200)
+        request = {
+            "executable": r"C:\Tools\Admin Tool.exe",
+            "args": ["--profile", "alpha beta"],
+            "cwd": r"C:\Tools",
+        }
+        result = self.protocol.handle({
+            "action": "observe",
+            "token": "session-token",
+            "request": request,
+        }, client_pid=1200)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["processes"][0]["pid"], 4301)
+        self.assertEqual(self.observations, [normalize_elevated_launch(request)])
 
     def test_dead_console_invalidates_session_and_requires_password_again(self):
         self.protocol.handle({

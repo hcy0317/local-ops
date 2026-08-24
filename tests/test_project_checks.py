@@ -1,6 +1,10 @@
 import unittest
+from pathlib import Path
 
 from tools import check_project
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class JavaScriptBindingCheckTests(unittest.TestCase):
@@ -79,6 +83,33 @@ class ProjectCheckScopeTests(unittest.TestCase):
         self.assertIn("tests/windows/test_windows_package_smoke.py", windows)
         self.assertIn("tests/windows/test_windows_packaging.py", windows)
         self.assertNotIn("start.command", windows)
+
+    def test_windows_console_task_installer_uses_protected_limited_package(self):
+        script = (
+            ROOT / "tools" / "install_windows_console_task.ps1"
+        ).read_text(encoding="ascii")
+        self.assertIn("LocalOps-Console", script)
+        self.assertIn("-RunLevel Limited", script)
+        self.assertIn("-AtLogOn", script)
+        self.assertIn("MultipleInstances", script)
+        self.assertIn("IgnoreNew", script)
+        self.assertIn("ProgramFiles", script)
+        self.assertNotIn("-RunLevel Highest", script)
+        self.assertNotIn("server.py", script)
+        self.assertNotIn(".venv", script)
+
+    def test_windows_console_task_installer_waits_before_reactivation(self):
+        script = (
+            ROOT / "tools" / "install_windows_console_task.ps1"
+        ).read_text(encoding="ascii")
+        stop_at = script.index("Stop-ScheduledTask -TaskName $taskName")
+        wait_at = script.index("Wait-ConsoleTaskStopped -TaskName $taskName")
+        start_at = script.index("Start-ScheduledTask -TaskName $taskName")
+
+        self.assertLess(stop_at, wait_at)
+        self.assertLess(wait_at, start_at)
+        self.assertIn("function Wait-ConsoleTaskStopped", script)
+        self.assertIn("throw 'Previous console task instance did not stop.'", script)
 
 
 if __name__ == "__main__":

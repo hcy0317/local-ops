@@ -7,6 +7,7 @@ import locale
 import os
 from pathlib import Path, PurePosixPath
 import platform
+import secrets
 import shutil
 import socket
 import subprocess
@@ -15,6 +16,7 @@ import tempfile
 import time
 import unittest
 from unittest import mock
+import uuid
 import zipfile
 
 from tools import build_windows
@@ -29,9 +31,73 @@ RUN_REAL = (
 
 if sys.platform == "win32":
     import psutil
+    import pywintypes
     import win32api
+    import win32com.client
     import win32con
+    import win32event
+    import win32gui
+    import win32net
+    import win32netcon
+    import win32process
     import win32security
+
+
+    class _NativeProcess:
+        """Minimal Popen-compatible owner for one exact fixture process handle."""
+
+        def __init__(self, handle, pid: int):
+            self._handle = handle
+            self._returncode: int | None = None
+            self.pid = int(pid)
+
+        def poll(self) -> int | None:
+            if self._handle is None:
+                return self._returncode
+            result = win32event.WaitForSingleObject(self._handle, 0)
+            if result == win32event.WAIT_TIMEOUT:
+                return None
+            if result != win32event.WAIT_OBJECT_0:
+                raise OSError("fixture process poll failed")
+            code = int(win32process.GetExitCodeProcess(self._handle))
+            self._returncode = code
+            return code
+
+        def wait(self, timeout: float | None = None) -> int:
+            if self._returncode is not None:
+                return self._returncode
+            milliseconds = (
+                win32event.INFINITE
+                if timeout is None
+                else max(0, int(float(timeout) * 1000))
+            )
+            result = win32event.WaitForSingleObject(self._handle, milliseconds)
+            if result == win32event.WAIT_TIMEOUT:
+                raise subprocess.TimeoutExpired("LocalOps.exe", timeout)
+            if result != win32event.WAIT_OBJECT_0:
+                raise OSError("fixture process wait failed")
+            code = int(win32process.GetExitCodeProcess(self._handle))
+            self._returncode = code
+            return code
+
+        def terminate(self):
+            if self.poll() is None:
+                win32process.TerminateProcess(self._handle, 1)
+
+        def kill(self):
+            self.terminate()
+
+        def close(self):
+            if self._handle is not None:
+                self._handle.Close()
+                self._handle = None
+
+
+    ConsoleProcess = _NativeProcess | subprocess.Popen[bytes]
+    TASK_ACTION_EXEC = 0
+    TASK_CREATE_OR_UPDATE = 6
+    TASK_LOGON_PASSWORD = 1
+    TASK_RUNLEVEL_LUA = 0
 
 
 @unittest.skipUnless(
@@ -72,11 +138,17 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         )
         self.assertTrue(self.archive.is_file(), "Windows package archive is absent")
 
-        self.console_processes: list[tuple[subprocess.Popen[bytes], float]] = []
-        self.current_console: subprocess.Popen[bytes] | None = None
+        self.console_processes: list[tuple[ConsoleProcess, float]] = []
+        self.current_console: ConsoleProcess | None = None
         self.console_port: int | None = None
         self.app_id: str | None = None
         self.runtime_identity: dict[str, object] | None = None
+        self.scheduled_task_names: list[str] = []
+        self.fixture_username: str | None = None
+        self.fixture_account: str | None = None
+        self.fixture_account_password: str | None = None
+        self.fixture_account_sid: str | None = None
+        self.fixture_account_has_batch_right = False
 
         self._assert_supported_host()
         self.manifest = self._audit_and_extract()
@@ -85,6 +157,8 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         self._assert_manifest_matches_install_tree()
         self.child_environment = self._package_environment()
         self._assert_no_python_on_child_path()
+        self._prepare_limited_fixture_account()
+        self._grant_fixture_user_modify()
 
         self.addCleanup(self._restore_bundle_acl)
         self._make_bundle_read_execute_only()
@@ -245,6 +319,94 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         finally:
             token.Close()
 
+    def _prepare_limited_fixture_account(self):
+        token = win32security.OpenProcessToken(
+            win32api.GetCurrentProcess(), win32con.TOKEN_QUERY
+        )
+        try:
+            elevated = bool(win32security.GetTokenInformation(
+                token, win32security.TokenElevation
+            ))
+        finally:
+            token.Close()
+        if not elevated:
+            return
+
+        username = "LocalOpsSmk%s" % uuid.uuid4().hex[:8]
+        password = "Lo1!" + secrets.token_urlsafe(24)
+        win32net.NetUserAdd(None, 1, {
+            "name": username,
+            "password": password,
+            "priv": win32netcon.USER_PRIV_USER,
+            "comment": "Ephemeral Local Ops package smoke account",
+            "flags": (
+                win32netcon.UF_NORMAL_ACCOUNT
+                | win32netcon.UF_SCRIPT
+                | win32netcon.UF_DONT_EXPIRE_PASSWD
+            ),
+        })
+        try:
+            sid, _, _ = win32security.LookupAccountName(None, username)
+            policy = win32security.LsaOpenPolicy(
+                None,
+                win32security.POLICY_LOOKUP_NAMES
+                | win32security.POLICY_CREATE_ACCOUNT,
+            )
+            try:
+                win32security.LsaAddAccountRights(
+                    policy, sid, ("SeBatchLogonRight",)
+                )
+            finally:
+                policy.Close()
+            computer = os.environ.get("COMPUTERNAME") or "."
+            self.fixture_username = username
+            self.fixture_account = "%s\\%s" % (computer, username)
+            self.fixture_account_password = password
+            self.fixture_account_sid = str(
+                win32security.ConvertSidToStringSid(sid)
+            )
+            self.fixture_account_has_batch_right = True
+            self.addCleanup(self._remove_limited_fixture_account)
+        except Exception:
+            win32net.NetUserDel(None, username)
+            raise
+
+    def _remove_limited_fixture_account(self):
+        username = self.fixture_username
+        self.fixture_account_password = None
+        if not username:
+            return
+        try:
+            if self.fixture_account_has_batch_right and self.fixture_account_sid:
+                sid = win32security.ConvertStringSidToSid(
+                    self.fixture_account_sid
+                )
+                policy = win32security.LsaOpenPolicy(
+                    None,
+                    win32security.POLICY_LOOKUP_NAMES,
+                )
+                try:
+                    win32security.LsaRemoveAccountRights(
+                        policy, sid, False, ("SeBatchLogonRight",)
+                    )
+                finally:
+                    policy.Close()
+            win32net.NetUserDel(None, username)
+        except win32net.error as exc:
+            if getattr(exc, "winerror", None) != 2221:
+                raise
+        finally:
+            self.fixture_username = None
+            self.fixture_account = None
+            self.fixture_account_sid = None
+            self.fixture_account_has_batch_right = False
+
+    def _fixture_security_sids(self) -> tuple[str, ...]:
+        values = [self._current_user_sid()]
+        if self.fixture_account_sid:
+            values.append(self.fixture_account_sid)
+        return tuple(values)
+
     def _icacls(self, arguments: list[str], *, action: str):
         executable = Path(self.child_environment["SystemRoot"]) / "System32" / "icacls.exe"
         completed = subprocess.run(
@@ -267,22 +429,47 @@ class WindowsPackageSmokeTests(unittest.TestCase):
 
     def _make_bundle_read_execute_only(self):
         self._assert_fixture_path(self.bundle)
-        sid = self._current_user_sid()
-        deny_write_data = "*%s:(OI)(CI)(WD,AD)" % sid
         self.fixture_acl_restored = False
-        # The hosted runner also has an Administrators allow ACE. Denying only
-        # data creation/appends for the exact user overrides that write path while
-        # preserving the loader's inherited read/execute and ACL-recovery rights.
-        self._icacls(
-            [
-                self.bundle.name,
-                "/deny",
-                deny_write_data,
-                "/T",
-                "/Q",
-            ],
-            action="deny recursive bundle data writes",
-        )
+        # A hosted administrator may reach the extracted tree only through its
+        # Administrators ACE. The Limited smoke token intentionally disables that
+        # SID, so model Program Files by granting the exact user explicit RX first.
+        for sid in self._fixture_security_sids():
+            self._icacls(
+                [
+                    self.bundle.name,
+                    "/grant",
+                    "*%s:(OI)(CI)(RX)" % sid,
+                    "/T",
+                    "/Q",
+                ],
+                action="grant recursive bundle read execute",
+            )
+            # Denying data creation/appends for the exact user overrides that
+            # write path while preserving loader RX and ACL-recovery rights.
+            self._icacls(
+                [
+                    self.bundle.name,
+                    "/deny",
+                    "*%s:(OI)(CI)(WD,AD)" % sid,
+                    "/T",
+                    "/Q",
+                ],
+                action="deny recursive bundle data writes",
+            )
+
+    def _grant_fixture_user_modify(self):
+        self._assert_fixture_path(self.fixture_root)
+        for sid in self._fixture_security_sids():
+            self._icacls(
+                [
+                    str(self.fixture_root),
+                    "/grant",
+                    "*%s:(OI)(CI)(M)" % sid,
+                    "/T",
+                    "/Q",
+                ],
+                action="grant fixture user modify",
+            )
 
     def _assert_bundle_write_denied(self):
         marker = self.bundle / build_windows.BUILD_INFO_NAME
@@ -301,11 +488,11 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         if not self.bundle.exists():
             return
         self._assert_fixture_path(self.bundle)
-        deny_sid = "*%s" % self._current_user_sid()
-        self._icacls(
-            [self.bundle.name, "/remove:d", deny_sid, "/T", "/Q"],
-            action="remove recursive bundle write deny",
-        )
+        for sid in self._fixture_security_sids():
+            self._icacls(
+                [self.bundle.name, "/remove:d", "*%s" % sid, "/T", "/Q"],
+                action="remove recursive bundle write deny",
+            )
         marker = self.bundle / build_windows.BUILD_INFO_NAME
         descriptor = os.open(marker, os.O_WRONLY | os.O_APPEND)
         os.close(descriptor)
@@ -349,7 +536,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             return port
         raise AssertionError("no free Local Ops console port is available")
 
-    def _headerless_json_api(
+    def _authenticated_json_api(
         self,
         port: int,
         method: str,
@@ -361,11 +548,18 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         body = None
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        with (self.data_dir / "control-credential.json").open(
+                "r", encoding="utf-8") as stream:
+            credential = json.load(stream)
+        if credential.get("port") != port or not isinstance(
+                credential.get("token"), str):
+            raise AssertionError("control credential does not match console port")
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
         try:
-            # Host is the only automatically generated trust header. No Origin,
-            # Sec-Fetch-* metadata, cookie, or control token is sent.
             connection.putrequest(method, path, skip_accept_encoding=True)
+            connection.putheader(
+                "Authorization", "Bearer " + credential["token"]
+            )
             if body is not None:
                 connection.putheader("Content-Type", "application/json")
                 connection.putheader("Content-Length", str(len(body)))
@@ -390,17 +584,26 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         if status == 200 and payload.get("ok") is not False:
             return
         self.fail(
-            "%s failed (status=%d, code=%r, error=%r)"
+            "%s failed (status=%d, code=%r, error=%r, console=%r, app=%r)"
             % (
                 action,
                 status,
                 self._sanitize(payload.get("code")),
                 self._sanitize(payload.get("error")),
+                self._console_log_tail(),
+                self._app_log_tail(),
             )
         )
 
     def _console_log_tail(self) -> str:
-        path = self.log_dir / "console.log"
+        return self._log_tail(self.log_dir / "console.log")
+
+    def _app_log_tail(self) -> str:
+        if not self.app_id:
+            return "<unavailable:no-app-id>"
+        return self._log_tail(self.log_dir / (self.app_id + ".log"))
+
+    def _log_tail(self, path: Path) -> str:
         try:
             with path.open("rb") as stream:
                 stream.seek(0, os.SEEK_END)
@@ -410,21 +613,245 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         except OSError as exc:
             return "<unavailable:%s>" % type(exc).__name__
 
-    def _start_console(self, port: int) -> subprocess.Popen[bytes]:
-        process = subprocess.Popen(
-            [
-                str(self.executable),
-                "--no-browser",
-                "--preferred-port",
-                str(port),
-            ],
-            cwd=self.work_dir,
-            env=self.child_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
+    def _console_process_diagnostics(self, process: ConsoleProcess) -> str:
+        try:
+            root = psutil.Process(process.pid)
+            descendants = root.children(recursive=True)
+            rows = []
+            for candidate in (root, *descendants):
+                try:
+                    rows.append({
+                        "pid": candidate.pid,
+                        "name": candidate.name(),
+                        "status": candidate.status(),
+                        "threads": candidate.num_threads(),
+                        "cmdline": candidate.cmdline(),
+                    })
+                except psutil.Error as exc:
+                    rows.append({
+                        "pid": candidate.pid,
+                        "error": type(exc).__name__,
+                    })
+            tracked_pids = {int(row["pid"]) for row in rows}
+        except psutil.Error as exc:
+            return "process:%s" % type(exc).__name__
+
+        windows = []
+
+        def collect_window(hwnd, _context):
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                if int(pid) not in tracked_pids:
+                    return True
+                controls = []
+
+                def collect_control(control, _child_context):
+                    try:
+                        text = win32gui.GetWindowText(control)
+                        if text:
+                            controls.append({
+                                "class": win32gui.GetClassName(control),
+                                "text": text,
+                            })
+                    except pywintypes.error:
+                        pass
+                    return True
+
+                win32gui.EnumChildWindows(hwnd, collect_control, None)
+                windows.append({
+                    "pid": int(pid),
+                    "class": win32gui.GetClassName(hwnd),
+                    "title": win32gui.GetWindowText(hwnd),
+                    "visible": bool(win32gui.IsWindowVisible(hwnd)),
+                    "controls": controls,
+                })
+            except pywintypes.error:
+                pass
+            return True
+
+        win32gui.EnumWindows(collect_window, None)
+        return self._sanitize({"processes": rows, "windows": windows})
+
+    @staticmethod
+    def _powershell_literal(value: object) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def _write_scheduled_console_wrapper(self, port: int) -> Path:
+        wrapper = self.temp_dir / ("launch-%s.ps1" % uuid.uuid4().hex)
+        removed_names = (
+            "VIRTUAL_ENV",
+            "__PYVENV_LAUNCHER__",
+            "CONDA_DEFAULT_ENV",
+            "CONDA_PREFIX",
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "PYTHONUTF8",
+            "PYTHONIOENCODING",
+            "PYTHONDONTWRITEBYTECODE",
         )
+        fixed_names = (
+            "PATH",
+            "PATHEXT",
+            "SystemRoot",
+            "WINDIR",
+            "COMSPEC",
+            "CONSOLE_DATA_DIR",
+            "CONSOLE_LOG_DIR",
+            "TEMP",
+            "TMP",
+        )
+        lines = ["$ErrorActionPreference = 'Stop'"]
+        lines.extend(
+            "Remove-Item -LiteralPath %s -ErrorAction SilentlyContinue"
+            % self._powershell_literal("Env:" + name)
+            for name in removed_names
+        )
+        lines.extend(
+            "$env:%s = %s" % (
+                name, self._powershell_literal(self.child_environment[name])
+            )
+            for name in fixed_names
+        )
+        lines.extend((
+            "$arguments = @('--no-browser', '--preferred-port', %s)"
+            % self._powershell_literal(str(port)),
+            "$process = Start-Process -FilePath %s -ArgumentList $arguments "
+            "-WorkingDirectory %s -WindowStyle Hidden -PassThru -Wait"
+            % (
+                self._powershell_literal(self.executable),
+                self._powershell_literal(self.work_dir),
+            ),
+            "exit $process.ExitCode",
+        ))
+        with wrapper.open("w", encoding="utf-8-sig", newline="\r\n") as stream:
+            stream.write("\n".join(lines) + "\n")
+        return wrapper
+
+    def _start_scheduled_console(self, port: int) -> _NativeProcess:
+        wrapper = self._write_scheduled_console_wrapper(port)
+        task_name = "LocalOps-PackageSmoke-%s" % uuid.uuid4().hex
+        account = self.fixture_account
+        password = self.fixture_account_password
+        if not account or not password:
+            raise AssertionError("elevated package smoke has no standard account")
+        service = win32com.client.Dispatch("Schedule.Service")
+        service.Connect()
+        root = service.GetFolder("\\")
+        definition = service.NewTask(0)
+        definition.RegistrationInfo.Description = (
+            "Ephemeral Local Ops package smoke Limited controller"
+        )
+        definition.Principal.UserId = account
+        definition.Principal.LogonType = TASK_LOGON_PASSWORD
+        definition.Principal.RunLevel = TASK_RUNLEVEL_LUA
+        definition.Settings.Enabled = True
+        definition.Settings.Hidden = True
+        definition.Settings.AllowDemandStart = True
+        definition.Settings.StartWhenAvailable = False
+        definition.Settings.DisallowStartIfOnBatteries = False
+        definition.Settings.StopIfGoingOnBatteries = False
+        definition.Settings.ExecutionTimeLimit = "PT10M"
+        action = definition.Actions.Create(TASK_ACTION_EXEC)
+        powershell = Path(self.child_environment["SystemRoot"]) / (
+            "System32/WindowsPowerShell/v1.0/powershell.exe"
+        )
+        action.Path = str(powershell)
+        action.Arguments = subprocess.list2cmdline([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(wrapper),
+        ])
+        action.WorkingDirectory = str(self.work_dir)
+        registered = root.RegisterTaskDefinition(
+            task_name,
+            definition,
+            TASK_CREATE_OR_UPDATE,
+            account,
+            password,
+            TASK_LOGON_PASSWORD,
+        )
+        self.scheduled_task_names.append(task_name)
+        try:
+            registered.Run("")
+            credential_path = self.data_dir / "control-credential.json"
+            deadline = time.monotonic() + self.CONSOLE_READY_TIMEOUT
+            last_error = "credential unavailable"
+            while time.monotonic() < deadline:
+                try:
+                    with credential_path.open("r", encoding="utf-8") as stream:
+                        credential = json.load(stream)
+                    pid = credential.get("pid")
+                    if (
+                        credential.get("port") != port
+                        or not isinstance(pid, int)
+                        or isinstance(pid, bool)
+                    ):
+                        raise ValueError("credential identity mismatch")
+                    candidate = psutil.Process(pid)
+                    if os.path.normcase(candidate.exe()) != os.path.normcase(
+                            str(self.executable)):
+                        raise ValueError("credential executable mismatch")
+                    access = (
+                        win32con.PROCESS_QUERY_LIMITED_INFORMATION
+                        | win32con.PROCESS_TERMINATE
+                        | win32con.SYNCHRONIZE
+                    )
+                    handle = win32api.OpenProcess(access, False, pid)
+                    return _NativeProcess(handle, pid)
+                except (OSError, ValueError, psutil.Error) as exc:
+                    last_error = type(exc).__name__
+                time.sleep(0.1)
+            raise AssertionError(
+                "scheduled Limited console produced no private credential "
+                "within %.0fs (last=%s, taskState=%r, taskResult=%r)"
+                % (
+                    self.CONSOLE_READY_TIMEOUT,
+                    last_error,
+                    registered.State,
+                    registered.LastTaskResult,
+                )
+            )
+        except Exception:
+            try:
+                registered.Stop(0)
+            except pywintypes.com_error:
+                pass
+            try:
+                root.DeleteTask(task_name, 0)
+                self.scheduled_task_names.remove(task_name)
+            except (ValueError, pywintypes.com_error):
+                pass
+            raise
+
+    def _start_console(self, port: int) -> ConsoleProcess:
+        process_token = win32security.OpenProcessToken(
+            win32api.GetCurrentProcess(), win32con.TOKEN_QUERY
+        )
+        elevated = bool(win32security.GetTokenInformation(
+            process_token, win32security.TokenElevation
+        ))
+        if not elevated:
+            process_token.Close()
+            process = subprocess.Popen(
+                [
+                    str(self.executable),
+                    "--no-browser",
+                    "--preferred-port",
+                    str(port),
+                ],
+                cwd=self.work_dir,
+                env=self.child_environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+        else:
+            process_token.Close()
+            process = self._start_scheduled_console(port)
         try:
             create_time = float(psutil.Process(process.pid).create_time())
         except psutil.Error:
@@ -442,7 +869,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
                     "(exit=%d, log=%r)" % (returncode, self._console_log_tail())
                 )
             try:
-                status, state = self._headerless_json_api(
+                status, state = self._authenticated_json_api(
                     port, "GET", "/api/state", timeout=3.0
                 )
                 if (
@@ -456,11 +883,17 @@ class WindowsPackageSmokeTests(unittest.TestCase):
                 last_error = type(exc).__name__
             time.sleep(0.1)
         self.fail(
-            "packaged console was not ready within %.0fs (last=%s, log=%r)"
-            % (self.CONSOLE_READY_TIMEOUT, last_error, self._console_log_tail())
+            "packaged console was not ready within %.0fs "
+            "(last=%s, log=%r, diagnostics=%s)"
+            % (
+                self.CONSOLE_READY_TIMEOUT,
+                last_error,
+                self._console_log_tail(),
+                self._console_process_diagnostics(process),
+            )
         )
 
-    def _terminate_console(self, process: subprocess.Popen[bytes]):
+    def _terminate_console(self, process: ConsoleProcess):
         if process.poll() is None:
             process.terminate()
             try:
@@ -473,7 +906,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             self.current_console = None
 
     def _state_row(self, port: int) -> tuple[dict[str, object], dict[str, object] | None]:
-        status, state = self._headerless_json_api(port, "GET", "/api/state")
+        status, state = self._authenticated_json_api(port, "GET", "/api/state")
         self.assertEqual(status, 200)
         row = next(
             (app for app in state.get("apps", []) if app.get("id") == self.app_id),
@@ -591,7 +1024,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             )
 
     def _stop_through_api(self, port: int, generation: str):
-        status, stopped = self._headerless_json_api(
+        status, stopped = self._authenticated_json_api(
             port,
             "POST",
             "/api/apps/%s/stop" % self.app_id,
@@ -605,7 +1038,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             self.assertEqual(fresh_identity.get("generationId"), generation)
             self.assertEqual(fresh.get("lifecycleStatus"), "running")
             self.assertTrue(fresh.get("controlAvailable"))
-            status, stopped = self._headerless_json_api(
+            status, stopped = self._authenticated_json_api(
                 port,
                 "POST",
                 "/api/apps/%s/stop" % self.app_id,
@@ -659,6 +1092,26 @@ class WindowsPackageSmokeTests(unittest.TestCase):
                 self._terminate_console(process)
             except (OSError, subprocess.SubprocessError) as exc:
                 problems.append("console:%s" % type(exc).__name__)
+
+        if self.scheduled_task_names:
+            try:
+                service = win32com.client.Dispatch("Schedule.Service")
+                service.Connect()
+                task_root = service.GetFolder("\\")
+            except pywintypes.com_error as exc:
+                problems.append("task-service:%s" % type(exc).__name__)
+            else:
+                for task_name in reversed(self.scheduled_task_names):
+                    try:
+                        registered = task_root.GetTask(task_name)
+                        try:
+                            registered.Stop(0)
+                        except pywintypes.com_error:
+                            pass
+                        task_root.DeleteTask(task_name, 0)
+                    except pywintypes.com_error as exc:
+                        problems.append("task-delete:%s" % type(exc).__name__)
+                self.scheduled_task_names.clear()
 
         tracked_runtime = []
         if isinstance(identity, dict) and self.app_id:
@@ -733,6 +1186,10 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             time.sleep(0.1)
         else:
             problems.append("exact fixture process remained alive")
+        for process, _ in self.console_processes:
+            close = getattr(process, "close", None)
+            if close is not None:
+                close()
 
         if problems:
             raise AssertionError(
@@ -760,6 +1217,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         self.assertEqual(state.get("platform"), "windows")
         self.assertEqual(state.get("consolePid"), first_console.pid)
         self.assertTrue(state.get("capabilities", {}).get("launch_managed"))
+        self.assertFalse(state.get("platformInfo", {}).get("controllerElevated"))
         self.assertEqual(
             os.path.normcase(
                 os.path.commonpath(
@@ -778,7 +1236,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             "text": self._powershell_tcp_fixture(service_port),
             "needsReview": False,
         }
-        status, created = self._headerless_json_api(
+        status, created = self._authenticated_json_api(
             self.console_port,
             "POST",
             "/api/apps",
@@ -796,7 +1254,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         self.assertFalse(created["commandSpec"]["needsReview"])
 
         self.lifecycle_requested = True
-        status, started = self._headerless_json_api(
+        status, started = self._authenticated_json_api(
             self.console_port,
             "POST",
             "/api/apps/%s/start" % self.app_id,
@@ -842,7 +1300,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         self.assertEqual(running_row["port"], service_port)
 
         def log_is_ready():
-            status, log = self._headerless_json_api(
+            status, log = self._authenticated_json_api(
                 int(self.console_port),
                 "GET",
                 "/api/apps/%s/logs?tail=200" % self.app_id,
@@ -921,7 +1379,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             message="packaged runtime records were not cleaned",
         )
 
-        status, deleted = self._headerless_json_api(
+        status, deleted = self._authenticated_json_api(
             self.console_port,
             "DELETE",
             "/api/apps/%s" % self.app_id,

@@ -10,7 +10,8 @@ import { $, el, setText, setChildren, icon, state, fmtClock, taskExitStatus,
   taskNotificationsEnabled, toggleTaskNotifications, currentPlatform,
   platformPresentation, shortcutLabel, hasCapability } from './core.js';
 import { openAppModal, openLogs, openConsoleLog, openConfirm,
-  offerForceStopAfterTimeout, refreshLifecycleState } from './overlays.js';
+  offerForceStopAfterTimeout, refreshLifecycleState,
+  openBrokerPassword } from './overlays.js';
 import { configuredPort } from './ports.js';
 import { lifecyclePayload, lifecycleSnapshot, isGenerationMismatch,
   isStopTimeout, runLifecycleMutation } from './lifecycle.js';
@@ -85,6 +86,10 @@ export function initWidgets() {
   $('#setNotify').addEventListener('click', () => {
     toggleTaskNotifications();
     syncSettings();
+  });
+  $('#setBrokerUpgrade').addEventListener('click', () => {
+    closeSettingsCenter(false);
+    openBrokerPassword('install');
   });
   $('#setAppearance').addEventListener('click', e => {
     const tab = e.target.closest('.mini-tab');
@@ -447,6 +452,13 @@ function syncSettings() {
   const sw = $('#setNotify');
   sw.classList.toggle('on', on);
   sw.setAttribute('aria-checked', String(on));
+  const brokerRow = $('#setBrokerRow');
+  const broker = (state.data && state.data.elevationBroker) || {};
+  brokerRow.hidden = currentPlatform() !== 'windows'
+    || !hasCapability('manage_elevation_broker');
+  $('#setBrokerHint').textContent = broker.stopSupported
+    ? '当前代理支持受保护启动与精确停止；可重新安装当前版本'
+    : '当前代理需要升级，才能由非管理员总控台精确停止管理员程序';
   const stored = localStorage.getItem('console-theme');
   const mode = stored === 'dark' ? 'dark' : stored === 'light' ? 'light' : 'auto';
   for (const tab of $('#setAppearance').querySelectorAll('.mini-tab')) {

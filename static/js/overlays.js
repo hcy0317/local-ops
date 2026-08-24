@@ -96,13 +96,14 @@ confirmMask.addEventListener('mousedown', e => { if (e.target === confirmMask) c
 let brokerPasswordMode = 'unlock';
 const BROKER_INTERACTIVE_TIMEOUT_MS = 180000;
 
-export function openBrokerPassword() {
+export function openBrokerPassword(mode = null) {
   const broker = (state.data && state.data.elevationBroker) || {};
-  brokerPasswordMode = !broker.installed || !broker.verified ? 'install' : 'unlock';
+  brokerPasswordMode = mode === 'install'
+    ? 'install' : !broker.installed || !broker.verified ? 'install' : 'unlock';
   const installing = brokerPasswordMode === 'install';
   setText(brokerPasswordTitle, installing ? '安装管理员启动代理' : '解锁管理员启动');
   setText(brokerPasswordNote, installing
-    ? '首次安装会显示一次 Windows UAC；系统会自动使用已部署的 Windows 伴随包，未找到时才需手动选择。密码仅保存为不可逆 verifier。'
+    ? '管理员代理只能由冻结 Windows 包安装或升级；操作会显示一次 UAC。密码仅保存为不可逆 verifier。'
     : '密码只解锁当前 Local Ops 进程；退出后需要重新输入。');
   brokerPasswordConfirmField.hidden = !installing;
   brokerPassword.value = '';
@@ -138,20 +139,7 @@ async function submitBrokerPassword() {
       await act(Promise.reject(error));
       return;
     }
-    if (brokerPasswordMode === 'install'
-        && result && result.code === 'BROKER_PACKAGE_REQUIRED') {
-      const selected = await act(post(
-        '/api/pick', { what: 'exe' }, BROKER_INTERACTIVE_TIMEOUT_MS,
-      ));
-      if (!selected || selected.ok === false || selected.canceled) return;
-      result = await act(post(
-        endpoint,
-        { password, packageExecutable: selected.path },
-        BROKER_INTERACTIVE_TIMEOUT_MS,
-      ));
-    } else {
-      result = await act(result);
-    }
+    result = await act(result);
     if (!result || result.ok === false) return;
     if (brokerPasswordMode === 'install') {
       const unlocked = await act(post(
@@ -1083,7 +1071,7 @@ async function saveApp() {
     if (attachSucceeded) toast('已加入启动台并认领正在运行的进程');
     if (body.elevated) {
       const broker = (state.data && state.data.elevationBroker) || {};
-      if (!broker.unlocked) openBrokerPassword();
+      if (!broker.sessionAuthorized) openBrokerPassword();
     }
   } finally {
     appSaving = false;

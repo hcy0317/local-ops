@@ -1329,7 +1329,7 @@ class LifecycleGenerationHttpTests(unittest.TestCase):
                 (409, "APP_OPERATION_IN_PROGRESS"),
             )
 
-            connection.request("GET", "/api/state")
+            connection.request("GET", "/api/state", headers=self.headers)
             response = connection.getresponse()
             self.assertEqual(response.status, 200)
             response.read()
@@ -1352,7 +1352,7 @@ class LifecycleGenerationHttpTests(unittest.TestCase):
             self.assertEqual(response.status, 200)
             self.assertTrue(json.loads(response.read().decode("utf-8"))["ok"])
 
-            connection.request("GET", "/api/state")
+            connection.request("GET", "/api/state", headers=self.headers)
             response = connection.getresponse()
             self.assertEqual(response.status, 200)
             state = json.loads(response.read().decode("utf-8"))

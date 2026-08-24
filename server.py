@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -106,6 +107,10 @@ THEMES_DIR = os.path.join(STATIC_DIR, "themes")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 INSTANCE_LOCK_PATH = os.path.join(DATA_DIR, "console.lock")
 IMPORT_RECORDS_DIR = os.path.join(DATA_DIR, "imports")
+CONTROL_CREDENTIAL_PATH = os.path.join(DATA_DIR, "control-credential.json")
+TAILSCALE_PROXY_CREDENTIAL_PATH = os.path.join(
+    DATA_DIR, "tailscale-proxy-secret"
+)
 
 CURRENT_SCHEMA_VERSION = 4
 
@@ -139,6 +144,12 @@ MAX_DETECT_FILE_BYTES = 2 * 1024 * 1024
 MAX_LOG_BYTES = 10 * 1024 * 1024
 LOG_BACKUPS = 3
 LOG_MAINTENANCE_SEC = 30
+BROWSER_BOOTSTRAP_TTL_SEC = 60.0
+CONTROL_SESSION_IDLE_SEC = 8 * 60 * 60
+TAILSCALE_PROXY_AUTH_HEADER = "X-LocalOps-Tailscale-Proxy-Authorization"
+TAILSCALE_USER_LOGIN_HEADER = "Tailscale-User-Login"
+TAILSCALE_LOGIN_RE = re.compile(r"^[^\s@]+@[^\s@]+$")
+TAILSCALE_PROXY_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 STARTUP_PROBE_SEC = 0.25
 APP_STOP_TIMEOUT_SEC = 5.0
 RUN_TOKEN_ENV = "CONSOLE_RUN_TOKEN"
@@ -304,6 +315,145 @@ def _copy_private_regular_file(source, target):
         os.close(source_fd)
     PLATFORM.ensure_private_file(target)
     return True
+
+
+def write_control_credential(path, console_server):
+    """Publish the current-process CLI bearer in current-user-only storage."""
+    _ensure_private_dir(os.path.dirname(path) or ".")
+    payload = json.dumps({
+        "schema": "localops-control.v1",
+        "pid": SELF_PID,
+        "port": int(console_server.console_port),
+        "token": console_server.cli_token,
+    }, ensure_ascii=True, sort_keys=True)
+    tmp = "%s.%s.tmp" % (path, secrets.token_hex(8))
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+             | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        PLATFORM.ensure_private_file(tmp)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            fd = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        PLATFORM.ensure_private_file(path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if os.path.lexists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def read_control_credential(path, expected_port=None):
+    """Read a previously verified private CLI bearer without repairing ACLs."""
+    try:
+        if os.path.islink(path) or not os.path.isfile(path):
+            return None
+        verifier = getattr(PLATFORM, "verify_private_file", None)
+        if verifier is not None:
+            verifier(path)
+        else:
+            PLATFORM.ensure_private_file(path)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            raw = os.read(fd, 4097)
+        finally:
+            os.close(fd)
+        if len(raw) > 4096:
+            return None
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None
+    if (not isinstance(payload, dict)
+            or set(payload) != {"schema", "pid", "port", "token"}
+            or payload.get("schema") != "localops-control.v1"
+            or not isinstance(payload.get("pid"), int)
+            or isinstance(payload.get("pid"), bool)
+            or not isinstance(payload.get("port"), int)
+            or isinstance(payload.get("port"), bool)
+            or not isinstance(payload.get("token"), str)
+            or len(payload["token"]) < 32):
+        return None
+    if expected_port is not None and payload["port"] != int(expected_port):
+        return None
+    return payload
+
+
+def remove_control_credential(path, console_server):
+    payload = read_control_credential(path, console_server.console_port)
+    if (payload is None or payload["pid"] != SELF_PID
+            or not secrets.compare_digest(
+                payload["token"], console_server.cli_token)):
+        return False
+    try:
+        os.unlink(path)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def read_tailscale_proxy_credential(path):
+    """Read the stable proxy-only bearer without repairing an existing ACL."""
+    try:
+        if os.path.islink(path) or not os.path.isfile(path):
+            return None
+        verifier = getattr(PLATFORM, "verify_private_file", None)
+        if verifier is not None:
+            verifier(path)
+        else:
+            PLATFORM.ensure_private_file(path)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            raw = os.read(fd, 257)
+        finally:
+            os.close(fd)
+        if len(raw) > 256:
+            return None
+        token = raw.decode("ascii")
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None
+    return token if TAILSCALE_PROXY_TOKEN_RE.fullmatch(token) else None
+
+
+def ensure_tailscale_proxy_credential(path):
+    token = read_tailscale_proxy_credential(path)
+    if token is not None:
+        return token
+    if os.path.lexists(path):
+        raise OSError("Tailscale proxy credential is invalid or insecure")
+    _ensure_private_dir(os.path.dirname(path) or ".")
+    token = secrets.token_urlsafe(48)
+    tmp = "%s.%s.tmp" % (path, secrets.token_hex(8))
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+             | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        PLATFORM.ensure_private_file(tmp)
+        with os.fdopen(fd, "w", encoding="ascii") as stream:
+            fd = -1
+            stream.write(token)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        PLATFORM.ensure_private_file(path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if os.path.lexists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    return token
 
 
 def _install_migrated_directory(target, populate):
@@ -1685,7 +1835,7 @@ def _restricted_program_process_matches(executable, expected_args, info):
     )
 
 
-def build_program_process_snapshot(cfg):
+def build_program_process_snapshot(cfg, broker_status=None):
     executables = []
     for app in cfg.get("apps") or []:
         if not elevated_favorite(app):
@@ -1704,7 +1854,21 @@ def build_program_process_snapshot(cfg):
         return {}
     snapshot = PLATFORM.processes_matching_keywords(names)
     _record_platform_issues(snapshot.status, snapshot.issues)
-    return snapshot.processes
+    processes = dict(snapshot.processes)
+    if (bool(getattr(broker_status, "unlocked", False))
+            and bool(getattr(broker_status, "stop_supported", False))):
+        for app in cfg.get("apps") or []:
+            if not elevated_favorite(app):
+                continue
+            try:
+                spec = normalize_command_spec(app.get("commandSpec"))
+            except CommandSpecError:
+                continue
+            observed = PLATFORM.observe_elevated(spec, app.get("cwd"))
+            _record_platform_issues(observed.status, observed.issues)
+            if observed.status is not ScanStatus.FAILED:
+                processes.update(observed.processes)
+    return processes
 
 
 def build_scheduled_task_index(cfg):
@@ -1853,7 +2017,8 @@ def elevation_broker_public(status):
     if status is None:
         return {
             "installed": False, "verified": False,
-            "running": False, "unlocked": False,
+            "running": False, "unlocked": False, "stopSupported": False,
+            "scheduledTaskSupported": False,
             "issue": None,
         }
     issue = getattr(status, "issue", None)
@@ -1862,6 +2027,10 @@ def elevation_broker_public(status):
         "verified": bool(getattr(status, "verified", False)),
         "running": bool(getattr(status, "running", False)),
         "unlocked": bool(getattr(status, "unlocked", False)),
+        "stopSupported": bool(getattr(status, "stop_supported", False)),
+        "scheduledTaskSupported": bool(
+            getattr(status, "scheduled_supported", False)
+        ),
         "issue": ({
             "code": issue.code, "message": issue.message,
         } if issue is not None else None),
@@ -1913,8 +2082,11 @@ def elevated_program_app_row(app, broker_status, program_processes=None):
             and not isinstance(info.get("createTime"), bool)
             and float(info["createTime"]) > 0)
     ]
-    program_stop_available = (
+    program_identity_verified = (
         running and len(observed_processes) == len(observed)
+    )
+    program_stop_available = (
+        program_identity_verified and broker["stopSupported"]
     )
     unlocked = (
         spec_valid and broker["installed"]
@@ -1982,6 +2154,7 @@ def elevated_program_app_row(app, broker_status, program_processes=None):
         "observedPids": [pid for pid, _ in observed],
         "observedProcesses": observed_processes,
         "observedOnly": bool(running and not program_stop_available),
+        "programIdentityVerified": program_identity_verified,
         "programStopAvailable": program_stop_available,
         "observedRestricted": any(
             info.get("restricted") is True for _, info in observed
@@ -2017,7 +2190,16 @@ def normalize_expected_processes(value):
 
 
 def stop_elevated_program_app(platform, app, expected_processes, *, force=False):
-    process_snapshot = build_program_process_snapshot({"apps": [app]})
+    if force:
+        return {
+            "ok": False,
+            "error": "管理员程序停止不支持强制模式",
+            "code": "PROGRAM_FORCE_UNSUPPORTED",
+        }
+    broker_status = platform.elevation_broker_status()
+    process_snapshot = build_program_process_snapshot(
+        {"apps": [app]}, broker_status
+    )
     current = elevated_program_app_row(
         app,
         None,
@@ -2030,7 +2212,7 @@ def stop_elevated_program_app(platform, app, expected_processes, *, force=False)
             "error": "程序进程已变化，请刷新状态后重试",
             "code": "PROGRAM_OBSERVATION_MISMATCH",
         }
-    if not current.get("programStopAvailable"):
+    if not current.get("programIdentityVerified"):
         return {
             "ok": False,
             "error": "程序进程身份无法验证，不能安全停止",
@@ -2044,24 +2226,25 @@ def stop_elevated_program_app(platform, app, expected_processes, *, force=False)
             "error": "收藏的程序不是有效的 absolute EXE",
             "code": "PROGRAM_STOP_UNVERIFIED",
         }
+    identities = []
     for process in observed:
         actual_executable = (process_snapshot.get(process["pid"]) or {}).get(
             "comm"
         )
-        result = platform.stop_external_process(
-            process["pid"],
-            bool(force),
-            expected_executable=actual_executable or executable,
-            expected_create_time=process["createTime"],
-        )
-        if not result.ok:
-            payload = {
-                "ok": False,
-                "error": result.error or "程序停止失败",
-                "code": result.code or "EXTERNAL_PROCESS_CONTROL_FAILED",
-            }
-            record_app_action(app, "管理员程序停止", payload)
-            return payload
+        identities.append({
+            "pid": process["pid"],
+            "createTime": process["createTime"],
+            "executable": actual_executable or executable,
+        })
+    result = platform.stop_elevated(executable, identities)
+    if not result.ok:
+        payload = {
+            "ok": False,
+            "error": result.error or "程序停止失败",
+            "code": result.code or "BROKER_STOP_FAILED",
+        }
+        record_app_action(app, "管理员程序停止", payload)
+        return payload
     payload = {"ok": True, "status": "stopped"}
     record_app_action(
         app, "管理员程序强制停止" if force else "管理员程序停止", payload
@@ -2436,7 +2619,7 @@ def build_state(cfg, console_port, config_health=None):
                 "component": "elevation_broker", "error": str(exc),
             })
     try:
-        program_processes = build_program_process_snapshot(cfg)
+        program_processes = build_program_process_snapshot(cfg, broker_status)
     except Exception as exc:
         LOG.exception("构建程序运行观察状态失败")
         program_processes = {}
@@ -2477,6 +2660,13 @@ def build_state(cfg, console_port, config_health=None):
                 visibility_notices.append(notice)
     platform_metadata = PLATFORM.platform_metadata()
     platform_name = platform_metadata.get("platform", PLATFORM.name)
+    controller_elevated = bool(platform_metadata.get("controllerElevated", False))
+    if controller_elevated:
+        degraded_reasons.append({
+            "component": "security",
+            "code": "CONTROLLER_ELEVATED_UNSAFE",
+            "error": "Local Ops controller is running with administrator elevation",
+        })
     if platform_name == "windows":
         launch_instruction = "运行 python server.py 启动总控台。"
         lifecycle_notice = (
@@ -2509,6 +2699,7 @@ def build_state(cfg, console_port, config_health=None):
             "consoleLogPath": os.path.join(LOGS_DIR, "console.log"),
             "launchInstruction": launch_instruction,
             "lifecycleNotice": lifecycle_notice,
+            "controllerElevated": controller_elevated,
         },
         "degraded": bool(degraded_reasons),
         "degradedReasons": degraded_reasons,
@@ -5051,16 +5242,109 @@ class ConsoleServer(ThreadingHTTPServer):
         PLATFORM.configure_server_socket(self.socket)
         super().server_bind()
 
-    def __init__(self, addr, handler_cls, cfg, port):
+    def __init__(
+            self, addr, handler_cls, cfg, port,
+            tailscale_proxy_token=None):
         super().__init__(addr, handler_cls)
         self.cfg = cfg
         self.console_port = self.server_address[1]
-        self.control_token = secrets.token_urlsafe(32)
+        self.cli_token = secrets.token_urlsafe(32)
+        self.tailscale_proxy_token = tailscale_proxy_token
+        self._control_sessions = {}
+        self._browser_bootstraps = {}
+        self._control_sessions_guard = threading.Lock()
         self._app_locks = {}
         self._app_locks_guard = threading.Lock()
         self._console_action_guard = threading.Lock()
         self._console_action = None
         self._console_helper_pid = None
+
+    def _prune_control_sessions(self, now):
+        self._browser_bootstraps = {
+            token: expires for token, expires in self._browser_bootstraps.items()
+            if expires > now
+        }
+        self._control_sessions = {
+            token: session for token, session in self._control_sessions.items()
+            if now - float(session.get("lastSeen") or 0) <= CONTROL_SESSION_IDLE_SEC
+        }
+
+    def issue_browser_bootstrap(self):
+        now = time.monotonic()
+        with self._control_sessions_guard:
+            self._prune_control_sessions(now)
+            while len(self._browser_bootstraps) >= 8:
+                oldest = min(
+                    self._browser_bootstraps,
+                    key=self._browser_bootstraps.__getitem__,
+                )
+                self._browser_bootstraps.pop(oldest, None)
+            token = secrets.token_urlsafe(32)
+            self._browser_bootstraps[token] = now + BROWSER_BOOTSTRAP_TTL_SEC
+            return token
+
+    def consume_browser_bootstrap(self, token):
+        if not isinstance(token, str):
+            return None
+        now = time.monotonic()
+        with self._control_sessions_guard:
+            self._prune_control_sessions(now)
+            expires = self._browser_bootstraps.pop(token, None)
+            if expires is None or expires <= now:
+                return None
+            session_id = secrets.token_urlsafe(32)
+            self._control_sessions[session_id] = {
+                "lastSeen": now,
+                "elevated": False,
+            }
+            return session_id
+
+    def authenticate_browser_session(self, session_id):
+        if not isinstance(session_id, str):
+            return None
+        now = time.monotonic()
+        with self._control_sessions_guard:
+            self._prune_control_sessions(now)
+            session = self._control_sessions.get(session_id)
+            if session is None:
+                return None
+            session["lastSeen"] = now
+            return session_id
+
+    def issue_tailscale_browser_session(self, login):
+        if (not isinstance(login, str) or len(login) > 320
+                or not TAILSCALE_LOGIN_RE.fullmatch(login)):
+            return None
+        now = time.monotonic()
+        with self._control_sessions_guard:
+            self._prune_control_sessions(now)
+            session_id = secrets.token_urlsafe(32)
+            self._control_sessions[session_id] = {
+                "lastSeen": now,
+                "elevated": False,
+                "source": "tailscale-serve",
+                "login": login,
+            }
+            return session_id
+
+    def browser_session_elevated(self, session_id):
+        with self._control_sessions_guard:
+            session = self._control_sessions.get(session_id)
+            return bool(session and session.get("elevated"))
+
+    def set_browser_session_elevated(self, session_id, value):
+        with self._control_sessions_guard:
+            session = self._control_sessions.get(session_id)
+            if session is None:
+                return False
+            session["elevated"] = bool(value)
+            session["lastSeen"] = time.monotonic()
+            return True
+
+    def clear_elevated_browser_sessions(self):
+        with self._control_sessions_guard:
+            for session in self._control_sessions.values():
+                session["elevated"] = False
 
     def handle_error(self, request, client_address):
         """空闲连接超时 / 客户端中途断开属正常现象，不刷 traceback。"""
@@ -5129,6 +5413,51 @@ class Handler(BaseHTTPRequestHandler):
         self.send_err(409, message, "CAPABILITY_DISABLED")
         return False
 
+    def _require_browser_session(self, elevated=False):
+        if self.control_auth_kind != "browser" or not self.control_session_id:
+            self.send_err(
+                403, "此操作必须从已验证的总控台页面执行",
+                "BROWSER_SESSION_REQUIRED",
+            )
+            return False
+        if (elevated and not self.server.browser_session_elevated(
+                self.control_session_id)):
+            self.send_err(
+                403, "当前页面尚未解锁管理员程序控制",
+                "ELEVATION_SESSION_REQUIRED",
+            )
+            return False
+        return True
+
+    def _project_state_authorization(self, state):
+        browser_authorized = bool(
+            self.control_auth_kind == "browser"
+            and self.control_session_id
+            and self.server.browser_session_elevated(self.control_session_id)
+        )
+        projected = dict(state)
+        broker = dict(projected.get("elevationBroker") or {})
+        session_authorized = bool(
+            browser_authorized and broker.get("unlocked")
+        )
+        broker["sessionAuthorized"] = session_authorized
+        projected["elevationBroker"] = broker
+        apps = []
+        for app in projected.get("apps") or []:
+            if not app.get("elevated"):
+                apps.append(app)
+                continue
+            row = dict(app)
+            row_broker = dict(row.get("elevationBroker") or {})
+            row_broker["sessionAuthorized"] = session_authorized
+            row["elevationBroker"] = row_broker
+            row["controlAvailable"] = bool(
+                row.get("controlAvailable") and session_authorized
+            )
+            apps.append(row)
+        projected["apps"] = apps
+        return projected
+
     def _parsed_request_host(self):
         """Return (hostname, port) only for the exact local console origin."""
         raw = (self.headers.get("Host") or "").strip()
@@ -5140,11 +5469,36 @@ class Handler(BaseHTTPRequestHandler):
             port = parsed.port
         except (ValueError, UnicodeError):
             return None
-        if hostname not in ("127.0.0.1", "localhost", "::1"):
+        if hostname in ("127.0.0.1", "localhost", "::1"):
+            if port != self.server.console_port:
+                return None
+            return hostname, port, "http", "loopback"
+        if (hostname.endswith(".ts.net") and port in (None, 443)
+                and self._tailscale_proxy_identity() is not None):
+            return hostname, 443, "https", "tailscale"
+        return None
+
+    def _tailscale_proxy_identity(self):
+        try:
+            authorizations = self.headers.get_all(
+                TAILSCALE_PROXY_AUTH_HEADER
+            ) or []
+            logins = self.headers.get_all(TAILSCALE_USER_LOGIN_HEADER) or []
+            expected = self.server.tailscale_proxy_token
+            if (len(authorizations) != 1 or len(logins) != 1
+                    or not isinstance(expected, str)):
+                return None
+            value = authorizations[0].strip()
+            prefix = "Bearer "
+            if (not value.startswith(prefix) or not secrets.compare_digest(
+                    value[len(prefix):], expected)):
+                return None
+            login = logins[0].strip()
+            if len(login) > 320 or not TAILSCALE_LOGIN_RE.fullmatch(login):
+                return None
+            return login
+        except (AttributeError, TypeError, ValueError):
             return None
-        if port != self.server.console_port:
-            return None
-        return hostname, port
 
     def _request_host_allowed(self):
         if self._parsed_request_host() is None:
@@ -5158,7 +5512,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             parsed = urllib.parse.urlsplit(origin)
             port = parsed.port or (80 if parsed.scheme == "http" else 443)
-            return (parsed.scheme == "http"
+            return (parsed.scheme == host[2]
                     and (parsed.hostname or "").lower() == host[0]
                     and port == host[1]
                     and not parsed.username and not parsed.password
@@ -5171,10 +5525,18 @@ class Handler(BaseHTTPRequestHandler):
             cookie = SimpleCookie()
             cookie.load(self.headers.get("Cookie") or "")
             morsel = cookie.get("console_session")
-            return bool(morsel and secrets.compare_digest(
-                morsel.value, self.server.control_token))
+            return self.server.authenticate_browser_session(
+                morsel.value if morsel else None)
         except (KeyError, TypeError, ValueError):
-            return False
+            return None
+
+    def _has_cli_bearer(self):
+        value = (self.headers.get("Authorization") or "").strip()
+        prefix = "Bearer "
+        return bool(
+            value.startswith(prefix)
+            and secrets.compare_digest(value[len(prefix):], self.server.cli_token)
+        )
 
     def _deny_request(self, status, message):
         # Do not consume attacker-controlled bodies. Closing after the bounded
@@ -5191,18 +5553,19 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
-    def authorize_request(self, mutating=False, content_kind=None):
+    def authorize_request(self, mutating=False, content_kind=None,
+                          require_auth=False, allow_unauthenticated=False):
         """Enforce the loopback browser trust boundary.
 
         Browser writes require exact same-origin metadata plus the HttpOnly
-        session cookie issued by this process. Headerless local CLI clients stay
-        compatible, but JSON/image Content-Type rules keep those paths
-        unavailable to simple cross-site HTML forms.
+        session cookie issued by this process. Local CLI control requires the
+        private per-process bearer credential; loopback location and JSON/image
+        Content-Type alone never authorize a control request.
         """
         host = self._parsed_request_host()
         if host is None or not self._request_host_allowed():
             return self._deny_request(421, "请求 Host 不是当前本地控制台")
-        if not mutating:
+        if not mutating and not require_auth:
             return True
 
         site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
@@ -5211,8 +5574,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._deny_request(403, "拒绝跨站控制请求")
         if origin and not self._same_origin(origin, host):
             return self._deny_request(403, "请求 Origin 不是当前控制台")
-        if (site or origin) and not self._has_control_cookie():
-            return self._deny_request(403, "控制会话已失效，请刷新页面")
+        self.control_session_id = self._has_control_cookie()
+        self.control_auth_kind = (
+            "browser" if self.control_session_id else
+            "cli" if self._has_cli_bearer() else None
+        )
+        if (self.control_auth_kind is None and not mutating
+                and urllib.parse.urlparse(self.path).path == "/api/state"
+                and host[3] == "tailscale"):
+            self.control_session_id = self.server.issue_tailscale_browser_session(
+                self._tailscale_proxy_identity()
+            )
+            if self.control_session_id:
+                self.control_auth_kind = "browser"
+                self._pending_session_cookie = self.control_session_id
+        if not allow_unauthenticated and self.control_auth_kind is None:
+            return self._deny_request(403, "控制会话已失效，请重新打开总控台")
 
         if self.headers.get("Transfer-Encoding"):
             return self._deny_request(400, "不支持 Transfer-Encoding 请求体")
@@ -5239,7 +5616,7 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _send(self, body, status=200, ctype="text/plain; charset=utf-8",
-              set_cookie=True):
+              set_cookie=False, session_cookie=None):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -5254,11 +5631,16 @@ class Handler(BaseHTTPRequestHandler):
             "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
             "form-action 'self'; connect-src 'self'; img-src 'self' data: blob:; "
             "font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'")
-        if set_cookie and self._request_host_allowed():
+        session_cookie = session_cookie or getattr(
+            self, "_pending_session_cookie", None
+        )
+        if session_cookie and self._request_host_allowed():
+            parsed_host = self._parsed_request_host()
+            secure = "; Secure" if parsed_host and parsed_host[2] == "https" else ""
             self.send_header(
                 "Set-Cookie",
-                "console_session=%s; Path=/; HttpOnly; SameSite=Strict" %
-                self.server.control_token)
+                "console_session=%s; Path=/; HttpOnly; SameSite=Strict%s" %
+                (session_cookie, secure))
         self.end_headers()
         if body:
             try:
@@ -5266,9 +5648,10 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
-    def send_json(self, obj, status=200):
+    def send_json(self, obj, status=200, session_cookie=None):
         self._send(json.dumps(obj, ensure_ascii=False).encode("utf-8"),
-                   status, "application/json; charset=utf-8")
+                   status, "application/json; charset=utf-8",
+                   session_cookie=session_cookie)
 
     def send_err(self, status, msg, code=None):
         payload = {"ok": False, "error": msg}
@@ -5377,10 +5760,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            if not self.authorize_request():
-                return
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
+            if not self.authorize_request(
+                    require_auth=path.startswith("/api/")
+                    and path != "/api/health"):
+                return
             if path == "/favicon.ico":
                 self.serve_static("/assets/favicon.ico")
                 return
@@ -5388,8 +5773,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(build_health(self.server.cfg))
                 return
             if path == "/api/state":
-                self.send_json(get_state_snapshot(self.server.cfg,
-                                                  self.server.console_port))
+                state = get_state_snapshot(
+                    self.server.cfg, self.server.console_port
+                )
+                self.send_json(self._project_state_authorization(state))
                 return
             if path == "/api/windows/scheduled-tasks":
                 self.handle_scheduled_tasks_list(parsed.query)
@@ -5539,6 +5926,13 @@ class Handler(BaseHTTPRequestHandler):
             route_match = APP_ROUTE_RE.match(path)
             content_kind = ("image" if route_match and
                             route_match.group(2) == "icon" else "json")
+            if path == "/api/session/bootstrap":
+                if not self.authorize_request(
+                        mutating=True, content_kind="json",
+                        allow_unauthenticated=True):
+                    return
+                self.handle_session_bootstrap()
+                return
             if not self.authorize_request(mutating=True,
                                           content_kind=content_kind):
                 return
@@ -5577,6 +5971,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/windows/elevation-broker/lock":
                 self.handle_elevation_broker_lock()
+                return
+            if path == "/api/console/open":
+                self.handle_console_open()
                 return
             if path == "/api/console/restart":
                 self.discard_body()
@@ -5629,6 +6026,37 @@ class Handler(BaseHTTPRequestHandler):
             pass
         except Exception as e:
             self._handle_request_error("POST", e)
+
+    def handle_session_bootstrap(self):
+        data = self._read_json_request()
+        if data is None:
+            return
+        if set(data) != {"token"} or not isinstance(data.get("token"), str):
+            self.send_err(400, "会话引导请求无效", "SESSION_BOOTSTRAP_INVALID")
+            return
+        session_id = self.server.consume_browser_bootstrap(data["token"])
+        if session_id is None:
+            self.send_err(403, "会话引导已失效，请重新打开总控台",
+                          "SESSION_BOOTSTRAP_INVALID")
+            return
+        self.control_session_id = session_id
+        self.control_auth_kind = "browser"
+        self.send_json({"ok": True}, session_cookie=session_id)
+
+    def handle_console_open(self):
+        data = self._read_json_request()
+        if data is None:
+            return
+        if data:
+            self.send_err(400, "打开控制台请求不接受额外字段",
+                          "INVALID_REQUEST")
+            return
+        if self.control_auth_kind != "cli":
+            self.send_err(403, "只有当前用户的本地启动器可以打开新控制页面",
+                          "CLI_AUTH_REQUIRED")
+            return
+        open_browser_later(self.server, delay=0)
+        self.send_json({"ok": True})
 
     def handle_pick(self):
         data, err = self.read_json_body()
@@ -6075,6 +6503,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._generation_matches(app, expected_generation):
             return
         if elevated_favorite(app):
+            if not self._require_browser_session(elevated=True):
+                return
             if not self._require_capability(
                     "launch_elevated", "当前平台未启用管理员程序启动"):
                 return
@@ -6093,6 +6523,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(result, 200 if result.get("ok") else 409)
             return
         if scheduled_task_path(app):
+            if (PLATFORM.name == "windows"
+                    and not self._require_browser_session(elevated=True)):
+                return
             if not self._require_capability(
                     "run_scheduled_tasks", "当前平台未启用 Windows 计划任务运行"):
                 return
@@ -6192,6 +6625,8 @@ class Handler(BaseHTTPRequestHandler):
         if app is None:
             return
         if elevated_favorite(app):
+            if not self._require_browser_session(elevated=True):
+                return
             if expected_generation is not None:
                 self.send_err(
                     409, "管理员程序不使用受管运行代次",
@@ -6235,6 +6670,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(result, 200 if result.get("ok") else 409)
             return
         if scheduled_task_path(app):
+            if (PLATFORM.name == "windows"
+                    and not self._require_browser_session(elevated=True)):
+                return
             if not self._require_capability(
                     "stop_scheduled_tasks", "当前平台未启用 Windows 计划任务停止"):
                 return
@@ -6297,6 +6735,9 @@ class Handler(BaseHTTPRequestHandler):
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
+        if (PLATFORM.name == "windows"
+                and not self._require_browser_session(elevated=True)):
+            return
         if not scheduled_task_path(app):
             self.send_err(
                 409, "应用没有关联 Windows 计划任务",
@@ -6323,6 +6764,9 @@ class Handler(BaseHTTPRequestHandler):
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
+        if (PLATFORM.name == "windows"
+                and not self._require_browser_session(elevated=True)):
+            return
         if not scheduled_task_path(app):
             self.send_err(
                 409, "应用没有关联 Windows 计划任务",
@@ -6340,16 +6784,16 @@ class Handler(BaseHTTPRequestHandler):
         data = self._read_json_request()
         if data is None:
             return
+        if not self._require_browser_session():
+            return
+        if set(data) != {"password"}:
+            self.send_err(
+                400, "安装请求只接受 password", "INVALID_REQUEST"
+            )
+            return
         password = data.get("password")
         if not isinstance(password, str):
             self.send_err(400, "password 必须是字符串", "INVALID_REQUEST")
-            return
-        package_executable = data.get("packageExecutable")
-        if package_executable is not None and not isinstance(
-                package_executable, str):
-            self.send_err(
-                400, "packageExecutable 必须是字符串", "INVALID_REQUEST"
-            )
             return
         if not self._require_capability(
                 "manage_elevation_broker", "当前平台未启用管理员启动代理"):
@@ -6359,9 +6803,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self.send_err(400, str(exc), "BROKER_PASSWORD_INVALID")
             return
-        result = PLATFORM.install_elevation_broker(
-            password_record, package_executable
-        )
+        result = PLATFORM.install_elevation_broker(password_record)
         payload = {
             "ok": bool(getattr(result, "ok", False)),
             "code": getattr(result, "code", None),
@@ -6375,6 +6817,8 @@ class Handler(BaseHTTPRequestHandler):
     def handle_elevation_broker_unlock(self):
         data = self._read_json_request()
         if data is None:
+            return
+        if not self._require_browser_session():
             return
         password = data.get("password")
         if not isinstance(password, str):
@@ -6391,12 +6835,16 @@ class Handler(BaseHTTPRequestHandler):
         if not payload["ok"]:
             payload["error"] = getattr(result, "error", None) or "管理员启动解锁失败"
         else:
+            self.server.set_browser_session_elevated(
+                self.control_session_id, True)
             invalidate_state_cache()
         self.send_json(payload, 200 if payload["ok"] else 409)
 
     def handle_elevation_broker_lock(self):
         data = self._read_json_request()
         if data is None:
+            return
+        if not self._require_browser_session():
             return
         if data:
             self.send_err(400, "锁定请求不接受额外字段", "INVALID_REQUEST")
@@ -6412,6 +6860,7 @@ class Handler(BaseHTTPRequestHandler):
         if not payload["ok"]:
             payload["error"] = getattr(result, "error", None) or "管理员启动锁定失败"
         else:
+            self.server.clear_elevated_browser_sessions()
             invalidate_state_cache()
         self.send_json(payload, 200 if payload["ok"] else 409)
 
@@ -6931,11 +7380,39 @@ class Handler(BaseHTTPRequestHandler):
 
 # ---------------------------------------------------------------- 启动
 
-def open_browser_later(port, delay=0.8):
+def browser_control_url(server):
+    fragment = urllib.parse.urlencode({
+        "control": server.issue_browser_bootstrap(),
+    })
+    return "http://%s:%d/#%s" % (HOST, server.console_port, fragment)
+
+
+def request_console_browser_open(port, credential_path=CONTROL_CREDENTIAL_PATH):
+    credential = read_control_credential(credential_path, port)
+    if credential is None:
+        return False
+    request = urllib.request.Request(
+        "http://%s:%d/api/console/open" % (HOST, port),
+        data=b"{}",
+        headers={
+            "Authorization": "Bearer " + credential["token"],
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=3) as response:
+            return response.status == 200
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def open_browser_later(server, delay=0.8):
     def _open():
         try:
             time.sleep(delay)
-            PLATFORM.open_browser("http://%s:%d/" % (HOST, port))
+            PLATFORM.open_browser(browser_control_url(server))
         except Exception:
             pass
     threading.Thread(target=_open, daemon=True).start()
@@ -7005,7 +7482,8 @@ def launcher_main():
     if choice == "打开控制台":
         ports = [p for item in instances for p in item["ports"]]
         port = min(ports) if ports else PORT_START
-        PLATFORM.open_browser("http://%s:%d/" % (HOST, port))
+        if not request_console_browser_open(port):
+            _launcher_alert("无法验证现有总控台会话，请从任务管理器确认实例状态。")
         return
     if choice != "重新启动":
         return
@@ -7073,6 +7551,14 @@ def _run_console(preferred_port=None, open_browser=True, storage_issues=None):
         ),
     )
 
+    try:
+        tailscale_proxy_token = ensure_tailscale_proxy_credential(
+            TAILSCALE_PROXY_CREDENTIAL_PATH
+        )
+    except OSError as exc:
+        tailscale_proxy_token = None
+        LOG.warning("Tailscale 代理会话已禁用: %s", exc)
+
     server, port = None, None
     candidates = list(range(PORT_START, PORT_START + PORT_TRIES))
     if isinstance(preferred_port, int) and preferred_port in candidates:
@@ -7080,7 +7566,10 @@ def _run_console(preferred_port=None, open_browser=True, storage_issues=None):
         candidates.insert(0, preferred_port)
     for p in candidates:
         try:
-            server = ConsoleServer((HOST, p), Handler, cfg, p)
+            server = ConsoleServer(
+                (HOST, p), Handler, cfg, p,
+                tailscale_proxy_token=tailscale_proxy_token,
+            )
             port = p
             break
         except OSError:
@@ -7090,10 +7579,11 @@ def _run_console(preferred_port=None, open_browser=True, storage_issues=None):
               (PORT_START, PORT_START + PORT_TRIES - 1))
         sys.exit(1)
 
+    write_control_credential(CONTROL_CREDENTIAL_PATH, server)
     print("总控台已启动: http://%s:%d/  (Ctrl+C 停止)" % (HOST, port), flush=True)
     reconcile_stop = start_windows_runtime_reconciler(cfg)
     if open_browser:
-        open_browser_later(port)
+        open_browser_later(server)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -7106,6 +7596,7 @@ def _run_console(preferred_port=None, open_browser=True, storage_issues=None):
             except Exception:
                 LOG.exception("锁定管理员启动代理失败")
         server.server_close()
+        remove_control_credential(CONTROL_CREDENTIAL_PATH, server)
         print("已停止", flush=True)
 
 
@@ -7189,7 +7680,7 @@ def main(preferred_port=None, open_browser=True, log_to_file=False):
             instances = find_console_instances()
             ports = [port for item in instances for port in item.get("ports", [])]
             if ports:
-                PLATFORM.open_browser("http://%s:%d/" % (HOST, min(ports)))
+                request_console_browser_open(min(ports))
         return False
     try:
         _run_console(preferred_port, open_browser, migration.get("securityIssues"))

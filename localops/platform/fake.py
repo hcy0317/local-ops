@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Mapping
+from typing import Literal, Mapping, Sequence
 
 from .contracts import (
     CwdSnapshot,
@@ -113,6 +113,9 @@ class FakePlatform:
     )
     elevation_launch_result: ElevationBrokerResult = field(
         default_factory=lambda: ElevationBrokerResult(False, "unsupported")
+    )
+    elevated_processes: ProcessSnapshot = field(
+        default_factory=lambda: ProcessSnapshot(status=ScanStatus.OK)
     )
     executable_icon: bytes | None = None
     launch_result: ManagedRuntime = field(default_factory=lambda: ManagedRuntime(ok=True))
@@ -299,6 +302,25 @@ class FakePlatform:
             cwd: str | None) -> ElevationBrokerResult:
         self.calls.append(("launch_elevated", (command_spec, cwd)))
         return self.elevation_launch_result
+
+    def observe_elevated(
+            self, command_spec: Mapping[str, object],
+            cwd: str | None) -> ProcessSnapshot:
+        self.calls.append(("observe_elevated", (command_spec, cwd)))
+        return self.elevated_processes
+
+    def stop_elevated(
+            self, favorite_executable: str,
+            processes: Sequence[Mapping[str, object]]) -> StopResult:
+        identities = tuple(
+            (
+                int(row["pid"]), float(row["createTime"]),
+                str(row["executable"]),
+            )
+            for row in processes
+        )
+        self.calls.append(("stop_elevated", (favorite_executable, identities)))
+        return self.stop_result
 
     def extract_executable_icon(self, executable: str) -> bytes | None:
         self.calls.append(("extract_executable_icon", executable))

@@ -100,6 +100,7 @@ def _default_run(args: Sequence[str], timeout: float) -> subprocess.CompletedPro
     return subprocess.run(
         list(args), capture_output=True, text=True, encoding="utf-8",
         errors="replace", timeout=timeout, check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
 
 

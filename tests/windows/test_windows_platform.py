@@ -1,7 +1,9 @@
 import base64
+import hashlib
 import json
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -11,7 +13,13 @@ from unittest import mock
 
 from localops.command_spec import shell_command_spec
 from localops.elevation_broker import broker_task_sddl
-from localops.platform.contracts import LaunchRequest, ScanStatus, StopResult
+from localops.platform.contracts import (
+    LaunchRequest,
+    ScanStatus,
+    ScheduledTaskRunResult,
+    ScheduledTaskSnapshot,
+    StopResult,
+)
 
 if sys.platform == "win32":
     import psutil
@@ -37,26 +45,69 @@ if sys.platform == "win32":
 class WindowsPlatformTests(unittest.TestCase):
     def setUp(self):
         self.platform = WindowsPlatform(os.getcwd(), "server.py")
+        # Adapter unit tests model the production Limited controller even when
+        # the hosted runner itself has an administrator token. The explicit
+        # elevated-controller test below opts back into True.
+        self.platform.controller_elevated = False
 
-    @staticmethod
-    def _write_broker_package(bundle: Path) -> Path:
-        internal = bundle / "_internal"
-        internal.mkdir(parents=True)
-        executable = bundle / "LocalOps.exe"
-        executable.write_bytes(b"packaged-local-ops")
-        (internal / "python312.dll").write_bytes(b"runtime")
-        (internal / "VERSION").write_text("1.0.0\n", encoding="utf-8")
-        (bundle / "BUILD-INFO.json").write_text(json.dumps({
-            "architecture": "x64",
-            "elevationBrokerDispatch": "-m localops.windows.elevation_broker",
-            "entrypoint": "localops.windows.packaged_entry",
-            "packaging": "PyInstaller onedir windowed",
-            "product": "Local Ops Console",
-            "pythonVersion": "3.12.13",
-            "schemaVersion": 1,
-            "version": "1.0.0",
-        }), encoding="utf-8")
-        return executable
+    def test_broker_exchange_waits_for_new_task_pipe_to_appear(self):
+        missing = windows_adapter.pywintypes.error(
+            windows_adapter.winerror.ERROR_FILE_NOT_FOUND,
+            "WaitNamedPipe", "pipe is not ready",
+        )
+        with mock.patch.object(
+                windows_adapter.win32pipe, "WaitNamedPipe",
+                side_effect=[missing, None]) as wait_pipe, \
+                mock.patch.object(
+                    windows_adapter.win32file, "CreateFile",
+                    return_value="pipe"), \
+                mock.patch.object(
+                    windows_adapter.win32pipe, "SetNamedPipeHandleState"), \
+                mock.patch.object(windows_adapter.win32file, "WriteFile"), \
+                mock.patch.object(
+                    windows_adapter.win32file, "ReadFile",
+                    return_value=(0, windows_adapter.encode_message({
+                        "ok": True,
+                    }))), \
+                mock.patch.object(windows_adapter.win32file, "CloseHandle"):
+            response = self.platform._broker_exchange(
+                {"action": "status"}, timeout_ms=500
+            )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(wait_pipe.call_count, 2)
+
+    def test_locked_down_scheduler_query_and_stop_fall_back_to_broker(self):
+        self.platform._elevation_token = "session-token"
+        failed = ScheduledTaskSnapshot(ScanStatus.FAILED)
+        with mock.patch.object(
+                self.platform, "_scheduled_tasks_direct",
+                return_value=failed), \
+                mock.patch.object(
+                    self.platform, "_broker_scheduled_exchange",
+                    side_effect=[{
+                        "ok": True,
+                        "status": "ok",
+                        "tasks": {r"\memos-guard": {
+                            "path": r"\Memos-Guard", "state": "running",
+                        }},
+                        "issues": [],
+                    }, {
+                        "ok": True, "operation": "stop",
+                        "path": r"\Memos-Guard",
+                    }]) as exchange, \
+                mock.patch.object(
+                    self.platform, "_stop_scheduled_task_direct",
+                    return_value=ScheduledTaskRunResult(
+                        False, r"\Memos-Guard", "access denied"
+                    )):
+            snapshot = self.platform.scheduled_tasks({r"\Memos-Guard"})
+            stopped = self.platform.stop_scheduled_task(r"\Memos-Guard")
+
+        self.assertIs(snapshot.status, ScanStatus.OK)
+        self.assertEqual(snapshot.tasks[r"\memos-guard"]["state"], "running")
+        self.assertTrue(stopped.ok)
+        self.assertEqual(exchange.call_count, 2)
 
     def test_source_venv_runner_uses_base_process_with_venv_context(self):
         venv_python = r"C:\fixture\.venv\Scripts\python.exe"
@@ -375,6 +426,44 @@ class WindowsPlatformTests(unittest.TestCase):
             self.assertIsNotNone(replacement)
             replacement.release()
 
+    def test_instance_lock_is_not_inherited_by_child_processes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            identity = os.path.join(temp_dir, "console.lock")
+            first = self.platform.acquire_instance_lock(identity)
+            self.assertIsNotNone(first)
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                close_fds=False,
+            )
+            try:
+                first.release()
+                replacement = self.platform.acquire_instance_lock(identity)
+                self.assertIsNotNone(replacement)
+                replacement.release()
+            finally:
+                child.terminate()
+                child.wait(timeout=10)
+
+    def test_legacy_instance_mutex_does_not_block_current_console(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            identity = os.path.join(temp_dir, "console.lock")
+            data_dir = self.platform._canonical_path(os.path.dirname(identity))
+            digest = hashlib.sha256(
+                (self.platform.current_principal().identifier + "\0" + data_dir)
+                .encode("utf-8")
+            ).hexdigest()[:32]
+            legacy = windows_adapter.win32event.CreateMutex(
+                self.platform._security_attributes(),
+                False,
+                "Local\\LocalOps-" + digest,
+            )
+            try:
+                current = self.platform.acquire_instance_lock(identity)
+                self.assertIsNotNone(current)
+                current.release()
+            finally:
+                win32api.CloseHandle(legacy)
+
     def test_current_process_snapshot_contains_current_sid(self):
         snapshot = self.platform.process_snapshot({os.getpid()})
         self.assertIn(snapshot.status, (ScanStatus.OK, ScanStatus.PARTIAL))
@@ -594,91 +683,15 @@ class WindowsPlatformTests(unittest.TestCase):
         self.assertTrue(result.canceled)
         self.assertIsNone(result.path)
 
-    def test_source_broker_install_uses_selected_packaged_companion(self):
-        with tempfile.TemporaryDirectory() as root:
-            bundle = Path(root) / "LocalOps-1.0.0-windows-x64"
-            executable = self._write_broker_package(bundle)
-            runtime_dir = Path(root) / "runtime"
-
-            def approve_install(**kwargs):
-                request_path = next(
-                    (runtime_dir / "elevation-install").glob("*/request.json")
-                )
-                (request_path.parent / "response.json").write_text(
-                    '{"ok": true}', encoding="utf-8"
-                )
-                return {}
-
-            with mock.patch.object(
-                    self.platform, "runtime_paths",
-                    return_value=SimpleNamespace(runtime_dir=str(runtime_dir))), \
-                    mock.patch.object(
-                        self.platform, "ensure_private_directory"), \
-                    mock.patch.object(self.platform, "ensure_private_file"), \
-                    mock.patch.object(self.platform, "verify_private_file"), \
-                    mock.patch.object(
-                        windows_adapter.shell, "ShellExecuteEx",
-                        side_effect=approve_install) as shell_execute:
-                result = self.platform.install_elevation_broker(
-                    {"verifier": "opaque"}, str(executable)
-                )
-
-            self.assertTrue(result.ok)
-            self.assertEqual(
-                shell_execute.call_args.kwargs["lpFile"], str(executable)
+    def test_source_broker_install_is_rejected_before_package_or_uac(self):
+        with mock.patch.object(
+                windows_adapter.shell, "ShellExecuteEx") as shell_execute:
+            result = self.platform.install_elevation_broker(
+                {"verifier": "opaque"}, r"C:\Local Ops\LocalOps.exe"
             )
-            parameters = shell_execute.call_args.kwargs["lpParameters"]
-            self.assertIn("localops.windows.elevation_broker", parameters)
-
-    def test_source_broker_install_auto_discovers_deployed_package(self):
-        with tempfile.TemporaryDirectory() as root:
-            bundle = (
-                Path(root) / "packages" / "1.0.0-audited"
-                / "LocalOps-1.0.0-windows-x64"
-            )
-            executable = self._write_broker_package(bundle)
-            runtime_dir = Path(root) / "runtime"
-
-            def approve_install(**kwargs):
-                request_path = next(
-                    (runtime_dir / "elevation-install").glob("*/request.json")
-                )
-                (request_path.parent / "response.json").write_text(
-                    '{"ok": true}', encoding="utf-8"
-                )
-                return {}
-
-            with mock.patch.object(
-                    self.platform, "runtime_paths",
-                    return_value=SimpleNamespace(runtime_dir=str(runtime_dir))), \
-                    mock.patch.object(
-                        self.platform, "ensure_private_directory"), \
-                    mock.patch.object(self.platform, "ensure_private_file"), \
-                    mock.patch.object(self.platform, "verify_private_file"), \
-                    mock.patch.object(
-                        windows_adapter.shell, "ShellExecuteEx",
-                        side_effect=approve_install) as shell_execute:
-                result = self.platform.install_elevation_broker(
-                    {"verifier": "opaque"}
-                )
-
-            self.assertTrue(result.ok)
-            self.assertEqual(
-                shell_execute.call_args.kwargs["lpFile"], str(executable)
-            )
-
-    def test_source_broker_install_rejects_incomplete_package_before_uac(self):
-        with tempfile.TemporaryDirectory() as root:
-            executable = Path(root) / "LocalOps.exe"
-            executable.write_bytes(b"not-a-bundle")
-            with mock.patch.object(
-                    windows_adapter.shell, "ShellExecuteEx") as shell_execute:
-                result = self.platform.install_elevation_broker(
-                    {"verifier": "opaque"}, str(executable)
-                )
 
         self.assertFalse(result.ok)
-        self.assertEqual(result.code, "BROKER_PACKAGE_INVALID")
+        self.assertEqual(result.code, "BROKER_PACKAGED_REQUIRED")
         shell_execute.assert_not_called()
 
     def test_broker_task_security_accepts_scheduler_canonical_acl_only(self):
@@ -1063,6 +1076,7 @@ class WindowsPlatformTests(unittest.TestCase):
                         "CONSOLE_LOG_DIR": os.path.join(temp_dir, "logs"),
                     }):
                 platform = WindowsPlatform(os.getcwd(), "server.py")
+                platform.controller_elevated = False
                 app_id = "a1b2c3d4"
                 generation_id = "00000000-0000-4000-8000-000000000001"
                 receipt_path = platform._runtime_files(
@@ -1148,6 +1162,33 @@ class WindowsPlatformTests(unittest.TestCase):
                     ],
                     "1",
                 )
+
+    def test_elevated_controller_refuses_managed_launch_before_creating_runtime(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+                os.environ, {
+                    "CONSOLE_DATA_DIR": os.path.join(temp_dir, "data"),
+                    "CONSOLE_LOG_DIR": os.path.join(temp_dir, "logs"),
+                }):
+            platform = WindowsPlatform(os.getcwd(), "server.py")
+            platform.controller_elevated = True
+            app_id = "a1b2c3d4"
+            generation_id = "00000000-0000-4000-8000-000000000001"
+            result = platform.launch(LaunchRequest(
+                app_id=app_id,
+                command="fixture",
+                cwd=temp_dir,
+                log_path=os.path.join(
+                    platform.runtime_paths().logs_dir, app_id + ".log"
+                ),
+                command_spec=shell_command_spec(
+                    "powershell", "exit 0", needs_review=False
+                ),
+                generation_id=generation_id,
+            ))
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, "CONTROLLER_ELEVATED_UNSAFE")
+            self.assertFalse(os.path.exists(platform.runtime_paths().runtime_dir))
 
 
 if __name__ == "__main__":

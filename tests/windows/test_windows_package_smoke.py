@@ -29,6 +29,7 @@ RUN_REAL = (
 
 if sys.platform == "win32":
     import psutil
+    import pywintypes
     import win32api
     import win32con
     import win32event
@@ -36,7 +37,7 @@ if sys.platform == "win32":
     import win32security
 
 
-    class _RestrictedProcess:
+    class _NativeProcess:
         """Minimal Popen-compatible owner for one exact fixture process handle."""
 
         def __init__(self, handle, pid: int):
@@ -83,6 +84,9 @@ if sys.platform == "win32":
                 self._handle = None
 
 
+    ConsoleProcess = _NativeProcess | subprocess.Popen[bytes]
+
+
 @unittest.skipUnless(
     RUN_REAL,
     "real Windows package smoke requires its explicit gate and archive path",
@@ -121,8 +125,8 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         )
         self.assertTrue(self.archive.is_file(), "Windows package archive is absent")
 
-        self.console_processes: list[tuple[_RestrictedProcess, float]] = []
-        self.current_console: _RestrictedProcess | None = None
+        self.console_processes: list[tuple[ConsoleProcess, float]] = []
+        self.current_console: ConsoleProcess | None = None
         self.console_port: int | None = None
         self.app_id: str | None = None
         self.runtime_identity: dict[str, object] | None = None
@@ -479,54 +483,81 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         except OSError as exc:
             return "<unavailable:%s>" % type(exc).__name__
 
-    def _start_console(self, port: int) -> _RestrictedProcess:
+    def _start_console(self, port: int) -> ConsoleProcess:
         process_token = win32security.OpenProcessToken(
             win32api.GetCurrentProcess(), win32con.TOKEN_ALL_ACCESS
         )
-        restricted_token = None
-        thread_handle = None
-        try:
-            administrators = win32security.CreateWellKnownSid(
-                win32security.WinBuiltinAdministratorsSid, None
-            )
-            restricted_token = win32security.CreateRestrictedToken(
-                process_token,
-                win32security.DISABLE_MAX_PRIVILEGE,
-                [(administrators, 0)],
-                [],
-                [],
-            )
-            startup = win32process.STARTUPINFO()
-            startup.dwFlags |= win32con.STARTF_USESHOWWINDOW
-            startup.wShowWindow = win32con.SW_HIDE
-            command = subprocess.list2cmdline([
-                str(self.executable),
-                "--no-browser",
-                "--preferred-port",
-                str(port),
-            ])
-            process_handle, thread_handle, pid, _ = win32process.CreateProcessAsUser(
-                restricted_token,
-                str(self.executable),
-                command,
-                None,
-                None,
-                False,
-                (
-                    win32process.CREATE_NO_WINDOW
-                    | win32process.CREATE_UNICODE_ENVIRONMENT
-                ),
-                self.child_environment,
-                str(self.work_dir),
-                startup,
-            )
-            process = _RestrictedProcess(process_handle, pid)
-        finally:
-            if thread_handle is not None:
-                thread_handle.Close()
-            if restricted_token is not None:
-                restricted_token.Close()
+        elevated = bool(win32security.GetTokenInformation(
+            process_token, win32security.TokenElevation
+        ))
+        if not elevated:
             process_token.Close()
+            process = subprocess.Popen(
+                [
+                    str(self.executable),
+                    "--no-browser",
+                    "--preferred-port",
+                    str(port),
+                ],
+                cwd=self.work_dir,
+                env=self.child_environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+        else:
+            launch_token = None
+            thread_handle = None
+            try:
+                try:
+                    launch_token = win32security.GetTokenInformation(
+                        process_token, win32security.TokenLinkedToken
+                    )
+                except pywintypes.error:
+                    administrators = win32security.CreateWellKnownSid(
+                        win32security.WinBuiltinAdministratorsSid, None
+                    )
+                    launch_token = win32security.CreateRestrictedToken(
+                        process_token,
+                        win32security.DISABLE_MAX_PRIVILEGE,
+                        [(administrators, 0)],
+                        [],
+                        [],
+                    )
+                startup = win32process.STARTUPINFO()
+                startup.dwFlags |= win32con.STARTF_USESHOWWINDOW
+                startup.wShowWindow = win32con.SW_HIDE
+                command = subprocess.list2cmdline([
+                    str(self.executable),
+                    "--no-browser",
+                    "--preferred-port",
+                    str(port),
+                ])
+                process_handle, thread_handle, pid, _ = (
+                    win32process.CreateProcessAsUser(
+                        launch_token,
+                        str(self.executable),
+                        command,
+                        None,
+                        None,
+                        False,
+                        (
+                            win32process.CREATE_NO_WINDOW
+                            | win32process.CREATE_UNICODE_ENVIRONMENT
+                        ),
+                        self.child_environment,
+                        str(self.work_dir),
+                        startup,
+                    )
+                )
+                process = _NativeProcess(process_handle, pid)
+            finally:
+                if thread_handle is not None:
+                    thread_handle.Close()
+                if launch_token is not None:
+                    launch_token.Close()
+                process_token.Close()
         try:
             create_time = float(psutil.Process(process.pid).create_time())
         except psutil.Error:
@@ -562,7 +593,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             % (self.CONSOLE_READY_TIMEOUT, last_error, self._console_log_tail())
         )
 
-    def _terminate_console(self, process: _RestrictedProcess):
+    def _terminate_console(self, process: ConsoleProcess):
         if process.poll() is None:
             process.terminate()
             try:
@@ -836,7 +867,9 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         else:
             problems.append("exact fixture process remained alive")
         for process, _ in self.console_processes:
-            process.close()
+            close = getattr(process, "close", None)
+            if close is not None:
+                close()
 
         if problems:
             raise AssertionError(

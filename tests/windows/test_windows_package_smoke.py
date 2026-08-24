@@ -31,7 +31,56 @@ if sys.platform == "win32":
     import psutil
     import win32api
     import win32con
+    import win32event
+    import win32process
     import win32security
+
+
+    class _RestrictedProcess:
+        """Minimal Popen-compatible owner for one exact fixture process handle."""
+
+        def __init__(self, handle, pid: int):
+            self._handle = handle
+            self._returncode: int | None = None
+            self.pid = int(pid)
+
+        def poll(self) -> int | None:
+            if self._handle is None:
+                return self._returncode
+            code = int(win32process.GetExitCodeProcess(self._handle))
+            if code == win32con.STILL_ACTIVE:
+                return None
+            self._returncode = code
+            return code
+
+        def wait(self, timeout: float | None = None) -> int:
+            if self._returncode is not None:
+                return self._returncode
+            milliseconds = (
+                win32event.INFINITE
+                if timeout is None
+                else max(0, int(float(timeout) * 1000))
+            )
+            result = win32event.WaitForSingleObject(self._handle, milliseconds)
+            if result == win32event.WAIT_TIMEOUT:
+                raise subprocess.TimeoutExpired("LocalOps.exe", timeout)
+            if result != win32event.WAIT_OBJECT_0:
+                raise OSError("fixture process wait failed")
+            code = int(win32process.GetExitCodeProcess(self._handle))
+            self._returncode = code
+            return code
+
+        def terminate(self):
+            if self.poll() is None:
+                win32process.TerminateProcess(self._handle, 1)
+
+        def kill(self):
+            self.terminate()
+
+        def close(self):
+            if self._handle is not None:
+                self._handle.Close()
+                self._handle = None
 
 
 @unittest.skipUnless(
@@ -72,8 +121,8 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         )
         self.assertTrue(self.archive.is_file(), "Windows package archive is absent")
 
-        self.console_processes: list[tuple[subprocess.Popen[bytes], float]] = []
-        self.current_console: subprocess.Popen[bytes] | None = None
+        self.console_processes: list[tuple[_RestrictedProcess, float]] = []
+        self.current_console: _RestrictedProcess | None = None
         self.console_port: int | None = None
         self.app_id: str | None = None
         self.runtime_identity: dict[str, object] | None = None
@@ -417,21 +466,54 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         except OSError as exc:
             return "<unavailable:%s>" % type(exc).__name__
 
-    def _start_console(self, port: int) -> subprocess.Popen[bytes]:
-        process = subprocess.Popen(
-            [
+    def _start_console(self, port: int) -> _RestrictedProcess:
+        process_token = win32security.OpenProcessToken(
+            win32api.GetCurrentProcess(), win32con.TOKEN_ALL_ACCESS
+        )
+        restricted_token = None
+        thread_handle = None
+        try:
+            administrators = win32security.CreateWellKnownSid(
+                win32security.WinBuiltinAdministratorsSid, None
+            )
+            restricted_token = win32security.CreateRestrictedToken(
+                process_token,
+                win32security.DISABLE_MAX_PRIVILEGE,
+                [(administrators, 0)],
+                [],
+                [],
+            )
+            startup = win32process.STARTUPINFO()
+            startup.dwFlags |= win32con.STARTF_USESHOWWINDOW
+            startup.wShowWindow = win32con.SW_HIDE
+            command = subprocess.list2cmdline([
                 str(self.executable),
                 "--no-browser",
                 "--preferred-port",
                 str(port),
-            ],
-            cwd=self.work_dir,
-            env=self.child_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-        )
+            ])
+            process_handle, thread_handle, pid, _ = win32process.CreateProcessAsUser(
+                restricted_token,
+                str(self.executable),
+                command,
+                None,
+                None,
+                False,
+                (
+                    win32process.CREATE_NO_WINDOW
+                    | win32process.CREATE_UNICODE_ENVIRONMENT
+                ),
+                self.child_environment,
+                str(self.work_dir),
+                startup,
+            )
+            process = _RestrictedProcess(process_handle, pid)
+        finally:
+            if thread_handle is not None:
+                thread_handle.Close()
+            if restricted_token is not None:
+                restricted_token.Close()
+            process_token.Close()
         try:
             create_time = float(psutil.Process(process.pid).create_time())
         except psutil.Error:
@@ -467,7 +549,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             % (self.CONSOLE_READY_TIMEOUT, last_error, self._console_log_tail())
         )
 
-    def _terminate_console(self, process: subprocess.Popen[bytes]):
+    def _terminate_console(self, process: _RestrictedProcess):
         if process.poll() is None:
             process.terminate()
             try:
@@ -740,6 +822,8 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             time.sleep(0.1)
         else:
             problems.append("exact fixture process remained alive")
+        for process, _ in self.console_processes:
+            process.close()
 
         if problems:
             raise AssertionError(
@@ -767,6 +851,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         self.assertEqual(state.get("platform"), "windows")
         self.assertEqual(state.get("consolePid"), first_console.pid)
         self.assertTrue(state.get("capabilities", {}).get("launch_managed"))
+        self.assertFalse(state.get("platformInfo", {}).get("controllerElevated"))
         self.assertEqual(
             os.path.normcase(
                 os.path.commonpath(

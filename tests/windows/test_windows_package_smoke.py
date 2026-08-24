@@ -15,6 +15,7 @@ import tempfile
 import time
 import unittest
 from unittest import mock
+import uuid
 import zipfile
 
 from tools import build_windows
@@ -31,6 +32,7 @@ if sys.platform == "win32":
     import psutil
     import pywintypes
     import win32api
+    import win32com.client
     import win32con
     import win32event
     import win32gui
@@ -89,6 +91,10 @@ if sys.platform == "win32":
 
 
     ConsoleProcess = _NativeProcess | subprocess.Popen[bytes]
+    TASK_ACTION_EXEC = 0
+    TASK_CREATE_OR_UPDATE = 6
+    TASK_LOGON_INTERACTIVE_TOKEN = 3
+    TASK_RUNLEVEL_LUA = 0
 
 
 @unittest.skipUnless(
@@ -134,6 +140,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         self.console_port: int | None = None
         self.app_id: str | None = None
         self.runtime_identity: dict[str, object] | None = None
+        self.scheduled_task_names: list[str] = []
 
         self._assert_supported_host()
         self.manifest = self._audit_and_extract()
@@ -570,9 +577,159 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         win32gui.EnumWindows(collect_window, None)
         return self._sanitize({"processes": rows, "windows": windows})
 
+    @staticmethod
+    def _powershell_literal(value: object) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def _write_scheduled_console_wrapper(self, port: int) -> Path:
+        wrapper = self.temp_dir / ("launch-%s.ps1" % uuid.uuid4().hex)
+        removed_names = (
+            "VIRTUAL_ENV",
+            "__PYVENV_LAUNCHER__",
+            "CONDA_DEFAULT_ENV",
+            "CONDA_PREFIX",
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "PYTHONUTF8",
+            "PYTHONIOENCODING",
+            "PYTHONDONTWRITEBYTECODE",
+        )
+        fixed_names = (
+            "PATH",
+            "PATHEXT",
+            "SystemRoot",
+            "WINDIR",
+            "COMSPEC",
+            "CONSOLE_DATA_DIR",
+            "CONSOLE_LOG_DIR",
+            "TEMP",
+            "TMP",
+        )
+        lines = ["$ErrorActionPreference = 'Stop'"]
+        lines.extend(
+            "Remove-Item -LiteralPath %s -ErrorAction SilentlyContinue"
+            % self._powershell_literal("Env:" + name)
+            for name in removed_names
+        )
+        lines.extend(
+            "$env:%s = %s" % (
+                name, self._powershell_literal(self.child_environment[name])
+            )
+            for name in fixed_names
+        )
+        lines.extend((
+            "$arguments = @('--no-browser', '--preferred-port', %s)"
+            % self._powershell_literal(str(port)),
+            "$process = Start-Process -FilePath %s -ArgumentList $arguments "
+            "-WorkingDirectory %s -WindowStyle Hidden -PassThru -Wait"
+            % (
+                self._powershell_literal(self.executable),
+                self._powershell_literal(self.work_dir),
+            ),
+            "exit $process.ExitCode",
+        ))
+        with wrapper.open("w", encoding="utf-8-sig", newline="\r\n") as stream:
+            stream.write("\n".join(lines) + "\n")
+        return wrapper
+
+    def _start_scheduled_console(self, port: int) -> _NativeProcess:
+        wrapper = self._write_scheduled_console_wrapper(port)
+        task_name = "LocalOps-PackageSmoke-%s" % uuid.uuid4().hex
+        account = win32api.GetUserNameEx(win32con.NameSamCompatible)
+        service = win32com.client.Dispatch("Schedule.Service")
+        service.Connect()
+        root = service.GetFolder("\\")
+        definition = service.NewTask(0)
+        definition.RegistrationInfo.Description = (
+            "Ephemeral Local Ops package smoke Limited controller"
+        )
+        definition.Principal.UserId = account
+        definition.Principal.LogonType = TASK_LOGON_INTERACTIVE_TOKEN
+        definition.Principal.RunLevel = TASK_RUNLEVEL_LUA
+        definition.Settings.Enabled = True
+        definition.Settings.Hidden = True
+        definition.Settings.StartWhenAvailable = False
+        definition.Settings.DisallowStartIfOnBatteries = False
+        definition.Settings.StopIfGoingOnBatteries = False
+        definition.Settings.ExecutionTimeLimit = "PT10M"
+        action = definition.Actions.Create(TASK_ACTION_EXEC)
+        powershell = Path(self.child_environment["SystemRoot"]) / (
+            "System32/WindowsPowerShell/v1.0/powershell.exe"
+        )
+        action.Path = str(powershell)
+        action.Arguments = subprocess.list2cmdline([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(wrapper),
+        ])
+        action.WorkingDirectory = str(self.work_dir)
+        registered = root.RegisterTaskDefinition(
+            task_name,
+            definition,
+            TASK_CREATE_OR_UPDATE,
+            account,
+            None,
+            TASK_LOGON_INTERACTIVE_TOKEN,
+        )
+        self.scheduled_task_names.append(task_name)
+        try:
+            registered.Run("")
+            credential_path = self.data_dir / "control-credential.json"
+            deadline = time.monotonic() + self.CONSOLE_READY_TIMEOUT
+            last_error = "credential unavailable"
+            while time.monotonic() < deadline:
+                try:
+                    with credential_path.open("r", encoding="utf-8") as stream:
+                        credential = json.load(stream)
+                    pid = credential.get("pid")
+                    if (
+                        credential.get("port") != port
+                        or not isinstance(pid, int)
+                        or isinstance(pid, bool)
+                    ):
+                        raise ValueError("credential identity mismatch")
+                    candidate = psutil.Process(pid)
+                    if os.path.normcase(candidate.exe()) != os.path.normcase(
+                            str(self.executable)):
+                        raise ValueError("credential executable mismatch")
+                    access = (
+                        win32con.PROCESS_QUERY_LIMITED_INFORMATION
+                        | win32con.PROCESS_TERMINATE
+                        | win32con.SYNCHRONIZE
+                    )
+                    handle = win32api.OpenProcess(access, False, pid)
+                    return _NativeProcess(handle, pid)
+                except (OSError, ValueError, psutil.Error) as exc:
+                    last_error = type(exc).__name__
+                time.sleep(0.1)
+            raise AssertionError(
+                "scheduled Limited console produced no private credential "
+                "within %.0fs (last=%s, taskState=%r, taskResult=%r)"
+                % (
+                    self.CONSOLE_READY_TIMEOUT,
+                    last_error,
+                    registered.State,
+                    registered.LastTaskResult,
+                )
+            )
+        except Exception:
+            try:
+                registered.Stop(0)
+            except pywintypes.com_error:
+                pass
+            try:
+                root.DeleteTask(task_name, 0)
+                self.scheduled_task_names.remove(task_name)
+            except (ValueError, pywintypes.com_error):
+                pass
+            raise
+
     def _start_console(self, port: int) -> ConsoleProcess:
         process_token = win32security.OpenProcessToken(
-            win32api.GetCurrentProcess(), win32con.TOKEN_ALL_ACCESS
+            win32api.GetCurrentProcess(), win32con.TOKEN_QUERY
         )
         elevated = bool(win32security.GetTokenInformation(
             process_token, win32security.TokenElevation
@@ -594,58 +751,8 @@ class WindowsPackageSmokeTests(unittest.TestCase):
                 close_fds=True,
             )
         else:
-            launch_token = None
-            thread_handle = None
-            try:
-                try:
-                    launch_token = win32security.GetTokenInformation(
-                        process_token, win32security.TokenLinkedToken
-                    )
-                except pywintypes.error:
-                    administrators = win32security.CreateWellKnownSid(
-                        win32security.WinBuiltinAdministratorsSid, None
-                    )
-                    launch_token = win32security.CreateRestrictedToken(
-                        process_token,
-                        win32security.DISABLE_MAX_PRIVILEGE,
-                        [(administrators, 0)],
-                        [],
-                        [],
-                    )
-                startup = win32process.STARTUPINFO()
-                startup.dwFlags |= win32con.STARTF_USESHOWWINDOW
-                startup.wShowWindow = win32con.SW_HIDE
-                startup.lpDesktop = r"winsta0\default"
-                command = subprocess.list2cmdline([
-                    str(self.executable),
-                    "--no-browser",
-                    "--preferred-port",
-                    str(port),
-                ])
-                process_handle, thread_handle, pid, _ = (
-                    win32process.CreateProcessAsUser(
-                        launch_token,
-                        str(self.executable),
-                        command,
-                        None,
-                        None,
-                        False,
-                        (
-                            win32process.CREATE_BREAKAWAY_FROM_JOB
-                            | win32process.CREATE_UNICODE_ENVIRONMENT
-                        ),
-                        self.child_environment,
-                        str(self.work_dir),
-                        startup,
-                    )
-                )
-                process = _NativeProcess(process_handle, pid)
-            finally:
-                if thread_handle is not None:
-                    thread_handle.Close()
-                if launch_token is not None:
-                    launch_token.Close()
-                process_token.Close()
+            process_token.Close()
+            process = self._start_scheduled_console(port)
         try:
             create_time = float(psutil.Process(process.pid).create_time())
         except psutil.Error:
@@ -886,6 +993,26 @@ class WindowsPackageSmokeTests(unittest.TestCase):
                 self._terminate_console(process)
             except (OSError, subprocess.SubprocessError) as exc:
                 problems.append("console:%s" % type(exc).__name__)
+
+        if self.scheduled_task_names:
+            try:
+                service = win32com.client.Dispatch("Schedule.Service")
+                service.Connect()
+                task_root = service.GetFolder("\\")
+            except pywintypes.com_error as exc:
+                problems.append("task-service:%s" % type(exc).__name__)
+            else:
+                for task_name in reversed(self.scheduled_task_names):
+                    try:
+                        registered = task_root.GetTask(task_name)
+                        try:
+                            registered.Stop(0)
+                        except pywintypes.com_error:
+                            pass
+                        task_root.DeleteTask(task_name, 0)
+                    except pywintypes.com_error as exc:
+                        problems.append("task-delete:%s" % type(exc).__name__)
+                self.scheduled_task_names.clear()
 
         tracked_runtime = []
         if isinstance(identity, dict) and self.app_id:

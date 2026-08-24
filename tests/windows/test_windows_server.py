@@ -70,11 +70,16 @@ class HttpHarness:
 @unittest.skipUnless(sys.platform == "win32", "Windows-only server tests")
 class WindowsServerTests(unittest.TestCase):
     def setUp(self):
+        self.controller_patch = mock.patch.object(
+            server.PLATFORM, "controller_elevated", False
+        )
+        self.controller_patch.start()
         self.harness = HttpHarness()
         self.headers = self.harness.session_headers()
 
     def tearDown(self):
         self.harness.close()
+        self.controller_patch.stop()
 
     def test_state_exposes_owned_job_lifecycle_capabilities(self):
         status, state, _ = self.harness.request("GET", "/api/state")

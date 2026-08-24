@@ -45,6 +45,10 @@ if sys.platform == "win32":
 class WindowsPlatformTests(unittest.TestCase):
     def setUp(self):
         self.platform = WindowsPlatform(os.getcwd(), "server.py")
+        # Adapter unit tests model the production Limited controller even when
+        # the hosted runner itself has an administrator token. The explicit
+        # elevated-controller test below opts back into True.
+        self.platform.controller_elevated = False
 
     def test_broker_exchange_waits_for_new_task_pipe_to_appear(self):
         missing = windows_adapter.pywintypes.error(

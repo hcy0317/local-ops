@@ -7,6 +7,7 @@ import locale
 import os
 from pathlib import Path, PurePosixPath
 import platform
+import secrets
 import shutil
 import socket
 import subprocess
@@ -36,6 +37,8 @@ if sys.platform == "win32":
     import win32con
     import win32event
     import win32gui
+    import win32net
+    import win32netcon
     import win32process
     import win32security
 
@@ -93,7 +96,7 @@ if sys.platform == "win32":
     ConsoleProcess = _NativeProcess | subprocess.Popen[bytes]
     TASK_ACTION_EXEC = 0
     TASK_CREATE_OR_UPDATE = 6
-    TASK_LOGON_INTERACTIVE_TOKEN = 3
+    TASK_LOGON_PASSWORD = 1
     TASK_RUNLEVEL_LUA = 0
 
 
@@ -141,6 +144,10 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         self.app_id: str | None = None
         self.runtime_identity: dict[str, object] | None = None
         self.scheduled_task_names: list[str] = []
+        self.fixture_username: str | None = None
+        self.fixture_account: str | None = None
+        self.fixture_account_password: str | None = None
+        self.fixture_account_sid: str | None = None
 
         self._assert_supported_host()
         self.manifest = self._audit_and_extract()
@@ -149,6 +156,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         self._assert_manifest_matches_install_tree()
         self.child_environment = self._package_environment()
         self._assert_no_python_on_child_path()
+        self._prepare_limited_fixture_account()
         self._grant_fixture_user_modify()
 
         self.addCleanup(self._restore_bundle_acl)
@@ -310,6 +318,67 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         finally:
             token.Close()
 
+    def _prepare_limited_fixture_account(self):
+        token = win32security.OpenProcessToken(
+            win32api.GetCurrentProcess(), win32con.TOKEN_QUERY
+        )
+        try:
+            elevated = bool(win32security.GetTokenInformation(
+                token, win32security.TokenElevation
+            ))
+        finally:
+            token.Close()
+        if not elevated:
+            return
+
+        username = "LocalOpsSmk%s" % uuid.uuid4().hex[:8]
+        password = "Lo1!" + secrets.token_urlsafe(24)
+        win32net.NetUserAdd(None, 1, {
+            "name": username,
+            "password": password,
+            "priv": win32netcon.USER_PRIV_USER,
+            "comment": "Ephemeral Local Ops package smoke account",
+            "flags": (
+                win32netcon.UF_NORMAL_ACCOUNT
+                | win32netcon.UF_SCRIPT
+                | win32netcon.UF_DONT_EXPIRE_PASSWD
+            ),
+        })
+        try:
+            sid, _, _ = win32security.LookupAccountName(None, username)
+            computer = os.environ.get("COMPUTERNAME") or "."
+            self.fixture_username = username
+            self.fixture_account = "%s\\%s" % (computer, username)
+            self.fixture_account_password = password
+            self.fixture_account_sid = str(
+                win32security.ConvertSidToStringSid(sid)
+            )
+            self.addCleanup(self._remove_limited_fixture_account)
+        except Exception:
+            win32net.NetUserDel(None, username)
+            raise
+
+    def _remove_limited_fixture_account(self):
+        username = self.fixture_username
+        self.fixture_account_password = None
+        if not username:
+            return
+        try:
+            win32net.NetUserDel(None, username)
+        except win32net.error as exc:
+            if getattr(exc, "winerror", None) != 2221:
+                raise
+        finally:
+            self.fixture_username = None
+            self.fixture_account = None
+            self.fixture_account_sid = None
+
+    def _fixture_security_sids(self) -> tuple[str, ...]:
+        values = [self._current_user_sid()]
+        if self.fixture_account_sid:
+            values.append(self.fixture_account_sid)
+        return tuple(values)
+
     def _icacls(self, arguments: list[str], *, action: str):
         executable = Path(self.child_environment["SystemRoot"]) / "System32" / "icacls.exe"
         completed = subprocess.run(
@@ -332,49 +401,47 @@ class WindowsPackageSmokeTests(unittest.TestCase):
 
     def _make_bundle_read_execute_only(self):
         self._assert_fixture_path(self.bundle)
-        sid = self._current_user_sid()
-        allow_read_execute = "*%s:(OI)(CI)(RX)" % sid
-        deny_write_data = "*%s:(OI)(CI)(WD,AD)" % sid
         self.fixture_acl_restored = False
         # A hosted administrator may reach the extracted tree only through its
         # Administrators ACE. The Limited smoke token intentionally disables that
         # SID, so model Program Files by granting the exact user explicit RX first.
-        self._icacls(
-            [
-                self.bundle.name,
-                "/grant",
-                allow_read_execute,
-                "/T",
-                "/Q",
-            ],
-            action="grant recursive bundle read execute",
-        )
-        # Denying data creation/appends for the exact user overrides that write
-        # path while preserving loader read/execute and ACL-recovery rights.
-        self._icacls(
-            [
-                self.bundle.name,
-                "/deny",
-                deny_write_data,
-                "/T",
-                "/Q",
-            ],
-            action="deny recursive bundle data writes",
-        )
+        for sid in self._fixture_security_sids():
+            self._icacls(
+                [
+                    self.bundle.name,
+                    "/grant",
+                    "*%s:(OI)(CI)(RX)" % sid,
+                    "/T",
+                    "/Q",
+                ],
+                action="grant recursive bundle read execute",
+            )
+            # Denying data creation/appends for the exact user overrides that
+            # write path while preserving loader RX and ACL-recovery rights.
+            self._icacls(
+                [
+                    self.bundle.name,
+                    "/deny",
+                    "*%s:(OI)(CI)(WD,AD)" % sid,
+                    "/T",
+                    "/Q",
+                ],
+                action="deny recursive bundle data writes",
+            )
 
     def _grant_fixture_user_modify(self):
         self._assert_fixture_path(self.fixture_root)
-        sid = self._current_user_sid()
-        self._icacls(
-            [
-                str(self.fixture_root),
-                "/grant",
-                "*%s:(OI)(CI)(M)" % sid,
-                "/T",
-                "/Q",
-            ],
-            action="grant fixture user modify",
-        )
+        for sid in self._fixture_security_sids():
+            self._icacls(
+                [
+                    str(self.fixture_root),
+                    "/grant",
+                    "*%s:(OI)(CI)(M)" % sid,
+                    "/T",
+                    "/Q",
+                ],
+                action="grant fixture user modify",
+            )
 
     def _assert_bundle_write_denied(self):
         marker = self.bundle / build_windows.BUILD_INFO_NAME
@@ -393,11 +460,11 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         if not self.bundle.exists():
             return
         self._assert_fixture_path(self.bundle)
-        deny_sid = "*%s" % self._current_user_sid()
-        self._icacls(
-            [self.bundle.name, "/remove:d", deny_sid, "/T", "/Q"],
-            action="remove recursive bundle write deny",
-        )
+        for sid in self._fixture_security_sids():
+            self._icacls(
+                [self.bundle.name, "/remove:d", "*%s" % sid, "/T", "/Q"],
+                action="remove recursive bundle write deny",
+            )
         marker = self.bundle / build_windows.BUILD_INFO_NAME
         descriptor = os.open(marker, os.O_WRONLY | os.O_APPEND)
         os.close(descriptor)
@@ -635,7 +702,10 @@ class WindowsPackageSmokeTests(unittest.TestCase):
     def _start_scheduled_console(self, port: int) -> _NativeProcess:
         wrapper = self._write_scheduled_console_wrapper(port)
         task_name = "LocalOps-PackageSmoke-%s" % uuid.uuid4().hex
-        account = win32api.GetUserNameEx(win32con.NameSamCompatible)
+        account = self.fixture_account
+        password = self.fixture_account_password
+        if not account or not password:
+            raise AssertionError("elevated package smoke has no standard account")
         service = win32com.client.Dispatch("Schedule.Service")
         service.Connect()
         root = service.GetFolder("\\")
@@ -644,7 +714,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             "Ephemeral Local Ops package smoke Limited controller"
         )
         definition.Principal.UserId = account
-        definition.Principal.LogonType = TASK_LOGON_INTERACTIVE_TOKEN
+        definition.Principal.LogonType = TASK_LOGON_PASSWORD
         definition.Principal.RunLevel = TASK_RUNLEVEL_LUA
         definition.Settings.Enabled = True
         definition.Settings.Hidden = True
@@ -671,8 +741,8 @@ class WindowsPackageSmokeTests(unittest.TestCase):
             definition,
             TASK_CREATE_OR_UPDATE,
             account,
-            None,
-            TASK_LOGON_INTERACTIVE_TOKEN,
+            password,
+            TASK_LOGON_PASSWORD,
         )
         self.scheduled_task_names.append(task_name)
         try:

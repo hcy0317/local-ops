@@ -142,6 +142,7 @@ class WindowsPackageSmokeTests(unittest.TestCase):
         self._assert_manifest_matches_install_tree()
         self.child_environment = self._package_environment()
         self._assert_no_python_on_child_path()
+        self._grant_fixture_user_modify()
 
         self.addCleanup(self._restore_bundle_acl)
         self._make_bundle_read_execute_only()
@@ -352,6 +353,20 @@ class WindowsPackageSmokeTests(unittest.TestCase):
                 "/Q",
             ],
             action="deny recursive bundle data writes",
+        )
+
+    def _grant_fixture_user_modify(self):
+        self._assert_fixture_path(self.fixture_root)
+        sid = self._current_user_sid()
+        self._icacls(
+            [
+                str(self.fixture_root),
+                "/grant",
+                "*%s:(OI)(CI)(M)" % sid,
+                "/T",
+                "/Q",
+            ],
+            action="grant fixture user modify",
         )
 
     def _assert_bundle_write_denied(self):

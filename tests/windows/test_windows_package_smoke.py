@@ -317,11 +317,24 @@ class WindowsPackageSmokeTests(unittest.TestCase):
     def _make_bundle_read_execute_only(self):
         self._assert_fixture_path(self.bundle)
         sid = self._current_user_sid()
+        allow_read_execute = "*%s:(OI)(CI)(RX)" % sid
         deny_write_data = "*%s:(OI)(CI)(WD,AD)" % sid
         self.fixture_acl_restored = False
-        # The hosted runner also has an Administrators allow ACE. Denying only
-        # data creation/appends for the exact user overrides that write path while
-        # preserving the loader's inherited read/execute and ACL-recovery rights.
+        # A hosted administrator may reach the extracted tree only through its
+        # Administrators ACE. The Limited smoke token intentionally disables that
+        # SID, so model Program Files by granting the exact user explicit RX first.
+        self._icacls(
+            [
+                self.bundle.name,
+                "/grant",
+                allow_read_execute,
+                "/T",
+                "/Q",
+            ],
+            action="grant recursive bundle read execute",
+        )
+        # Denying data creation/appends for the exact user overrides that write
+        # path while preserving loader read/execute and ACL-recovery rights.
         self._icacls(
             [
                 self.bundle.name,

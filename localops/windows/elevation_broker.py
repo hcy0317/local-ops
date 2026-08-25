@@ -7,7 +7,9 @@ import hmac
 import json
 import os
 from pathlib import Path
+import re
 import shutil
+import secrets
 import subprocess
 import sys
 import time
@@ -39,18 +41,62 @@ from localops.elevation_broker import (
     normalize_elevated_launch,
     normalize_elevated_stop,
     normalize_scheduled_request,
+    make_keepalive_registry,
+    validate_keepalive_registry,
 )
 from localops.windows.runner_protocol import decode_message, encode_message
 
 
 _SYSTEM_SID = "S-1-5-18"
 _ADMINISTRATORS_SID = "S-1-5-32-544"
+_USERS_SID = "S-1-5-32-545"
+_EVERYONE_SID = "S-1-1-0"
+_AUTHENTICATED_USERS_SID = "S-1-5-11"
+_CREATOR_OWNER_SID = "S-1-3-0"
+_TRUSTED_INSTALLER_SID = (
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+)
 _MAX_MESSAGE = 1024 * 1024
+_CAPABILITY_TEMP_RE = re.compile(
+    r"(?:key\.bin|grants\.json)\.tmp-[0-9a-f]{32}\Z"
+)
+_KEEP_ALIVE_ATTESTATION_TTL = 30.0
+_KEEP_ALIVE_RESOURCE_VERIFY_TTL = 30.0
 
 
 def _program_data_dir() -> Path:
     root = os.environ.get("ProgramData") or r"C:\ProgramData"
     return Path(root) / "LocalOps"
+
+
+def _verify_broker_data_ancestors(*, require_localops: bool) -> None:
+    raw_root = Path(os.environ.get("ProgramData") or r"C:\ProgramData")
+    root = Path(os.path.abspath(raw_root))
+    if (not root.is_dir() or root.is_symlink()
+            or win32api.GetFileAttributes(
+                str(root)) & win32con.FILE_ATTRIBUTE_REPARSE_POINT
+            or os.path.normcase(os.path.realpath(root))
+            != os.path.normcase(os.path.abspath(root))):
+        raise OSError("ProgramData root is not a trusted canonical directory")
+    expected_localops = Path(os.path.abspath(root / "LocalOps"))
+    if expected_localops.exists():
+        if (not expected_localops.is_dir() or expected_localops.is_symlink()
+                or win32api.GetFileAttributes(
+                    str(expected_localops)) & win32con.FILE_ATTRIBUTE_REPARSE_POINT
+                or os.path.normcase(os.path.realpath(expected_localops))
+                != os.path.normcase(os.path.abspath(expected_localops))):
+            raise OSError("LocalOps ProgramData directory is not canonical")
+    elif require_localops:
+        raise OSError("LocalOps ProgramData directory is missing")
+    expected_capabilities = expected_localops / "capabilities"
+    if expected_capabilities.exists() and (
+            not expected_capabilities.is_dir()
+            or expected_capabilities.is_symlink()
+            or win32api.GetFileAttributes(
+                str(expected_capabilities)) & win32con.FILE_ATTRIBUTE_REPARSE_POINT
+            or os.path.normcase(os.path.realpath(expected_capabilities))
+            != os.path.normcase(os.path.abspath(expected_capabilities))):
+        raise OSError("capability directory is not canonical")
 
 
 def _program_files_broker_dir() -> Path:
@@ -64,6 +110,18 @@ def public_config_path() -> Path:
 
 def secret_config_path() -> Path:
     return _program_data_dir() / "elevation-password.json"
+
+
+def capability_dir() -> Path:
+    return _program_data_dir() / "capabilities"
+
+
+def capability_key_path() -> Path:
+    return capability_dir() / "key.bin"
+
+
+def capability_registry_path() -> Path:
+    return capability_dir() / "grants.json"
 
 
 def _acl(owner_sid: str, *, user_access: int, inherit: bool) -> object:
@@ -111,16 +169,218 @@ def _write_json(path: Path, payload: Mapping[str, object], owner_sid: str, *, se
     data = json.dumps(
         payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
-    with open(temporary, "xb") as stream:
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    access = 0 if secret else (
-        ntsecuritycon.FILE_GENERIC_READ | ntsecuritycon.FILE_GENERIC_EXECUTE
+    try:
+        with open(temporary, "xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        access = 0 if secret else (
+            ntsecuritycon.FILE_GENERIC_READ | ntsecuritycon.FILE_GENERIC_EXECUTE
+        )
+        _protect_path(temporary, owner_sid, directory=False, user_access=access)
+        os.replace(temporary, path)
+        _protect_path(path, owner_sid, directory=False, user_access=access)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_secret_bytes(path: Path, payload: bytes, owner_sid: str) -> None:
+    temporary = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex)
+    try:
+        with open(temporary, "xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _protect_path(temporary, owner_sid, directory=False, user_access=0)
+        os.replace(temporary, path)
+        _protect_path(path, owner_sid, directory=False, user_access=0)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _verify_broker_only_path(
+        path: Path, *, directory: bool, allow_inherited: bool = False) -> None:
+    if (path.is_symlink() or (directory and not path.is_dir())
+            or (not directory and not path.is_file())):
+        raise OSError("broker-only path is not a safe expected object")
+    attributes = win32api.GetFileAttributes(str(path))
+    if attributes & win32con.FILE_ATTRIBUTE_REPARSE_POINT:
+        raise OSError("broker-only path cannot be a reparse point")
+    descriptor = win32security.GetNamedSecurityInfo(
+        str(path), win32security.SE_FILE_OBJECT,
+        win32security.OWNER_SECURITY_INFORMATION
+        | win32security.DACL_SECURITY_INFORMATION,
     )
-    _protect_path(temporary, owner_sid, directory=False, user_access=access)
-    os.replace(temporary, path)
-    _protect_path(path, owner_sid, directory=False, user_access=access)
+    owner = win32security.ConvertSidToStringSid(
+        descriptor.GetSecurityDescriptorOwner()
+    )
+    dacl = descriptor.GetSecurityDescriptorDacl()
+    aces = [
+        dacl.GetAce(index) for index in range(dacl.GetAceCount())
+    ] if dacl is not None else []
+    principals = {
+        win32security.ConvertSidToStringSid(ace[2]) for ace in aces
+    }
+    allowed = {_SYSTEM_SID, _ADMINISTRATORS_SID}
+    control = descriptor.GetSecurityDescriptorControl()[0]
+    if (owner not in allowed or principals != allowed
+            or not aces
+            or not all(
+                ace[0][0] == win32security.ACCESS_ALLOWED_ACE_TYPE
+                and ace[1] & ntsecuritycon.FILE_ALL_ACCESS
+                == ntsecuritycon.FILE_ALL_ACCESS
+                for ace in aces
+            ) or (
+                not allow_inherited
+                and not control & win32security.SE_DACL_PROTECTED
+            )):
+        raise PermissionError("broker-only ACL verification failed")
+
+
+def _verify_broker_public_directory(path: Path, owner_sid: str) -> None:
+    if (path.is_symlink() or not path.is_dir()
+            or win32api.GetFileAttributes(
+                str(path)) & win32con.FILE_ATTRIBUTE_REPARSE_POINT):
+        raise OSError("broker public directory is not a safe directory")
+    descriptor = win32security.GetNamedSecurityInfo(
+        str(path), win32security.SE_FILE_OBJECT,
+        win32security.OWNER_SECURITY_INFORMATION
+        | win32security.DACL_SECURITY_INFORMATION,
+    )
+    owner = win32security.ConvertSidToStringSid(
+        descriptor.GetSecurityDescriptorOwner()
+    )
+    dacl = descriptor.GetSecurityDescriptorDacl()
+    aces = [
+        dacl.GetAce(index) for index in range(dacl.GetAceCount())
+    ] if dacl is not None else []
+    expected = {
+        _SYSTEM_SID: ntsecuritycon.FILE_ALL_ACCESS,
+        _ADMINISTRATORS_SID: ntsecuritycon.FILE_ALL_ACCESS,
+        owner_sid: (
+            ntsecuritycon.FILE_GENERIC_READ
+            | ntsecuritycon.FILE_GENERIC_EXECUTE
+        ),
+    }
+    actual = {
+        win32security.ConvertSidToStringSid(ace[2]): int(ace[1])
+        for ace in aces
+        if ace[0][0] == win32security.ACCESS_ALLOWED_ACE_TYPE
+    }
+    control = descriptor.GetSecurityDescriptorControl()[0]
+    if (owner not in {_SYSTEM_SID, _ADMINISTRATORS_SID}
+            or set(actual) != set(expected)
+            or any(actual[sid] & ~mask for sid, mask in expected.items())
+            or not control & win32security.SE_DACL_PROTECTED):
+        raise PermissionError("broker public directory ACL verification failed")
+
+
+def _verify_broker_public_file(path: Path, owner_sid: str) -> None:
+    if (path.is_symlink() or not path.is_file()
+            or win32api.GetFileAttributes(
+                str(path)) & win32con.FILE_ATTRIBUTE_REPARSE_POINT):
+        raise OSError("broker public file is not a safe regular file")
+    descriptor = win32security.GetNamedSecurityInfo(
+        str(path), win32security.SE_FILE_OBJECT,
+        win32security.OWNER_SECURITY_INFORMATION
+        | win32security.DACL_SECURITY_INFORMATION,
+    )
+    owner = win32security.ConvertSidToStringSid(
+        descriptor.GetSecurityDescriptorOwner()
+    )
+    dacl = descriptor.GetSecurityDescriptorDacl()
+    aces = [
+        dacl.GetAce(index) for index in range(dacl.GetAceCount())
+    ] if dacl is not None else []
+    expected = {
+        _SYSTEM_SID: ntsecuritycon.FILE_ALL_ACCESS,
+        _ADMINISTRATORS_SID: ntsecuritycon.FILE_ALL_ACCESS,
+        owner_sid: (
+            ntsecuritycon.FILE_GENERIC_READ
+            | ntsecuritycon.FILE_GENERIC_EXECUTE
+        ),
+    }
+    actual = {
+        win32security.ConvertSidToStringSid(ace[2]): int(ace[1])
+        for ace in aces
+        if ace[0][0] == win32security.ACCESS_ALLOWED_ACE_TYPE
+    }
+    control = descriptor.GetSecurityDescriptorControl()[0]
+    if (owner not in {_SYSTEM_SID, _ADMINISTRATORS_SID}
+            or set(actual) != set(expected)
+            or any(actual[sid] & ~mask for sid, mask in expected.items())
+            or not control & win32security.SE_DACL_PROTECTED):
+        raise PermissionError("broker public file ACL verification failed")
+
+
+def _cleanup_capability_temporaries(directory: Path) -> None:
+    for item in directory.iterdir():
+        if item.name in {"key.bin", "grants.json"}:
+            continue
+        if not _CAPABILITY_TEMP_RE.fullmatch(item.name):
+            raise OSError("capability store contains unknown entries")
+        # The directory was already verified broker-only. A crash between raw
+        # file creation and explicit protection can leave the exact inherited
+        # SYSTEM/Administrators ACL without SE_DACL_PROTECTED; that remains
+        # safe to remove, but no additional principal or right is accepted.
+        _verify_broker_only_path(
+            item, directory=False, allow_inherited=True
+        )
+        item.unlink()
+
+
+def _load_capability_registry(
+        owner_sid: str, *, create: bool
+        ) -> tuple[bytes, str, int, dict[str, object]]:
+    _verify_broker_data_ancestors(require_localops=True)
+    directory = capability_dir()
+    directory_created = False
+    if directory.exists():
+        if directory.is_symlink() or not directory.is_dir():
+            raise OSError("capability store is not a safe directory")
+    elif create:
+        directory.mkdir(parents=False)
+        directory_created = True
+    else:
+        raise OSError("capability store is missing")
+    if directory_created:
+        _protect_path(directory, owner_sid, directory=True, user_access=0)
+    _verify_broker_only_path(directory, directory=True)
+    _cleanup_capability_temporaries(directory)
+    key_path = capability_key_path()
+    registry_path = capability_registry_path()
+    if key_path.exists():
+        _verify_broker_only_path(key_path, directory=False)
+        key = key_path.read_bytes()
+    elif create:
+        key = secrets.token_bytes(32)
+        _write_secret_bytes(key_path, key, owner_sid)
+    else:
+        raise OSError("capability key is missing")
+    if len(key) != 32:
+        raise OSError("capability key length is invalid")
+    _verify_broker_only_path(key_path, directory=False)
+    key_id = hashlib.sha256(key).hexdigest()[:32]
+    if registry_path.exists():
+        _verify_broker_only_path(registry_path, directory=False)
+        registry = _read_json(registry_path)
+        revision, grants = validate_keepalive_registry(
+            registry, key, owner_sid=owner_sid, key_id=key_id
+        )
+    elif create:
+        revision, grants = 0, {}
+        _write_json(
+            registry_path,
+            make_keepalive_registry(owner_sid, key_id, revision, grants, key),
+            owner_sid,
+            secret=True,
+        )
+    else:
+        raise OSError("capability registry is missing")
+    _verify_broker_only_path(registry_path, directory=False)
+    _verify_broker_data_ancestors(require_localops=True)
+    _verify_broker_only_path(directory, directory=True)
+    return key, key_id, revision, grants
 
 
 def _sha256(path: Path) -> str:
@@ -242,14 +502,19 @@ def install(request: Mapping[str, object]) -> dict[str, object]:
         "passwordRecord": request["passwordRecord"],
     }
     data_dir = _program_data_dir()
-    data_dir.mkdir(parents=True, exist_ok=True)
-    _protect_path(
-        data_dir, owner_sid, directory=True,
-        user_access=ntsecuritycon.FILE_GENERIC_READ
-        | ntsecuritycon.FILE_GENERIC_EXECUTE,
-    )
+    _verify_broker_data_ancestors(require_localops=False)
+    data_created = not data_dir.exists()
+    if data_created:
+        data_dir.mkdir(parents=True, exist_ok=False)
+        _protect_path(
+            data_dir, owner_sid, directory=True,
+            user_access=ntsecuritycon.FILE_GENERIC_READ
+            | ntsecuritycon.FILE_GENERIC_EXECUTE,
+        )
+    _verify_broker_public_directory(data_dir, owner_sid)
     _write_json(public_config_path(), public, owner_sid, secret=False)
     _write_json(secret_config_path(), secret, owner_sid, secret=True)
+    _load_capability_registry(owner_sid, create=True)
     _register_task(spec)
     return {"ok": True, "taskPath": BROKER_TASK_PATH}
 
@@ -441,6 +706,25 @@ def _scheduled(request: dict[str, object], owner_sid: str) -> dict[str, object]:
     }
 
 
+def _scheduled_runtime(path: str, owner_sid: str) -> dict[str, object]:
+    normalized = normalize_scheduled_request({
+        "operation": "query", "paths": [path]
+    })["paths"][0]
+    from localops.platform.windows import WindowsPlatform
+
+    platform = WindowsPlatform(os.getcwd(), sys.executable)
+    if platform.current_principal().identifier.casefold() != owner_sid.casefold():
+        raise PermissionError("scheduled task owner SID changed")
+    row = platform.scheduled_task_runtime(str(normalized))
+    return {
+        "ok": True,
+        "operation": "query",
+        "status": "ok",
+        "tasks": {str(normalized).casefold(): row},
+        "issues": [],
+    }
+
+
 def _pipe_security(owner_sid: str) -> object:
     descriptor = win32security.SECURITY_DESCRIPTOR()
     descriptor.SetSecurityDescriptorDacl(
@@ -457,13 +741,475 @@ def _pipe_security(owner_sid: str) -> object:
     return attributes
 
 
+def _canonical_digest(value: Mapping[str, object]) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _task_security_record(task: Mapping[str, object]) -> dict[str, object]:
+    action_types = list(task.get("actionTypes") or [])
+    action_details = list(task.get("actionDetails") or [])
+    definition_fingerprint = task.get("definitionFingerprint")
+    security_fingerprint = task.get("securityDescriptorFingerprint")
+    if (task.get("actionCount") != 1 or len(action_details) != 1
+            or action_details[0].get("type") != "exec"
+            or action_types not in ([0], ["Exec"])
+            or not isinstance(definition_fingerprint, str)
+            or not isinstance(security_fingerprint, str)
+            or task.get("securityLocked") is not True
+            or not str(task.get("principalSid") or "")):
+        raise ValueError(
+            "persistent scheduled keep-alive requires one fully verified Exec task"
+        )
+    return {
+        "path": str(task.get("path") or ""),
+        "principalSid": str(
+            task.get("principalSid") or task.get("principalUserId") or ""
+        ),
+        "runLevel": str(task.get("runLevel") or ""),
+        "multipleInstances": str(task.get("multipleInstances") or ""),
+        "triggerCount": int(task.get("triggerCount") or 0),
+        "principalLogonType": task.get("principalLogonType"),
+        "actionDetails": action_details,
+        "actionTypes": action_types,
+        "definitionFingerprint": definition_fingerprint,
+        "securityDescriptorFingerprint": security_fingerprint,
+        "securityLocked": task.get("securityLocked") is True,
+    }
+
+
+def _program_files_roots() -> tuple[str, ...]:
+    roots = []
+    for name in ("ProgramFiles", "ProgramFiles(x86)"):
+        value = os.environ.get(name)
+        if value:
+            roots.append(os.path.normcase(os.path.realpath(value)))
+    return tuple(dict.fromkeys(roots))
+
+
+def _reject_user_writable(
+        path: Path, owner_sid: str, *, directory: bool,
+        allow_root_creator_owner: bool = False) -> None:
+    descriptor = win32security.GetNamedSecurityInfo(
+        str(path), win32security.SE_FILE_OBJECT,
+        win32security.OWNER_SECURITY_INFORMATION
+        | win32security.DACL_SECURITY_INFORMATION,
+    )
+    owner = win32security.ConvertSidToStringSid(
+        descriptor.GetSecurityDescriptorOwner()
+    )
+    dacl = descriptor.GetSecurityDescriptorDacl()
+    write_mask = (
+        ntsecuritycon.FILE_GENERIC_WRITE
+        | ntsecuritycon.FILE_WRITE_DATA
+        | ntsecuritycon.FILE_APPEND_DATA
+        | ntsecuritycon.FILE_ADD_FILE
+        | ntsecuritycon.FILE_ADD_SUBDIRECTORY
+        | ntsecuritycon.FILE_DELETE_CHILD
+        | ntsecuritycon.DELETE
+        | ntsecuritycon.WRITE_DAC
+        | ntsecuritycon.WRITE_OWNER
+    )
+    trusted_writers = {
+        _SYSTEM_SID.casefold(),
+        _ADMINISTRATORS_SID.casefold(),
+        _TRUSTED_INSTALLER_SID.casefold(),
+    }
+    if owner.casefold() not in trusted_writers:
+        raise PermissionError(
+            "persistent elevated keep-alive target has an untrusted owner"
+        )
+    for ace in (
+            dacl.GetAce(index) for index in range(dacl.GetAceCount())
+            ) if dacl is not None else ():
+        sid = win32security.ConvertSidToStringSid(ace[2]).casefold()
+        inherit_only = bool(ace[0][1] & win32con.INHERIT_ONLY_ACE)
+        if (inherit_only and directory and allow_root_creator_owner
+                and sid == _CREATOR_OWNER_SID.casefold()):
+            continue
+        if (ace[0][0] == win32security.ACCESS_ALLOWED_ACE_TYPE
+                and (directory or not inherit_only)
+                and sid not in trusted_writers and ace[1] & write_mask):
+            raise PermissionError(
+                "persistent elevated keep-alive target is user-writable"
+            )
+
+
+def _protected_program_fingerprint(
+        executable: object, owner_sid: str) -> tuple[str, str]:
+    if not isinstance(executable, str):
+        raise ValueError("keep-alive executable is invalid")
+    path = Path(executable)
+    if not path.is_file() or path.is_symlink():
+        raise ValueError("keep-alive executable is not a regular protected file")
+    resolved = os.path.normcase(os.path.realpath(path))
+    if not any(
+            os.path.commonpath([root, resolved]) == root
+            for root in _program_files_roots()):
+        raise ValueError("keep-alive executable must be installed under Program Files")
+    _reject_user_writable(
+        Path(resolved), owner_sid, directory=False
+    )
+    return resolved, _sha256(Path(resolved))
+
+
+def _protected_program_request(
+        value: object, owner_sid: str) -> tuple[dict[str, object], str]:
+    launch = normalize_elevated_launch(value)
+    executable, digest = _protected_program_fingerprint(
+        launch["executable"], owner_sid
+    )
+    cwd_path = Path(str(launch["cwd"]))
+    if not cwd_path.is_dir() or cwd_path.is_symlink():
+        raise ValueError("keep-alive working directory is not protected")
+    cwd = os.path.normcase(os.path.realpath(cwd_path))
+    if cwd != os.path.dirname(executable):
+        raise ValueError(
+            "persistent elevated keep-alive requires the executable directory"
+        )
+    matching_roots = [
+        root for root in _program_files_roots()
+        if os.path.commonpath([root, cwd]) == root
+    ]
+    if len(matching_roots) != 1:
+        raise ValueError("persistent elevated keep-alive root is ambiguous")
+    root = matching_roots[0]
+    cursor = Path(cwd)
+    while True:
+        if (cursor.is_symlink()
+                or win32api.GetFileAttributes(
+                    str(cursor)) & win32con.FILE_ATTRIBUTE_REPARSE_POINT):
+            raise ValueError(
+                "persistent elevated keep-alive path contains a reparse point"
+            )
+        _reject_user_writable(
+            cursor,
+            owner_sid,
+            directory=True,
+            allow_root_creator_owner=(
+                os.path.normcase(os.path.realpath(cursor)) == root
+            ),
+        )
+        if os.path.normcase(os.path.realpath(cursor)) == root:
+            break
+        if cursor.parent == cursor:
+            raise ValueError("persistent elevated keep-alive path escaped its root")
+        cursor = cursor.parent
+    launch["executable"] = executable
+    launch["cwd"] = cwd
+    return launch, digest
+
+
+def _prepare_keepalive_grant(
+        request: Mapping[str, object], owner_sid: str) -> dict[str, object]:
+    app_id = request.get("appId")
+    kind = request.get("kind")
+    if (not isinstance(app_id, str) or len(app_id) != 8
+            or any(char not in "0123456789abcdefABCDEF" for char in app_id)):
+        raise ValueError("keep-alive app id is invalid")
+    if kind == "elevatedProgram" and set(request) == {
+            "appId", "kind", "request"}:
+        launch, digest = _protected_program_request(
+            request.get("request"), owner_sid
+        )
+        return {
+            "appId": app_id.lower(),
+            "kind": kind,
+            "request": launch,
+            "executableSha256": digest,
+        }
+    if kind == "scheduledService" and set(request) == {
+            "appId", "kind", "path"}:
+        path = normalize_scheduled_request({
+            "operation": "query", "paths": [request.get("path")]
+        })["paths"][0]
+        response = _scheduled({"operation": "query", "paths": [path]}, owner_sid)
+        task = (response.get("tasks") or {}).get(path.casefold())
+        if not response.get("ok") or not isinstance(task, Mapping):
+            raise ValueError("scheduled keep-alive target is unavailable")
+        return {
+            "appId": app_id.lower(),
+            "kind": kind,
+            "path": path,
+            "taskFingerprint": _canonical_digest(_task_security_record(task)),
+        }
+    raise ValueError("keep-alive grant resource is invalid")
+
+
+class _KeepAliveGrantExecutor:
+    def __init__(self, owner_sid: str, *, clock=time.monotonic):
+        self.owner_sid = owner_sid
+        self.clock = clock
+        self._verified: dict[tuple[str, ...], float] = {}
+
+    def _cached(self, key: tuple[str, ...], now: float) -> bool:
+        self._verified = {
+            item: expiry for item, expiry in self._verified.items()
+            if expiry >= now
+        }
+        expiry = self._verified.get(key)
+        return expiry is not None and expiry >= now
+
+    def _remember(self, key: tuple[str, ...], now: float) -> None:
+        self._verified[key] = now + _KEEP_ALIVE_RESOURCE_VERIFY_TTL
+
+    def __call__(
+            self, operation: str, record: Mapping[str, object]
+            ) -> dict[str, object]:
+        now = self.clock()
+        if record.get("kind") == "elevatedProgram":
+            request = record.get("request")
+            key = (
+                "program",
+                str(record.get("executableSha256") or ""),
+                _canonical_digest(request if isinstance(request, Mapping) else {}),
+            )
+            if self._cached(key, now):
+                launch = normalize_elevated_launch(request)
+            else:
+                launch, digest = _protected_program_request(
+                    request, self.owner_sid
+                )
+                if digest != record.get("executableSha256"):
+                    raise ValueError("keep-alive executable identity changed")
+                self._remember(key, now)
+            if operation == "observe":
+                return _observe(launch, self.owner_sid)
+            observed = _observe(launch, self.owner_sid)
+            if not observed.get("ok"):
+                return observed
+            if observed.get("processes"):
+                return {
+                    "ok": False,
+                    "code": "BROKER_KEEPALIVE_ALREADY_RUNNING",
+                    "error": "the exact elevated program is already running",
+                }
+            return {"ok": True, "pid": _launch(launch)}
+
+        if record.get("kind") == "scheduledService":
+            path = str(record.get("path") or "")
+            key = (
+                "scheduled",
+                path.casefold(),
+                str(record.get("taskFingerprint") or ""),
+            )
+            if self._cached(key, now):
+                queried = _scheduled_runtime(path, self.owner_sid)
+            else:
+                queried = _scheduled(
+                    {"operation": "query", "paths": [path]}, self.owner_sid
+                )
+                task = (queried.get("tasks") or {}).get(path.casefold())
+                if not queried.get("ok") or not isinstance(task, Mapping):
+                    raise ValueError("scheduled keep-alive target is unavailable")
+                if _canonical_digest(_task_security_record(task)) != record.get(
+                        "taskFingerprint"):
+                    raise ValueError("scheduled keep-alive task definition changed")
+                self._remember(key, now)
+            task = (queried.get("tasks") or {}).get(path.casefold())
+            if not queried.get("ok") or not isinstance(task, Mapping):
+                self._verified.pop(key, None)
+                raise ValueError("scheduled keep-alive target is unavailable")
+            if operation == "query":
+                return queried
+            if task.get("state") != "ready" or task.get("enabled") is not True:
+                return {
+                    "ok": False,
+                    "code": "BROKER_KEEPALIVE_TASK_NOT_READY",
+                    "error": "scheduled keep-alive task is not ready",
+                }
+            # A run attempt changes volatile task state and forces the next
+            # observation through a complete XML/SDDL verification.
+            self._verified.pop(key, None)
+            return _scheduled(
+                {"operation": "run", "path": path}, self.owner_sid
+            )
+        raise ValueError("keep-alive grant kind is invalid")
+
+
+def _execute_keepalive_grant(
+        operation: str, record: Mapping[str, object], owner_sid: str
+        ) -> dict[str, object]:
+    return _KeepAliveGrantExecutor(owner_sid)(operation, record)
+
+
+class _BoundedClientImageAttestation:
+    def __init__(
+            self, owner_sid: str, executable_sha256: str, *,
+            verify=None, clock=time.monotonic):
+        self.owner_sid = owner_sid
+        self.executable_sha256 = executable_sha256
+        self.verify = verify or _keepalive_client_image_valid
+        self.clock = clock
+        self._verified: dict[tuple[object, ...], float] = {}
+
+    def __call__(self, executable: Path) -> bool:
+        try:
+            if not executable.is_file() or executable.is_symlink():
+                return False
+            info = executable.stat(follow_symlinks=False)
+            key = (
+                os.path.normcase(os.path.realpath(executable)),
+                int(info.st_dev), int(info.st_ino), int(info.st_size),
+                int(info.st_mtime_ns), self.owner_sid.casefold(),
+                self.executable_sha256,
+            )
+        except (OSError, ValueError):
+            return False
+        now = self.clock()
+        self._verified = {
+            item: expiry for item, expiry in self._verified.items()
+            if expiry >= now
+        }
+        expiry = self._verified.get(key)
+        if expiry is not None and expiry >= now:
+            return True
+        valid = bool(self.verify(
+            executable, self.owner_sid, self.executable_sha256
+        ))
+        if valid:
+            self._verified[key] = now + _KEEP_ALIVE_ATTESTATION_TTL
+        return valid
+
+
+def _keepalive_client_image_valid(
+        executable: Path, owner_sid: str, executable_sha256: str) -> bool:
+    try:
+        resolved = os.path.normcase(os.path.realpath(executable))
+        local_ops_root = os.path.normcase(os.path.realpath(
+            Path(os.environ.get("ProgramFiles") or r"C:\Program Files") / "LocalOps"
+        ))
+        if (not executable.is_file() or executable.is_symlink()
+                or os.path.commonpath([local_ops_root, resolved]) != local_ops_root
+                or not hmac.compare_digest(_sha256(executable), executable_sha256)):
+            return False
+        cursor = executable.parent
+        root_path = Path(local_ops_root)
+        while True:
+            if win32api.GetFileAttributes(
+                    str(cursor)) & win32con.FILE_ATTRIBUTE_REPARSE_POINT:
+                return False
+            if os.path.normcase(os.path.realpath(cursor)) == local_ops_root:
+                break
+            if cursor.parent == cursor or root_path not in cursor.parents:
+                return False
+            cursor = cursor.parent
+        descriptor = win32security.GetNamedSecurityInfo(
+            str(executable), win32security.SE_FILE_OBJECT,
+            win32security.OWNER_SECURITY_INFORMATION
+            | win32security.DACL_SECURITY_INFORMATION,
+        )
+        file_owner = win32security.ConvertSidToStringSid(
+            descriptor.GetSecurityDescriptorOwner()
+        )
+        dacl = descriptor.GetSecurityDescriptorDacl()
+        aces = [
+            dacl.GetAce(index) for index in range(dacl.GetAceCount())
+        ] if dacl is not None else []
+        masks = {
+            _SYSTEM_SID: ntsecuritycon.FILE_ALL_ACCESS,
+            _ADMINISTRATORS_SID: ntsecuritycon.FILE_ALL_ACCESS,
+            owner_sid: (
+                ntsecuritycon.FILE_GENERIC_READ
+                | ntsecuritycon.FILE_GENERIC_EXECUTE
+            ),
+        }
+        control = descriptor.GetSecurityDescriptorControl()[0]
+        return bool(
+            file_owner in {_SYSTEM_SID, _ADMINISTRATORS_SID}
+            and {
+                win32security.ConvertSidToStringSid(ace[2]) for ace in aces
+            } == set(masks)
+            and all(
+                ace[0][0] == win32security.ACCESS_ALLOWED_ACE_TYPE
+                and ace[1] & ~masks[
+                    win32security.ConvertSidToStringSid(ace[2])
+                ] == 0
+                for ace in aces
+            )
+            and control & win32security.SE_DACL_PROTECTED
+        )
+    except (OSError, psutil.Error, pywintypes.error, ValueError):
+        return False
+
+
+def _keepalive_client_valid(
+        pid: int, created: float, owner_sid: str,
+        executable_sha256: str, *, image_valid=None) -> bool:
+    try:
+        process = psutil.Process(pid)
+        # These identity facts are intentionally never cached: the PID comes
+        # from the Named Pipe kernel and clientCreateTime is untrusted input.
+        if (_owner_sid(pid).casefold() != owner_sid.casefold()
+                or abs(float(process.create_time()) - float(created)) > 0.01):
+            return False
+        executable = Path(process.exe())
+        process_handle = win32api.OpenProcess(
+            win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        try:
+            token = win32security.OpenProcessToken(
+                process_handle, win32con.TOKEN_QUERY
+            )
+            try:
+                if bool(win32security.GetTokenInformation(
+                        token, win32security.TokenElevation)):
+                    return False
+            finally:
+                token.Close()
+        finally:
+            process_handle.Close()
+        verifier = image_valid or (
+            lambda path: _keepalive_client_image_valid(
+                path, owner_sid, executable_sha256
+            )
+        )
+        return bool(verifier(executable))
+    except (OSError, psutil.Error, pywintypes.error, ValueError):
+        return False
+
+
 def serve() -> int:
+    _verify_broker_data_ancestors(require_localops=True)
+    expected_owner_sid = _owner_sid(os.getpid())
+    _verify_broker_public_directory(
+        _program_data_dir(), expected_owner_sid
+    )
+    _verify_broker_public_file(public_config_path(), expected_owner_sid)
+    _verify_broker_only_path(secret_config_path(), directory=False)
     public = _read_json(public_config_path())
     secret = _read_json(secret_config_path())
     owner_sid = str(public.get("ownerSid") or "")
+    if owner_sid.casefold() != expected_owner_sid.casefold():
+        return 2
     if (secret.get("schema") != BROKER_PUBLIC_SCHEMA
             or secret.get("ownerSid") != owner_sid):
         return 2
+    capability_key, key_id, revision, grants = _load_capability_registry(
+        owner_sid, create=False
+    )
+    revision_box = [revision]
+    grant_executor = _KeepAliveGrantExecutor(owner_sid)
+    executable_sha256 = str(public.get("executableSha256") or "")
+    client_image_attestation = _BoundedClientImageAttestation(
+        owner_sid, executable_sha256
+    )
+
+    def persist_grants(records: Mapping[str, object]) -> None:
+        next_revision = revision_box[0] + 1
+        signed = make_keepalive_registry(
+            owner_sid, key_id, next_revision, records, capability_key
+        )
+        _write_json(
+            capability_registry_path(), signed, owner_sid, secret=True
+        )
+        _verify_broker_only_path(
+            capability_registry_path(), directory=False
+        )
+        revision_box[0] = next_revision
+
     protocol = ElevationBrokerProtocol(
         secret.get("passwordRecord"),
         owner_sid=owner_sid,
@@ -475,6 +1221,16 @@ def serve() -> int:
         observe=lambda request: _observe(request, owner_sid),
         stop=lambda request: _stop(request, owner_sid),
         scheduled=lambda request: _scheduled(request, owner_sid),
+        grant_prepare=lambda request: _prepare_keepalive_grant(
+            request, owner_sid
+        ),
+        grant_execute=grant_executor,
+        grant_client_valid=lambda pid, created: _keepalive_client_valid(
+            pid, created, owner_sid, executable_sha256,
+            image_valid=client_image_attestation,
+        ),
+        grant_records=grants,
+        persist_grants=persist_grants,
     )
     pipe_name = broker_pipe_name(owner_sid)
     failed_unlocks = 0

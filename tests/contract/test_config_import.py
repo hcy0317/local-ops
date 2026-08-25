@@ -251,6 +251,9 @@ class ConfigImportContractTests(unittest.TestCase):
         self.assertIsNone(apps["deadbeef"]["runtimeIdentity"])
         self.assertIsNone(apps["deadbeef"]["lastExit"])
         self.assertFalse(apps["deadbeef"]["attached"])
+        self.assertFalse(apps["deadbeef"]["keepAlive"])
+        self.assertFalse(apps["deadbeef"]["desiredRunning"])
+        self.assertIsNone(apps["deadbeef"]["keepAliveGrant"])
         self.assertEqual(apps["badc0ffe"]["status"], "blocked")
         self.assertEqual(
             apps["badc0ffe"]["reasons"][0]["code"],

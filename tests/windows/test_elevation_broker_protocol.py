@@ -5,16 +5,40 @@ from localops.elevation_broker import (
     ElevationBrokerProtocol,
     broker_install_request_digest,
     broker_task_spec,
+    make_keepalive_registry,
     new_password_record,
     normalize_elevated_launch,
     normalize_elevated_stop,
     normalize_scheduled_request,
     verify_broker_task,
     verify_password,
+    validate_keepalive_registry,
 )
 
 
 class PasswordVerifierTests(unittest.TestCase):
+    def test_keep_alive_registry_hmac_rejects_tampering(self):
+        key = b"k" * 32
+        owner = "S-1-5-21-1-2-3-1001"
+        key_id = "a" * 32
+        registry = make_keepalive_registry(
+            owner, key_id, 1, {"grant-deadbeef-01": {
+                "appId": "deadbeef", "kind": "scheduledService",
+                "path": r"\LocalOps\LongRunning", "active": True,
+            }}, key,
+        )
+        revision, grants = validate_keepalive_registry(
+            registry, key, owner_sid=owner, key_id=key_id
+        )
+        self.assertEqual(revision, 1)
+        self.assertIn("grant-deadbeef-01", grants)
+
+        registry["grants"]["grant-deadbeef-01"]["path"] = r"\Other"
+        with self.assertRaises(ValueError):
+            validate_keepalive_registry(
+                registry, key, owner_sid=owner, key_id=key_id
+            )
+
     def test_password_record_never_contains_plaintext_and_verifies_exact_input(self):
         record = new_password_record(
             "correct horse battery staple",
@@ -337,6 +361,128 @@ class BrokerSessionTests(unittest.TestCase):
 
         self.assertEqual(result["code"], "BROKER_SESSION_INVALID")
         self.assertFalse(self.protocol.unlocked)
+
+    def test_exact_keep_alive_grant_survives_lock_and_controller_restart(self):
+        persisted = []
+        uses = []
+        protocol = ElevationBrokerProtocol(
+            self.record,
+            owner_sid="S-1-5-21-1-2-3-1001",
+            process_matches=lambda pid, created, owner: (
+                pid, created, owner
+            ) in self.alive,
+            launch=lambda _request: 4321,
+            observe=lambda _request: {"ok": True, "processes": []},
+            stop=lambda _request: {"ok": True},
+            scheduled=lambda request: {"ok": True, "operation": request["operation"]},
+            token_factory=lambda: "session-token",
+            grant_id_factory=lambda: "grant-deadbeef-01",
+            grant_prepare=lambda request: {
+                "appId": request["appId"],
+                "kind": "elevatedProgram",
+                "request": normalize_elevated_launch(request["request"]),
+                "executableSha256": "a" * 64,
+            },
+            grant_execute=lambda operation, record: (
+                uses.append((operation, record["appId"]))
+                or ({"ok": True, "processes": []}
+                    if operation == "observe" else {"ok": True, "pid": 4321})
+            ),
+            grant_client_valid=lambda pid, created: (
+                pid, created
+            ) in {(1200, 77.25), (1300, 88.5)},
+            persist_grants=lambda records: persisted.append(dict(records)),
+        )
+        protocol.handle({
+            "action": "unlock",
+            "password": "correct horse battery staple",
+            "consolePid": 1200,
+            "consoleCreateTime": 77.25,
+        }, client_pid=1200)
+        issued = protocol.handle({
+            "action": "keepalive-grant-issue",
+            "token": "session-token",
+            "request": {
+                "appId": "deadbeef",
+                "kind": "elevatedProgram",
+                "request": {
+                    "executable": r"C:\Tools\Admin Tool.exe",
+                    "args": ["--profile", "alpha beta"],
+                    "cwd": r"C:\Tools",
+                },
+            },
+        }, client_pid=1200)
+        self.assertEqual(issued["grantId"], "grant-deadbeef-01")
+        activated = protocol.handle({
+            "action": "keepalive-grant-activate",
+            "token": "session-token",
+            "grantId": issued["grantId"],
+            "appId": "deadbeef",
+            "bindingDigest": issued["resourceDigest"],
+        }, client_pid=1200)
+        self.assertTrue(activated["ok"])
+
+        protocol.handle({
+            "action": "lock", "token": "session-token",
+        }, client_pid=1200)
+        used = protocol.handle({
+            "action": "keepalive-grant-use",
+            "grantId": issued["grantId"],
+            "appId": "deadbeef",
+            "bindingDigest": issued["resourceDigest"],
+            "operation": "observe",
+            "clientCreateTime": 88.5,
+        }, client_pid=1300)
+        self.assertTrue(used["ok"])
+        self.assertEqual(uses, [("observe", "deadbeef")])
+        self.assertIn("leaseId", used)
+        launched = protocol.handle({
+            "action": "keepalive-grant-use",
+            "grantId": issued["grantId"],
+            "appId": "deadbeef",
+            "bindingDigest": issued["resourceDigest"],
+            "operation": "launch",
+            "leaseId": used["leaseId"],
+            "clientCreateTime": 88.5,
+        }, client_pid=1300)
+        self.assertTrue(launched["ok"])
+        replay = protocol.handle({
+            "action": "keepalive-grant-use",
+            "grantId": issued["grantId"],
+            "appId": "deadbeef",
+            "bindingDigest": issued["resourceDigest"],
+            "operation": "launch",
+            "leaseId": used["leaseId"],
+            "clientCreateTime": 88.5,
+        }, client_pid=1300)
+        self.assertEqual(replay["code"], "BROKER_KEEPALIVE_LEASE_INVALID")
+
+        revoked = protocol.handle({
+            "action": "keepalive-grant-revoke",
+            "grantId": issued["grantId"],
+            "appId": "deadbeef",
+            "bindingDigest": issued["resourceDigest"],
+            "clientCreateTime": 88.5,
+        }, client_pid=1300)
+        self.assertTrue(revoked["ok"])
+        already_absent = protocol.handle({
+            "action": "keepalive-grant-revoke",
+            "grantId": issued["grantId"],
+            "appId": "deadbeef",
+            "bindingDigest": issued["resourceDigest"],
+            "clientCreateTime": 88.5,
+        }, client_pid=1300)
+        self.assertTrue(already_absent["alreadyAbsent"])
+        rejected = protocol.handle({
+            "action": "keepalive-grant-use",
+            "grantId": issued["grantId"],
+            "appId": "deadbeef",
+            "bindingDigest": issued["resourceDigest"],
+            "operation": "observe",
+            "clientCreateTime": 88.5,
+        }, client_pid=1300)
+        self.assertEqual(rejected["code"], "BROKER_KEEPALIVE_GRANT_INVALID")
+        self.assertGreaterEqual(len(persisted), 2)
 
 
 if __name__ == "__main__":

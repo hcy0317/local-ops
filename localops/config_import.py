@@ -29,7 +29,7 @@ from localops.command_spec import (
 
 MAX_SOURCE_BYTES = 1 * 1024 * 1024
 MAX_RECORD_BYTES = 16 * 1024 * 1024
-SUPPORTED_SCHEMA_VERSION = 4
+SUPPORTED_SCHEMA_VERSION = 5
 _HASH_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 _PREVIEW_PATTERN = re.compile(
     r"sha256:([0-9a-f]{64})\.([0-9a-f]{64})"
@@ -422,6 +422,9 @@ def _clear_runtime(app: Mapping[str, object]) -> dict[str, object]:
     for field in _RUNTIME_FIELDS:
         imported[field] = None
     imported["attached"] = False
+    imported["keepAlive"] = False
+    imported["desiredRunning"] = False
+    imported["keepAliveGrant"] = None
     return imported
 
 

@@ -297,6 +297,47 @@ class FakePlatform:
         self.calls.append(("lock_elevation_broker", None))
         return self.elevation_lock_result
 
+    def keep_alive_grant_issue(
+            self, request: Mapping[str, object]) -> dict[str, object]:
+        self.calls.append(("keep_alive_grant_issue", dict(request)))
+        return dict(getattr(self, "keep_alive_grant_issue_result", {
+            "ok": True,
+            "grantId": "fake-keepalive-grant-0001",
+            "resourceDigest": "sha256:" + "a" * 64,
+        }))
+
+    def keep_alive_grant_activate(
+            self, grant_id: str, app_id: str, binding_digest: str
+            ) -> dict[str, object]:
+        self.calls.append((
+            "keep_alive_grant_activate", (grant_id, app_id, binding_digest)
+        ))
+        return dict(getattr(
+            self, "keep_alive_grant_activate_result", {"ok": True}
+        ))
+
+    def keep_alive_grant_use(
+            self, grant_id: str, app_id: str, binding_digest: str,
+            operation: str, lease_id: str | None = None
+            ) -> dict[str, object]:
+        self.calls.append((
+            "keep_alive_grant_use",
+            (grant_id, app_id, binding_digest, operation, lease_id)
+        ))
+        return dict(getattr(
+            self, "keep_alive_grant_use_result", {"ok": True}
+        ))
+
+    def keep_alive_grant_revoke(
+            self, grant_id: str, app_id: str, binding_digest: str
+            ) -> dict[str, object]:
+        self.calls.append((
+            "keep_alive_grant_revoke", (grant_id, app_id, binding_digest)
+        ))
+        return dict(getattr(
+            self, "keep_alive_grant_revoke_result", {"ok": True}
+        ))
+
     def launch_elevated(
             self, command_spec: Mapping[str, object],
             cwd: str | None) -> ElevationBrokerResult:

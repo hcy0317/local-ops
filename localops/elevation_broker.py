@@ -11,6 +11,7 @@ import ntpath
 import re
 import secrets
 import subprocess
+import time
 from typing import Callable, Mapping
 
 
@@ -20,6 +21,7 @@ BROKER_TASK_PATH = r"\LocalOps-ElevationBroker"
 BROKER_MODULE = "localops.windows.elevation_broker"
 BROKER_PUBLIC_SCHEMA = "localops-elevation-broker.v1"
 BROKER_INSTALL_SCHEMA = "localops-elevation-install.v1"
+KEEPALIVE_REGISTRY_SCHEMA = "localops-elevation-keepalive-registry.v1"
 _SID_RE = re.compile(r"^S-\d(?:-\d+)+$", re.IGNORECASE)
 
 
@@ -28,6 +30,62 @@ def broker_install_request_digest(request: Mapping[str, object]) -> str:
         request, ensure_ascii=True, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def make_keepalive_registry(
+        owner_sid: str, key_id: str, revision: int,
+        grants: Mapping[str, object], key: bytes) -> dict[str, object]:
+    if (not isinstance(key, bytes) or len(key) != 32
+            or not isinstance(key_id, str) or not re.fullmatch(r"[0-9a-f]{32}", key_id)
+            or not isinstance(revision, int) or isinstance(revision, bool)
+            or revision < 0 or not isinstance(grants, Mapping)
+            or len(grants) > 256):
+        raise ValueError("keep-alive registry input is invalid")
+    unsigned = {
+        "schema": KEEPALIVE_REGISTRY_SCHEMA,
+        "ownerSid": owner_sid,
+        "keyId": key_id,
+        "revision": revision,
+        "grants": json.loads(json.dumps(grants, ensure_ascii=True)),
+    }
+    encoded = json.dumps(
+        unsigned, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    signature = hmac.new(
+        key, b"localops-keepalive-registry-v1\0" + encoded, hashlib.sha256
+    ).digest()
+    return {
+        **unsigned,
+        "hmac": base64.b64encode(signature).decode("ascii"),
+    }
+
+
+def validate_keepalive_registry(
+        value: object, key: bytes, *, owner_sid: str,
+        key_id: str) -> tuple[int, dict[str, object]]:
+    if (not isinstance(value, Mapping) or set(value) != {
+            "schema", "ownerSid", "keyId", "revision", "grants", "hmac"
+        } or value.get("schema") != KEEPALIVE_REGISTRY_SCHEMA
+            or value.get("ownerSid") != owner_sid
+            or value.get("keyId") != key_id):
+        raise ValueError("keep-alive registry schema is invalid")
+    revision = value.get("revision")
+    grants = value.get("grants")
+    if (not isinstance(revision, int) or isinstance(revision, bool)
+            or revision < 0 or not isinstance(grants, Mapping)
+            or len(grants) > 256):
+        raise ValueError("keep-alive registry content is invalid")
+    try:
+        actual = base64.b64decode(str(value.get("hmac") or ""), validate=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("keep-alive registry HMAC is invalid") from exc
+    expected_record = make_keepalive_registry(
+        owner_sid, key_id, revision, grants, key
+    )
+    expected = base64.b64decode(expected_record["hmac"], validate=True)
+    if len(actual) != 32 or not hmac.compare_digest(actual, expected):
+        raise ValueError("keep-alive registry integrity check failed")
+    return revision, json.loads(json.dumps(grants, ensure_ascii=True))
 
 
 def broker_pipe_name(owner_sid: str) -> str:
@@ -301,7 +359,13 @@ class ElevationBrokerProtocol:
             observe: Callable[[dict[str, object]], dict[str, object]],
             stop: Callable[[dict[str, object]], dict[str, object]],
             scheduled: Callable[[dict[str, object]], dict[str, object]],
-            token_factory: Callable[[], str] | None = None):
+            token_factory: Callable[[], str] | None = None,
+            grant_id_factory: Callable[[], str] | None = None,
+            grant_prepare: Callable[[Mapping[str, object]], dict[str, object]] | None = None,
+            grant_execute: Callable[[str, Mapping[str, object]], dict[str, object]] | None = None,
+            grant_client_valid: Callable[[int, float], bool] | None = None,
+            grant_records: Mapping[str, object] | None = None,
+            persist_grants: Callable[[Mapping[str, object]], None] | None = None):
         _record_values(password_record)
         if not isinstance(owner_sid, str) or not owner_sid:
             raise ValueError("owner SID is required")
@@ -313,9 +377,76 @@ class ElevationBrokerProtocol:
         self._stop = stop
         self._scheduled = scheduled
         self._token_factory = token_factory or (lambda: secrets.token_urlsafe(32))
+        self._grant_id_factory = grant_id_factory or (lambda: secrets.token_urlsafe(24))
+        self._grant_prepare = grant_prepare
+        self._grant_execute = grant_execute
+        self._grant_client_valid = grant_client_valid or (
+            lambda _pid, _created: False
+        )
+        self._persist_grants = persist_grants or (lambda _records: None)
+        self._grants = self._normalize_grants(grant_records or {})
+        pending_cutoff = time.time() - 3600.0
+        retained = {
+            grant_id: record for grant_id, record in self._grants.items()
+            if record.get("active") is True
+            or float(record.get("issuedAt") or 0) >= pending_cutoff
+        }
+        if len(retained) != len(self._grants):
+            self._grants = retained
+            self._persist_grants(self._grants)
+        self._leases: dict[str, dict[str, object]] = {}
         self._console_pid: int | None = None
         self._console_create_time: float | None = None
         self._token: str | None = None
+
+    @staticmethod
+    def _normalize_grants(records: object) -> dict[str, dict[str, object]]:
+        if not isinstance(records, Mapping) or len(records) > 256:
+            raise ValueError("keep-alive grant registry is invalid")
+        normalized = {}
+        for grant_id, raw in records.items():
+            if (not isinstance(grant_id, str) or not 16 <= len(grant_id) <= 128
+                    or not isinstance(raw, Mapping)):
+                raise ValueError("keep-alive grant record is invalid")
+            record = json.loads(json.dumps(raw, ensure_ascii=True))
+            if (not isinstance(record.get("appId"), str)
+                    or not re.fullmatch(r"[0-9a-fA-F]{8}", record["appId"])
+                    or record.get("kind") not in {
+                        "elevatedProgram", "scheduledService"
+                    }):
+                raise ValueError("keep-alive grant resource is invalid")
+            record["active"] = record.get("active") is True
+            issued_at = record.get("issuedAt")
+            record["issuedAt"] = (
+                float(issued_at)
+                if isinstance(issued_at, (int, float))
+                and not isinstance(issued_at, bool) and issued_at > 0
+                else None
+            )
+            normalized[grant_id] = record
+        return normalized
+
+    @staticmethod
+    def _grant_digest(record: Mapping[str, object]) -> str:
+        binding = {
+            key: value for key, value in record.items()
+            if key not in {"active", "issuedAt"}
+        }
+        payload = json.dumps(
+            binding, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+    def _grant_caller_valid(
+            self, message: Mapping[str, object], client_pid: int) -> bool:
+        created = message.get("clientCreateTime")
+        if (not isinstance(created, (int, float)) or isinstance(created, bool)
+                or float(created) <= 0):
+            return False
+        try:
+            return bool(self._grant_client_valid(client_pid, float(created)))
+        except (OSError, TypeError, ValueError):
+            return False
 
     @property
     def unlocked(self) -> bool:
@@ -375,14 +506,173 @@ class ElevationBrokerProtocol:
                 return {"ok": False, "code": "BROKER_SESSION_INVALID"}
             self._clear_session()
             return {"ok": True, "unlocked": False}
+        if action == "keepalive-grant-issue":
+            if not self._authorized(message, client_pid):
+                return {"ok": False, "code": "BROKER_SESSION_INVALID"}
+            if self._grant_prepare is None:
+                return {"ok": False, "code": "BROKER_KEEPALIVE_UNSUPPORTED"}
+            try:
+                request = message.get("request")
+                if not isinstance(request, Mapping):
+                    raise ValueError("keep-alive grant request is invalid")
+                record = self._grant_prepare(request)
+                record = dict(record)
+                record["active"] = False
+                record["issuedAt"] = time.time()
+                validated = self._normalize_grants({"x" * 16: record})["x" * 16]
+                validated["active"] = False
+                grant_id = self._grant_id_factory()
+                if (not isinstance(grant_id, str) or not 16 <= len(grant_id) <= 128
+                        or grant_id in self._grants):
+                    raise ValueError("keep-alive grant id is invalid")
+                self._grants[grant_id] = validated
+                try:
+                    self._persist_grants(self._grants)
+                except Exception:
+                    self._grants.pop(grant_id, None)
+                    raise
+            except (OSError, TypeError, ValueError) as exc:
+                return {
+                    "ok": False, "code": "BROKER_KEEPALIVE_GRANT_FAILED",
+                    "error": str(exc),
+                }
+            return {
+                "ok": True,
+                "grantId": grant_id,
+                "resourceDigest": self._grant_digest(validated),
+            }
+        if action == "keepalive-grant-activate":
+            if not self._authorized(message, client_pid):
+                return {"ok": False, "code": "BROKER_SESSION_INVALID"}
+            grant_id = message.get("grantId")
+            record = self._grants.get(grant_id) if isinstance(grant_id, str) else None
+            if record is None:
+                return {"ok": False, "code": "BROKER_KEEPALIVE_GRANT_INVALID"}
+            if (message.get("appId") != record.get("appId")
+                    or message.get("bindingDigest") != self._grant_digest(record)):
+                return {"ok": False, "code": "BROKER_KEEPALIVE_BINDING_MISMATCH"}
+            previous = bool(record.get("active"))
+            record["active"] = True
+            try:
+                self._persist_grants(self._grants)
+            except Exception as exc:
+                record["active"] = previous
+                return {
+                    "ok": False, "code": "BROKER_KEEPALIVE_ACTIVATE_FAILED",
+                    "error": str(exc),
+                }
+            return {"ok": True, "active": True}
+        if action in {"keepalive-grant-use", "keepalive-grant-revoke"}:
+            if not self._grant_caller_valid(message, client_pid):
+                return {"ok": False, "code": "BROKER_KEEPALIVE_CLIENT_INVALID"}
+            grant_id = message.get("grantId")
+            record = self._grants.get(grant_id) if isinstance(grant_id, str) else None
+            if record is None:
+                if action == "keepalive-grant-revoke":
+                    return {
+                        "ok": True, "revoked": True, "alreadyAbsent": True
+                    }
+                return {"ok": False, "code": "BROKER_KEEPALIVE_GRANT_INVALID"}
+            if (message.get("appId") != record.get("appId")
+                    or message.get("bindingDigest") != self._grant_digest(record)):
+                return {"ok": False, "code": "BROKER_KEEPALIVE_BINDING_MISMATCH"}
+            if action == "keepalive-grant-revoke":
+                removed = self._grants.pop(grant_id)
+                try:
+                    self._persist_grants(self._grants)
+                except Exception as exc:
+                    self._grants[grant_id] = removed
+                    return {
+                        "ok": False, "code": "BROKER_KEEPALIVE_REVOKE_FAILED",
+                        "error": str(exc),
+                    }
+                return {"ok": True, "revoked": True}
+            if record.get("active") is not True:
+                return {"ok": False, "code": "BROKER_KEEPALIVE_GRANT_INACTIVE"}
+            operation = message.get("operation")
+            allowed = (
+                {"observe", "launch"}
+                if record.get("kind") == "elevatedProgram"
+                else {"query", "run"}
+            )
+            if operation not in allowed or self._grant_execute is None:
+                return {"ok": False, "code": "BROKER_KEEPALIVE_OPERATION_DENIED"}
+            created = float(message["clientCreateTime"])
+            lease_now = time.monotonic()
+            self._leases = {
+                lease_id: lease for lease_id, lease in self._leases.items()
+                if float(lease.get("expiresAt") or 0) >= lease_now
+            }
+            if operation in {"launch", "run"}:
+                lease_id = message.get("leaseId")
+                lease = self._leases.pop(lease_id, None) if isinstance(
+                    lease_id, str) else None
+                expected_action = "launch" if operation == "launch" else "run"
+                if (not isinstance(lease, Mapping)
+                        or lease.get("grantId") != grant_id
+                        or lease.get("action") != expected_action
+                        or lease.get("clientPid") != client_pid
+                        or lease.get("clientCreateTime") != created
+                        or float(lease.get("expiresAt") or 0) < time.monotonic()):
+                    return {
+                        "ok": False, "code": "BROKER_KEEPALIVE_LEASE_INVALID"
+                    }
+            try:
+                response = self._grant_execute(str(operation), record)
+                if not isinstance(response, dict) or "ok" not in response:
+                    raise ValueError("keep-alive grant response is invalid")
+                eligible = False
+                lease_action = None
+                if operation == "observe":
+                    eligible = response.get("ok") is True and not (
+                        response.get("processes") or []
+                    )
+                    lease_action = "launch"
+                elif operation == "query":
+                    path = str(record.get("path") or "").casefold()
+                    task = (response.get("tasks") or {}).get(path)
+                    eligible = bool(
+                        response.get("ok") and isinstance(task, Mapping)
+                        and task.get("state") == "ready"
+                        and task.get("enabled") is True
+                    )
+                    lease_action = "run"
+                if eligible and lease_action:
+                    if len(self._leases) >= 256:
+                        oldest = min(
+                            self._leases,
+                            key=lambda item: float(
+                                self._leases[item].get("expiresAt") or 0
+                            ),
+                        )
+                        self._leases.pop(oldest, None)
+                    lease_id = secrets.token_urlsafe(24)
+                    self._leases[lease_id] = {
+                        "grantId": grant_id,
+                        "action": lease_action,
+                        "clientPid": client_pid,
+                        "clientCreateTime": created,
+                        "expiresAt": time.monotonic() + 10.0,
+                    }
+                    response = dict(response)
+                    response["leaseId"] = lease_id
+                return response
+            except (OSError, TypeError, ValueError) as exc:
+                return {
+                    "ok": False, "code": "BROKER_KEEPALIVE_ACTION_FAILED",
+                    "error": str(exc),
+                }
         if not self._authorized(message, client_pid):
             return {"ok": False, "code": "BROKER_SESSION_INVALID"}
         if action == "status":
             return {
                 "ok": True,
                 "unlocked": True,
-                "protocolVersion": 3,
-                "capabilities": ["launch", "observe", "stop", "scheduled"],
+                "protocolVersion": 4,
+                "capabilities": [
+                    "launch", "observe", "stop", "scheduled",
+                    "keepalive-grants",
+                ],
             }
         if action == "launch":
             try:

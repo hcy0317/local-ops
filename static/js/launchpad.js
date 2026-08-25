@@ -170,17 +170,20 @@ function createAppCard() {
   bDiag.hidden = true;
   const bRestart = iconBtn('refresh-cw', '重启应用');
   bRestart.hidden = true;
+  const bKeepAlive = iconBtn('zap', '保活');
+  bKeepAlive.hidden = true;
   const bSchedule = iconBtn('power', '启用或禁用计划任务');
   bSchedule.hidden = true;
   const bEdit = iconBtn('pencil', '编辑');
   const bDel = iconBtn('trash-2', '删除', 'danger');
-  sub.append(bCopy, bLogs, bDiag, bRestart, bSchedule, bEdit, bDel);
+  sub.append(bCopy, bLogs, bDiag, bKeepAlive, bRestart, bSchedule, bEdit, bDel);
   actions.append(primary, sub);
 
   card.append(head, cmd, actions);
   card._r = { iconBox, iconImg, iconGlyph, iconTxt, name, runtimeBadge, status, dot,
     stText, stPort, stUp, taskHistory, cmd, primary, copy: bCopy, logs: bLogs,
-    diag: bDiag, restart: bRestart, schedule: bSchedule, edit: bEdit, del: bDel };
+    diag: bDiag, keepAlive: bKeepAlive, restart: bRestart,
+    schedule: bSchedule, edit: bEdit, del: bDel };
 
   const id = () => card.dataset.key;
   primary.addEventListener('click', () => toggleApp(id(), primary));
@@ -213,6 +216,10 @@ function createAppCard() {
   bRestart.addEventListener('click', () => {
     const a = findApp(id());
     if (a) confirmRestartApp(a);
+  });
+  bKeepAlive.addEventListener('click', () => {
+    const a = findApp(id());
+    if (a) toggleKeepAlive(a, bKeepAlive);
   });
   bSchedule.addEventListener('click', () => {
     const a = findApp(id());
@@ -329,6 +336,7 @@ function updateAppCard(card, app) {
   const scheduledReady = isScheduled
     && (scheduledState === 'ready' || scheduledState === 'queued');
   const lifecycle = lifecycleSnapshot(app, currentPlatform());
+  const keepAliveStatus = app.keepAliveStatus || {};
   const taskStatus = isTask && app.lastExit ? taskExitStatus(app.lastExit) : '';
   const taskFinished = isTask && !app.running && !!app.lastExit;
   const taskFailed = taskFinished && taskStatus === 'failed';
@@ -383,6 +391,16 @@ function updateAppCard(card, app) {
   } else if (lifecycle.status === 'unknown') {
     stTxt = '运行状态待确认';
     stFail = true;
+  } else if (!app.running && app.keepAlive && app.desiredRunning) {
+    stTxt = keepAliveStatus.state === 'backoff' ? '保活等待重试'
+      : keepAliveStatus.state === 'conflict' ? '保活资源冲突'
+        : keepAliveStatus.state === 'blocked' ? '保活暂时受阻'
+          : keepAliveStatus.state === 'starting' ? '保活启动中'
+            : '保活等待启动';
+    stFail = keepAliveStatus.state === 'conflict'
+      || keepAliveStatus.state === 'blocked';
+  } else if (!app.running && app.keepAlive && !app.desiredRunning) {
+    stTxt = '已停止 · 保活已暂停';
   } else if (app.portConflict) {
     stTxt = '配置冲突';
     stFail = true;
@@ -502,6 +520,8 @@ function updateAppCard(card, app) {
   r.diag.setAttribute('aria-label',
     (isTask ? '配置与运行诊断：' : '配置与启动诊断：') + appName);
   r.restart.setAttribute('aria-label', '重启 ' + appName);
+  r.keepAlive.setAttribute('aria-label',
+    (app.keepAlive ? '关闭保活 ' : '开启保活 ') + appName);
   const scheduledEnabled = !!(app.scheduledTask && app.scheduledTask.enabled);
   const scheduleVerb = scheduledEnabled ? '禁用' : '启用';
   r.schedule.setAttribute('aria-label', scheduleVerb + '计划任务 ' + appName);
@@ -522,6 +542,15 @@ function updateAppCard(card, app) {
     : lifecycle.canStart ? canLaunch : false;
   r.restart.hidden = isScheduled || isDocker || isElevated || !lifecycle.canManage
     || kind !== 'service' || !canStop || !canLaunch;
+  r.keepAlive.hidden = !app.keepAliveAvailable;
+  r.keepAlive.disabled = !!lifecycle.busy;
+  r.keepAlive.classList.toggle('active', !!app.keepAlive);
+  const keepAliveNeedsUnlock = !!app.keepAliveRequiresElevation
+    && !app.keepAliveAuthorized;
+  r.keepAlive.title = app.keepAlive
+    ? (app.desiredRunning ? '关闭保活' : '关闭已暂停的保活')
+    : keepAliveNeedsUnlock ? '输入管理员密码后开启保活'
+      : '服务或程序退出后自动重启';
   r.schedule.hidden = !isScheduled || scheduledState === 'missing';
   r.schedule.disabled = !app.scheduledTaskControlAvailable
     || !hasCapability('toggle_scheduled_tasks');
@@ -554,6 +583,36 @@ function updateAppCard(card, app) {
   r.logs.classList.toggle('attention', taskFailed);
   r.logs.title = taskFailed ? '查看失败日志' : '日志';
   maybeFetchFavicon(card, app);
+}
+
+async function toggleKeepAlive(app, button) {
+  if (!app.keepAliveAvailable || button.dataset.busy === 'true') return;
+  const enabled = !app.keepAlive;
+  if (enabled && app.keepAliveRequiresElevation && !app.keepAliveAuthorized) {
+    openBrokerPassword();
+    toast('输入管理员密码后，再次点击保活即可启用');
+    return;
+  }
+  const intent = lifecycleSnapshot(app, currentPlatform());
+  button.dataset.busy = 'true';
+  button.disabled = true;
+  try {
+    const result = await act(post(
+      '/api/apps/' + app.id + '/keep-alive',
+      { enabled, expectedGeneration: intent.expectedGeneration },
+    ));
+    if (result && result.ok !== false) {
+      toast(enabled
+        ? (app.running ? '已开启保活' : '已开启保活，正在自动启动')
+        : '已关闭保活');
+      await window.__poll();
+    }
+  } finally {
+    delete button.dataset.busy;
+    const latest = findApp(app.id);
+    button.disabled = !latest || !!lifecycleSnapshot(
+      latest, currentPlatform()).busy;
+  }
 }
 
 async function setScheduledTaskEnabled(app, button) {

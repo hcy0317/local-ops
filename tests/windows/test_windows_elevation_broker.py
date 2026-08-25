@@ -1,3 +1,4 @@
+import json
 import sys
 import tempfile
 import unittest
@@ -307,6 +308,75 @@ class ElevationBrokerHttpTests(unittest.TestCase):
             ("unlock_elevation_broker", "correct horse battery staple"),
         )
 
+    def test_special_keep_alive_is_authorized_only_for_unlocked_session(self):
+        self.unlock_browser_session()
+        status, armed, _ = self.harness.request(
+            "POST", "/api/apps/deadbeef/keep-alive",
+            {"enabled": True, "expectedGeneration": None}, self.headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(armed["keepAlive"])
+        grant = self.harness.cfg.snapshot()["apps"][0]["keepAliveGrant"]
+        self.assertEqual(grant["grantId"], "fake-keepalive-grant-0001")
+        backup_path = Path(self.harness.temp_dir.name) / "config.json.bak"
+        backup = json.loads(backup_path.read_text(encoding="utf-8"))
+        backup_app = server.find_app(backup, APP_ID)
+        self.assertTrue(backup_app["keepAlive"])
+        self.assertTrue(backup_app["desiredRunning"])
+        self.assertEqual(backup_app["keepAliveGrant"], grant)
+
+        status, state, _ = self.harness.request(
+            "GET", "/api/state", headers=self.headers)
+        self.assertEqual(status, 200)
+        self.assertTrue(state["apps"][0]["keepAliveAuthorized"])
+
+        status, locked, _ = self.harness.request(
+            "POST", "/api/windows/elevation-broker/lock", {}, self.headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(locked["ok"])
+        status, state, _ = self.harness.request(
+            "GET", "/api/state", headers=self.headers)
+        self.assertTrue(state["apps"][0]["keepAliveAuthorized"])
+        self.assertTrue(self.harness.cfg.snapshot()["apps"][0]["keepAlive"])
+
+        status, disabled, _ = self.harness.request(
+            "POST", "/api/apps/deadbeef/keep-alive",
+            {"enabled": False, "expectedGeneration": None}, self.headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(disabled["keepAlive"])
+
+    def test_failed_grant_revoke_rotates_paused_intent_into_backup(self):
+        self.unlock_browser_session()
+        status, armed, _ = self.harness.request(
+            "POST", "/api/apps/deadbeef/keep-alive",
+            {"enabled": True, "expectedGeneration": None}, self.headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(armed["keepAlive"])
+        self.platform.keep_alive_grant_revoke_result = {
+            "ok": False,
+            "code": "KEEP_ALIVE_REVOKE_FAILED",
+            "error": "simulated revoke failure",
+        }
+
+        status, body, _ = self.harness.request(
+            "POST", "/api/apps/deadbeef/keep-alive",
+            {"enabled": False, "expectedGeneration": None}, self.headers,
+        )
+
+        self.assertEqual(status, 409)
+        self.assertEqual(body["code"], "KEEP_ALIVE_REVOKE_FAILED")
+        current = self.harness.cfg.snapshot()["apps"][0]
+        self.assertTrue(current["keepAlive"])
+        self.assertFalse(current["desiredRunning"])
+        backup_path = Path(self.harness.temp_dir.name) / "config.json.bak"
+        backup = json.loads(backup_path.read_text(encoding="utf-8"))
+        backup_app = server.find_app(backup, APP_ID)
+        self.assertTrue(backup_app["keepAlive"])
+        self.assertFalse(backup_app["desiredRunning"])
+
     def test_cli_bearer_cannot_unlock_or_reuse_browser_elevation(self):
         headers = {
             "Authorization": "Bearer " + self.harness.httpd.cli_token,
@@ -491,6 +561,215 @@ class ElevationBrokerHttpTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "win32", "Windows broker runtime only")
 class ElevationBrokerRuntimeTests(unittest.TestCase):
+    @staticmethod
+    def _scheduled_task_row(*, security_locked=True):
+        return {
+            "path": r"\Memos-Guard",
+            "state": "ready",
+            "enabled": True,
+            "principalSid": OWNER_SID,
+            "runLevel": "highest",
+            "multipleInstances": "ignoreNew",
+            "triggerCount": 1,
+            "principalLogonType": 3,
+            "actionDetails": [{
+                "type": "exec",
+                "path": r"C:\Program Files\Memos\memos.exe",
+                "arguments": "--serve",
+                "workingDirectory": r"C:\Program Files\Memos",
+            }],
+            "actionTypes": [0],
+            "actionCount": 1,
+            "definitionFingerprint": "sha256:" + "a" * 64,
+            "securityDescriptorFingerprint": "sha256:" + "b" * 64,
+            "securityLocked": security_locked,
+        }
+
+    def test_scheduled_grant_rejects_user_writable_security_descriptor(self):
+        with self.assertRaises(ValueError):
+            broker_runtime._task_security_record(
+                self._scheduled_task_row(security_locked=False)
+            )
+
+    def test_client_image_attestation_cache_is_bounded_by_file_and_ttl(self):
+        now = [0.0]
+        verify = mock.Mock(return_value=True)
+        with tempfile.TemporaryDirectory() as td:
+            executable = Path(td) / "LocalOps.exe"
+            executable.write_bytes(b"fixture")
+            cache = broker_runtime._BoundedClientImageAttestation(
+                OWNER_SID, "a" * 64,
+                verify=verify, clock=lambda: now[0],
+            )
+
+            self.assertTrue(cache(executable))
+            now[0] = 1.0
+            self.assertTrue(cache(executable))
+            self.assertEqual(verify.call_count, 1)
+            now[0] = 31.0
+            self.assertTrue(cache(executable))
+            self.assertEqual(verify.call_count, 2)
+
+    def test_client_pid_creation_is_rechecked_before_cached_image_proof(self):
+        process = mock.Mock()
+        process.create_time.side_effect = [88.5, 99.0]
+        process.exe.return_value = EXECUTABLE
+        token = mock.Mock()
+        handle = mock.Mock()
+        image_valid = mock.Mock(return_value=True)
+        with mock.patch.object(
+                broker_runtime.psutil, "Process", return_value=process), \
+                mock.patch.object(
+                    broker_runtime, "_owner_sid", return_value=OWNER_SID
+                ), mock.patch.object(
+                    broker_runtime.win32api, "OpenProcess", return_value=handle
+                ), mock.patch.object(
+                    broker_runtime.win32security, "OpenProcessToken",
+                    return_value=token,
+                ), mock.patch.object(
+                    broker_runtime.win32security, "GetTokenInformation",
+                    return_value=False,
+                ):
+            self.assertTrue(broker_runtime._keepalive_client_valid(
+                1200, 88.5, OWNER_SID, "a" * 64,
+                image_valid=image_valid,
+            ))
+            self.assertFalse(broker_runtime._keepalive_client_valid(
+                1200, 88.5, OWNER_SID, "a" * 64,
+                image_valid=image_valid,
+            ))
+
+        image_valid.assert_called_once_with(Path(EXECUTABLE))
+
+    def test_scheduled_grant_uses_lightweight_runtime_query_within_ttl(self):
+        now = [0.0]
+        task = self._scheduled_task_row()
+        fingerprint = broker_runtime._canonical_digest(
+            broker_runtime._task_security_record(task)
+        )
+        record = {
+            "kind": "scheduledService",
+            "path": r"\Memos-Guard",
+            "taskFingerprint": fingerprint,
+        }
+        full = {
+            "ok": True,
+            "tasks": {r"\memos-guard": task},
+        }
+        lightweight = {
+            "ok": True,
+            "tasks": {r"\memos-guard": {
+                "path": r"\Memos-Guard",
+                "state": "ready",
+                "enabled": True,
+            }},
+        }
+        executor = broker_runtime._KeepAliveGrantExecutor(
+            OWNER_SID, clock=lambda: now[0]
+        )
+        with mock.patch.object(
+                broker_runtime, "_scheduled", return_value=full
+                ) as complete, mock.patch.object(
+                    broker_runtime, "_scheduled_runtime", return_value=lightweight
+                ) as runtime:
+            self.assertTrue(executor("query", record)["ok"])
+            now[0] = 1.0
+            self.assertTrue(executor("query", record)["ok"])
+            now[0] = 31.0
+            self.assertTrue(executor("query", record)["ok"])
+
+        self.assertEqual(complete.call_count, 2)
+        runtime.assert_called_once_with(r"\Memos-Guard", OWNER_SID)
+
+    def test_registry_write_failure_removes_temporary_file(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+                broker_runtime, "_protect_path"), mock.patch.object(
+                    broker_runtime.os, "replace", side_effect=OSError("busy")
+                ):
+            target = Path(td) / "grants.json"
+            with self.assertRaises(OSError):
+                broker_runtime._write_json(
+                    target, {"schema": "fixture"}, OWNER_SID, secret=True
+                )
+            self.assertEqual(list(Path(td).iterdir()), [])
+
+    def test_registry_startup_cleans_only_verified_strict_temporaries(self):
+        with tempfile.TemporaryDirectory() as td:
+            directory = Path(td)
+            temporary = directory / ("grants.json.tmp-" + "a" * 32)
+            temporary.write_bytes(b"fixture")
+            administrators = broker_runtime.win32security.ConvertStringSidToSid(
+                broker_runtime._ADMINISTRATORS_SID
+            )
+            system = broker_runtime.win32security.ConvertStringSidToSid(
+                broker_runtime._SYSTEM_SID
+            )
+            dacl = mock.Mock()
+            dacl.GetAceCount.return_value = 2
+            inherited_aces = [
+                ((broker_runtime.win32security.ACCESS_ALLOWED_ACE_TYPE,
+                  broker_runtime.win32security.INHERITED_ACE),
+                 broker_runtime.ntsecuritycon.FILE_ALL_ACCESS, system),
+                ((broker_runtime.win32security.ACCESS_ALLOWED_ACE_TYPE,
+                  broker_runtime.win32security.INHERITED_ACE),
+                 broker_runtime.ntsecuritycon.FILE_ALL_ACCESS, administrators),
+            ]
+            dacl.GetAce.side_effect = lambda index: inherited_aces[index]
+            descriptor = mock.Mock()
+            descriptor.GetSecurityDescriptorOwner.return_value = administrators
+            descriptor.GetSecurityDescriptorDacl.return_value = dacl
+            descriptor.GetSecurityDescriptorControl.return_value = (0, 0)
+            with mock.patch.object(
+                    broker_runtime.win32security, "GetNamedSecurityInfo",
+                    return_value=descriptor,
+                ):
+                with self.assertRaises(PermissionError):
+                    broker_runtime._verify_broker_only_path(
+                        temporary, directory=False
+                    )
+                broker_runtime._cleanup_capability_temporaries(directory)
+            self.assertFalse(temporary.exists())
+
+            unknown = directory / "grants.json.tmp-unsafe"
+            unknown.write_bytes(b"fixture")
+            with self.assertRaises(OSError):
+                broker_runtime._cleanup_capability_temporaries(directory)
+            self.assertTrue(unknown.exists())
+
+    def test_persistent_program_rejects_inherited_low_privilege_writers(self):
+        owner = broker_runtime.win32security.ConvertStringSidToSid(
+            broker_runtime._ADMINISTRATORS_SID
+        )
+        low_privilege = broker_runtime.win32security.ConvertStringSidToSid(
+            broker_runtime._AUTHENTICATED_USERS_SID
+        )
+        dacl = mock.Mock()
+        dacl.GetAceCount.return_value = 1
+        dacl.GetAce.return_value = (
+            (
+                broker_runtime.win32security.ACCESS_ALLOWED_ACE_TYPE,
+                broker_runtime.win32con.OBJECT_INHERIT_ACE
+                | broker_runtime.win32con.CONTAINER_INHERIT_ACE
+                | broker_runtime.win32con.INHERIT_ONLY_ACE,
+            ),
+            broker_runtime.ntsecuritycon.FILE_GENERIC_WRITE,
+            low_privilege,
+        )
+        descriptor = mock.Mock()
+        descriptor.GetSecurityDescriptorOwner.return_value = owner
+        descriptor.GetSecurityDescriptorDacl.return_value = dacl
+
+        with mock.patch.object(
+                broker_runtime.win32security,
+                "GetNamedSecurityInfo",
+                return_value=descriptor):
+            with self.assertRaises(PermissionError):
+                broker_runtime._reject_user_writable(
+                    Path(r"C:\Program Files\Unsafe"),
+                    OWNER_SID,
+                    directory=True,
+                )
+
     def test_broker_queries_and_stops_only_normalized_scheduled_task_path(self):
         platform = mock.Mock()
         platform.current_principal.return_value = Principal(OWNER_SID)

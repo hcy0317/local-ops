@@ -105,6 +105,21 @@ class FrontendStructureParser(HTMLParser):
 
 
 class FrontendAccessibilityContractTests(unittest.TestCase):
+    def test_theme_is_resolved_before_first_stylesheet_paint(self):
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+        theme_init = (ROOT / "static/js/theme-init.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertLess(
+            html.index('<script src="/js/theme-init.js"></script>'),
+            html.index('<link rel="stylesheet" href="/themes/ops.css"'),
+        )
+        self.assertIn("localStorage.getItem('console-theme')", theme_init)
+        self.assertIn("prefers-color-scheme: dark", theme_init)
+        self.assertIn("document.documentElement.dataset.theme", theme_init)
+        self.assertNotIn("document.documentElement.style", theme_init)
+
     def test_monitoring_tables_have_named_aria_structure(self):
         parser = FrontendStructureParser()
         parser.feed((ROOT / "static/index.html").read_text(encoding="utf-8"))
@@ -607,7 +622,6 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("del('/api/apps/' + app.id, lifecyclePayload(intent))", launchpad)
         self.assertIn("'/api/apps/' + owner.appId + '/stop'", launchpad)
         self.assertIn("lifecyclePayload(intent, { force: false })", launchpad)
-
         self.assertIn("body.expectedGeneration = editingAppOriginal.lifecycle.expectedGeneration", overlays)
         self.assertIn("await refreshLifecycleState(app)", overlays)
         self.assertIn("sameLifecycleGeneration(intent, latest, currentPlatform())", overlays)
@@ -618,6 +632,16 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("item.intent.canManage", widgets)
         self.assertIn("lifecyclePayload(item.intent, { force: false })", widgets)
         self.assertIn("const del = (p, b) => req('DELETE', p, b)", core)
+
+    def test_launchpad_exposes_persisted_keep_alive_with_elevation_gate(self):
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+
+        self.assertIn("const bKeepAlive = iconBtn('zap', '保活')", launchpad)
+        self.assertIn("'/keep-alive'", launchpad)
+        self.assertIn("keepAliveAuthorized", launchpad)
+        self.assertIn("keepAliveStatus", launchpad)
+        self.assertIn("openBrokerPassword()", launchpad)
+        self.assertIn("r.keepAlive.classList.toggle('active'", launchpad)
 
     def test_windows_import_wizard_follows_preview_commit_rollback_contract(self):
         html = (ROOT / "static/index.html").read_text(encoding="utf-8")

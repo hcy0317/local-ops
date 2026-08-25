@@ -153,6 +153,85 @@ class DockerController:
                 issues=(_issue("query_failed", str(exc) or "Docker query failed"),),
             )
 
+    def inspect(self, value: object) -> DockerSnapshot:
+        """Inspect one immutable container or exact Compose identity."""
+        try:
+            resource = normalize_docker_resource(value)
+            if resource["kind"] == "container":
+                container_id = str(resource["containerId"])
+                result = self._command([
+                    "container", "inspect", container_id,
+                ])
+                payload = json.loads(str(getattr(result, "stdout", "") or "[]"))
+                if not isinstance(payload, list):
+                    raise ValueError("Docker inspect response is not an array")
+                snapshot = self._snapshot_from_inspect(payload)
+                exact = tuple(
+                    row for row in snapshot.containers
+                    if row.get("id") == container_id
+                )
+                if len(exact) != 1:
+                    raise ValueError("Docker returned a different container identity")
+                return DockerSnapshot(ScanStatus.OK, containers=exact)
+
+            compose_args = self._compose_args(resource)
+            listed = self._command([*compose_args, "ps", "--all", "--quiet"])
+            ids = [
+                item.strip().lower()
+                for item in str(getattr(listed, "stdout", "") or "").splitlines()
+                if item.strip()
+            ]
+            if any(not _CONTAINER_ID_RE.fullmatch(item) for item in ids):
+                raise ValueError("Docker returned an invalid Compose container identity")
+            if not ids:
+                return DockerSnapshot(ScanStatus.OK)
+            inspected = self._command(["container", "inspect", *ids])
+            payload = json.loads(str(getattr(inspected, "stdout", "") or "[]"))
+            if not isinstance(payload, list):
+                raise ValueError("Docker inspect response is not an array")
+            snapshot = self._snapshot_from_inspect(payload)
+            project = next((
+                row for row in snapshot.projects
+                if row.get("projectName") == resource["projectName"]
+            ), None)
+            if project is None:
+                raise ValueError("Docker returned a different Compose project identity")
+
+            def path_key(path: object) -> str:
+                text = str(path or "")
+                return (ntpath.normcase(ntpath.normpath(text))
+                        if ntpath.isabs(text) else posixpath.normpath(text))
+
+            if (path_key(project.get("workingDir"))
+                    != path_key(resource["workingDir"])):
+                raise ValueError("Compose working directory identity changed")
+            observed_files = [path_key(path) for path in project.get("configFiles") or []]
+            expected_files = [path_key(path) for path in resource["configFiles"]]
+            if observed_files != expected_files:
+                raise ValueError("Compose config file identity changed")
+            exact_ids = set(project.get("containerIds") or [])
+            exact_containers = tuple(
+                row for row in snapshot.containers if row.get("id") in exact_ids
+            )
+            return DockerSnapshot(
+                ScanStatus.OK, containers=exact_containers, projects=(project,)
+            )
+        except FileNotFoundError as exc:
+            return DockerSnapshot(
+                ScanStatus.FAILED,
+                issues=(_issue("cli_missing", str(exc) or "Docker CLI is unavailable"),),
+            )
+        except subprocess.TimeoutExpired as exc:
+            return DockerSnapshot(
+                ScanStatus.FAILED,
+                issues=(_issue("timeout", str(exc) or "Docker did not respond"),),
+            )
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+            return DockerSnapshot(
+                ScanStatus.FAILED,
+                issues=(_issue("query_failed", str(exc) or "Docker query failed"),),
+            )
+
     @staticmethod
     def _snapshot_from_inspect(payload: list[object]) -> DockerSnapshot:
         containers: list[dict[str, object]] = []

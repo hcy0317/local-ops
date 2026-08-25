@@ -113,11 +113,15 @@ from .contracts import (
 
 _SYSTEM_SID = "S-1-5-18"
 _ADMINISTRATORS_SID = "S-1-5-32-544"
+_TRUSTED_INSTALLER_SID = (
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+)
 _JUNCTION_REPARSE_TAG = 0xA0000003
 _RUNNER_PREPARE_TIMEOUT = 10.0
 _CPU_SAMPLE_MIN_INTERVAL = 0.1
 _CPU_SAMPLE_MAX_AGE = 300.0
 _MAX_CLEANUP_RECOVERY_ENTRIES = 256
+_KEEP_ALIVE_BROKER_VERIFY_TTL = 30.0
 _INSTANCE_MUTEX_PREFIX = "Local\\LocalOps-Console-v2-"
 _RUNTIME_RECORD_NAMES = frozenset({"request.json", "token.bin", "receipt.json"})
 _CLEANUP_TOMBSTONE_PREFIX = ".cleanup-"
@@ -229,6 +233,8 @@ class WindowsPlatform:
         self._principal = Principal(self._sid)
         self.controller_elevated = bool(shell.IsUserAnAdmin())
         self._elevation_token: str | None = None
+        self._keep_alive_broker_verified_until = 0.0
+        self._keep_alive_broker_verify_lock = threading.Lock()
         self._cpu_samples: dict[int, tuple[float, float, float, float]] = {}
         self._cpu_samples_lock = threading.Lock()
         self._cpu_samples_pruned_at = 0.0
@@ -919,6 +925,56 @@ class WindowsPlatform:
         except (AttributeError, TypeError, ValueError, pywintypes.error):
             return False
 
+    @staticmethod
+    def _scheduled_sddl_write_locked(sddl: str) -> bool:
+        """Accept only task ACLs whose owner and writers are privileged."""
+        try:
+            descriptor = (
+                win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
+                    sddl, win32security.SDDL_REVISION_1
+                )
+            )
+            owner = win32security.ConvertSidToStringSid(
+                descriptor.GetSecurityDescriptorOwner()
+            ).casefold()
+            trusted = {
+                _SYSTEM_SID.casefold(),
+                _ADMINISTRATORS_SID.casefold(),
+                _TRUSTED_INSTALLER_SID.casefold(),
+            }
+            if owner not in trusted:
+                return False
+            dacl = descriptor.GetSecurityDescriptorDacl()
+            if dacl is None:
+                return False
+            read_execute = (
+                ntsecuritycon.FILE_GENERIC_READ
+                | ntsecuritycon.FILE_GENERIC_EXECUTE
+                | win32con.GENERIC_READ
+                | win32con.GENERIC_EXECUTE
+            )
+            for index in range(dacl.GetAceCount()):
+                ace = dacl.GetAce(index)
+                ace_type = int(ace[0][0])
+                if ace_type == win32security.ACCESS_DENIED_ACE_TYPE:
+                    continue
+                if ace_type != win32security.ACCESS_ALLOWED_ACE_TYPE:
+                    return False
+                sid = win32security.ConvertSidToStringSid(ace[2]).casefold()
+                if sid not in trusted and int(ace[1]) & ~read_execute:
+                    return False
+            return True
+        except (AttributeError, TypeError, ValueError, pywintypes.error):
+            return False
+
+    def _scheduled_task_security_locked(self, task: object) -> bool:
+        try:
+            return self._scheduled_sddl_write_locked(
+                str(task.GetSecurityDescriptor(5) or "")
+            )
+        except (AttributeError, TypeError, ValueError, pywintypes.error):
+            return False
+
     def _scheduled_task_row(self, task: object) -> dict[str, object]:
         state_value = int(getattr(task, "State", 0) or 0)
         state = {
@@ -930,18 +986,36 @@ class WindowsPlatform:
         }.get(state_value, "unknown")
         actions: list[str] = []
         action_details: list[dict[str, object]] = []
+        action_types: list[int] = []
+        action_count = 0
         run_level = "limited"
         principal_user_id = ""
         principal_sid = ""
+        principal_logon_type = None
         multiple_instances = "parallel"
         trigger_count = 0
+        definition_fingerprint = None
+        security_descriptor_fingerprint = None
         try:
             definition = task.Definition
+            xml = str(getattr(task, "Xml", "") or "")
+            if xml:
+                definition_fingerprint = (
+                    "sha256:" + hashlib.sha256(xml.encode("utf-8")).hexdigest()
+                )
+            security_descriptor = str(task.GetSecurityDescriptor(5) or "")
+            if security_descriptor:
+                security_descriptor_fingerprint = (
+                    "sha256:" + hashlib.sha256(
+                        security_descriptor.encode("utf-8")
+                    ).hexdigest()
+                )
             run_level = (
                 "highest" if int(definition.Principal.RunLevel or 0) == 1
                 else "limited"
             )
             principal_user_id = str(definition.Principal.UserId or "")
+            principal_logon_type = int(definition.Principal.LogonType or 0)
             if principal_user_id:
                 try:
                     sid = (
@@ -959,8 +1033,11 @@ class WindowsPlatform:
                 3: "stopExisting",
             }.get(int(definition.Settings.MultipleInstances or 0), "unknown")
             trigger_count = int(getattr(definition.Triggers, "Count", 0) or 0)
+            action_count = int(getattr(definition.Actions, "Count", 0) or 0)
             for action in self._com_collection(definition.Actions):
-                if int(getattr(action, "Type", -1)) != 0:
+                action_type = int(getattr(action, "Type", -1))
+                action_types.append(action_type)
+                if action_type != 0:
                     continue
                 executable = str(getattr(action, "Path", "") or "")
                 arguments = str(getattr(action, "Arguments", "") or "")
@@ -988,7 +1065,8 @@ class WindowsPlatform:
         path = str(getattr(task, "Path", "") or "")
         security_locked = (
             self._broker_task_security_locked(task)
-            if path.casefold() == BROKER_TASK_PATH.casefold() else False
+            if path.casefold() == BROKER_TASK_PATH.casefold()
+            else self._scheduled_task_security_locked(task)
         )
         return {
             "path": path,
@@ -1001,10 +1079,15 @@ class WindowsPlatform:
             "runLevel": run_level,
             "principalUserId": principal_user_id,
             "principalSid": principal_sid,
+            "principalLogonType": principal_logon_type,
             "multipleInstances": multiple_instances,
             "triggerCount": trigger_count,
             "actions": actions,
             "actionDetails": action_details,
+            "actionCount": action_count,
+            "actionTypes": action_types,
+            "definitionFingerprint": definition_fingerprint,
+            "securityDescriptorFingerprint": security_descriptor_fingerprint,
             "securityLocked": security_locked,
             "enginePids": sorted(set(engine_pids)),
         }
@@ -1039,6 +1122,7 @@ class WindowsPlatform:
                 return str(node.text or "") if node is not None else ""
 
             action = root.find("task:Actions/task:Exec", namespace)
+            actions_node = root.find("task:Actions", namespace)
             triggers = root.find("task:Triggers", namespace)
             security = text("task:RegistrationInfo/task:SecurityDescriptor")
             row = {
@@ -1060,6 +1144,9 @@ class WindowsPlatform:
                 "principalSid": text(
                     "task:Principals/task:Principal/task:UserId"
                 ),
+                "principalLogonType": text(
+                    "task:Principals/task:Principal/task:LogonType"
+                ),
                 "multipleInstances": {
                     "IgnoreNew": "ignoreNew",
                     "Queue": "queue",
@@ -1069,6 +1156,23 @@ class WindowsPlatform:
                 "triggerCount": len(list(triggers)) if triggers is not None else 0,
                 "actions": [],
                 "actionDetails": [],
+                "actionCount": (
+                    len(list(actions_node)) if actions_node is not None else 0
+                ),
+                "actionTypes": [
+                    child.tag.rsplit("}", 1)[-1]
+                    for child in (list(actions_node) if actions_node is not None else [])
+                ],
+                "definitionFingerprint": (
+                    "sha256:" + hashlib.sha256(
+                        xml_text.encode("utf-8")
+                    ).hexdigest()
+                ),
+                "securityDescriptorFingerprint": (
+                    "sha256:" + hashlib.sha256(
+                        security.encode("utf-8")
+                    ).hexdigest() if security else None
+                ),
                 "securityLocked": security == broker_task_sddl(self._sid),
                 "enginePids": [],
             }
@@ -1198,6 +1302,36 @@ class WindowsPlatform:
         finally:
             pending.clear()
             task = folder = registered = children = service = None
+            gc.collect()
+            pythoncom.CoUninitialize()
+
+    def scheduled_task_runtime(self, path: str) -> dict[str, object]:
+        """Read only volatile task state without XML or SDDL expansion."""
+        normalized, folder_path, name = self._scheduled_task_parts(path)
+        pythoncom.CoInitialize()
+        service = task = folder = None
+        try:
+            service = win32com.client.Dispatch("Schedule.Service")
+            service.Connect()
+            folder = service.GetFolder(folder_path)
+            task = folder.GetTask(name)
+            state = {
+                0: "unknown",
+                1: "disabled",
+                2: "queued",
+                3: "ready",
+                4: "running",
+            }.get(int(getattr(task, "State", 0) or 0), "unknown")
+            return {
+                "path": str(getattr(task, "Path", "") or normalized),
+                "state": state,
+                "enabled": bool(getattr(task, "Enabled", False)),
+            }
+        except (OSError, AttributeError, TypeError, ValueError,
+                pywintypes.error, pythoncom.com_error) as exc:
+            raise OSError("scheduled task runtime query failed") from exc
+        finally:
+            task = folder = service = None
             gc.collect()
             pythoncom.CoUninitialize()
 
@@ -1812,6 +1946,7 @@ class WindowsPlatform:
                     str(response.get("error") or "管理员启动代理安装失败"),
                     str(response.get("code") or "BROKER_INSTALL_FAILED"),
                 )
+            self._invalidate_keep_alive_broker_verification()
             return ElevationBrokerResult(True)
         except pywintypes.error as exc:
             code = "BROKER_UAC_CANCELED" if exc.winerror == winerror.ERROR_CANCELLED \
@@ -1880,6 +2015,115 @@ class WindowsPlatform:
             None if response.get("ok") else str(response.get("error") or "锁定失败"),
             None if response.get("ok") else str(response.get("code") or "BROKER_LOCK_FAILED"),
         )
+
+    def _invalidate_keep_alive_broker_verification(self) -> None:
+        with self._keep_alive_broker_verify_lock:
+            self._keep_alive_broker_verified_until = 0.0
+
+    def _ensure_keep_alive_broker_running(self) -> None:
+        now = time.monotonic()
+        with self._keep_alive_broker_verify_lock:
+            if now < self._keep_alive_broker_verified_until:
+                return
+        public = self._broker_public_config()
+        if public is None:
+            raise OSError("elevation broker is not installed")
+        spec = broker_task_spec(str(public["executable"]), self._sid)
+        snapshot = self.scheduled_tasks({BROKER_TASK_PATH})
+        row = snapshot.tasks.get(BROKER_TASK_PATH.casefold())
+        verified, _ = verify_broker_task(row, spec)
+        if not verified:
+            raise OSError("elevation broker task failed verification")
+        if not row or row.get("state") != "running":
+            self._invalidate_keep_alive_broker_verification()
+            result = self._run_scheduled_task_direct(BROKER_TASK_PATH)
+            if not result.ok:
+                raise OSError(result.error or "elevation broker could not start")
+            return
+        with self._keep_alive_broker_verify_lock:
+            self._keep_alive_broker_verified_until = (
+                time.monotonic() + _KEEP_ALIVE_BROKER_VERIFY_TTL
+            )
+
+    def keep_alive_grant_issue(self, request: Mapping[str, object]) -> dict[str, object]:
+        if self._elevation_token is None:
+            return {"ok": False, "code": "BROKER_SESSION_LOCKED"}
+        try:
+            response = self._broker_exchange({
+                "action": "keepalive-grant-issue",
+                "token": self._elevation_token,
+                "request": dict(request),
+            }, timeout_ms=15000)
+            return dict(response)
+        except (OSError, TypeError, ValueError, pywintypes.error) as exc:
+            return {
+                "ok": False, "code": "BROKER_KEEPALIVE_GRANT_FAILED",
+                "error": str(exc),
+            }
+
+    def keep_alive_grant_activate(
+            self, grant_id: str, app_id: str, binding_digest: str
+            ) -> dict[str, object]:
+        if self._elevation_token is None:
+            return {"ok": False, "code": "BROKER_SESSION_LOCKED"}
+        try:
+            return dict(self._broker_exchange({
+                "action": "keepalive-grant-activate",
+                "token": self._elevation_token,
+                "grantId": grant_id,
+                "appId": app_id,
+                "bindingDigest": binding_digest,
+            }))
+        except (OSError, TypeError, ValueError, pywintypes.error) as exc:
+            return {
+                "ok": False, "code": "BROKER_KEEPALIVE_ACTIVATE_FAILED",
+                "error": str(exc),
+            }
+
+    def keep_alive_grant_use(
+            self, grant_id: str, app_id: str, binding_digest: str,
+            operation: str, lease_id: str | None = None
+            ) -> dict[str, object]:
+        try:
+            self._ensure_keep_alive_broker_running()
+            message: dict[str, object] = {
+                "action": "keepalive-grant-use",
+                "grantId": grant_id,
+                "appId": app_id,
+                "bindingDigest": binding_digest,
+                "operation": operation,
+                "clientCreateTime": psutil.Process(self.self_pid).create_time(),
+            }
+            if lease_id is not None:
+                message["leaseId"] = lease_id
+            return dict(self._broker_exchange(message, timeout_ms=2000))
+        except (OSError, psutil.Error, TypeError, ValueError,
+                pywintypes.error) as exc:
+            self._invalidate_keep_alive_broker_verification()
+            return {
+                "ok": False, "code": "BROKER_KEEPALIVE_ACTION_FAILED",
+                "error": str(exc),
+            }
+
+    def keep_alive_grant_revoke(
+            self, grant_id: str, app_id: str, binding_digest: str
+            ) -> dict[str, object]:
+        try:
+            self._ensure_keep_alive_broker_running()
+            return dict(self._broker_exchange({
+                "action": "keepalive-grant-revoke",
+                "grantId": grant_id,
+                "appId": app_id,
+                "bindingDigest": binding_digest,
+                "clientCreateTime": psutil.Process(self.self_pid).create_time(),
+            }, timeout_ms=15000))
+        except (OSError, psutil.Error, TypeError, ValueError,
+                pywintypes.error) as exc:
+            self._invalidate_keep_alive_broker_verification()
+            return {
+                "ok": False, "code": "BROKER_KEEPALIVE_REVOKE_FAILED",
+                "error": str(exc),
+            }
 
     def launch_elevated(
             self, command_spec: Mapping[str, object],

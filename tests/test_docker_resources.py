@@ -156,6 +156,29 @@ class DockerResourceTests(unittest.TestCase):
         self.assertEqual(calls[3][-1], "stop")
         self.assertFalse({"down", "rm", "prune"} & {part for call in calls for part in call})
 
+    def test_targeted_inspect_reads_only_the_exact_container_identity(self):
+        calls = []
+        payload = [{
+            "Id": CONTAINER_A,
+            "Name": "/exact",
+            "Config": {"Image": "redis:latest", "Labels": {}},
+            "State": {"Status": "exited", "Running": False},
+        }]
+
+        def run(args, timeout):
+            calls.append(args)
+            return Completed(json.dumps(payload))
+
+        snapshot = DockerController(executable="docker", run=run).inspect({
+            "kind": "container", "containerId": CONTAINER_A,
+        })
+
+        self.assertIs(snapshot.status, ScanStatus.OK)
+        self.assertEqual(snapshot.containers[0]["id"], CONTAINER_A)
+        self.assertEqual(calls, [
+            ["docker", "container", "inspect", CONTAINER_A],
+        ])
+
     def test_logs_use_exact_container_or_compose_identity(self):
         calls = []
 

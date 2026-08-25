@@ -8,11 +8,13 @@ API 契约与实现要点见 AGENTS.md。
 """
 
 import functools
+import hashlib
 import errno
 import json
 import logging
 import ntpath
 import os
+import random
 import re
 import secrets
 import shlex
@@ -112,7 +114,7 @@ TAILSCALE_PROXY_CREDENTIAL_PATH = os.path.join(
     DATA_DIR, "tailscale-proxy-secret"
 )
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 # 默认 UI 主题：新安装与无偏好回退均使用它，主题清单中固定排首位。
 DEFAULT_UI_THEME = "ops"
@@ -268,7 +270,7 @@ code{background:#f5f5f7;border:1px solid rgba(0,0,0,.05);border-radius:6px;paddi
 
 APP_ROUTE_RE = re.compile(
     r"^/api/apps/([0-9a-fA-F]{8})(?:/(start|stop|restart|icon|logs|favicon|"
-    r"diagnose|attach|scheduled-enabled|scheduled-history))?$")
+    r"diagnose|attach|keep-alive|scheduled-enabled|scheduled-history))?$")
 
 
 # ---------------------------------------------------------------- 运行目录
@@ -935,11 +937,26 @@ def migrate_config_v3_to_v4(raw):
     return migrated
 
 
+def migrate_config_v4_to_v5(raw):
+    """Add disabled per-app keep-alive intent without starting anything."""
+    migrated = json.loads(json.dumps(raw, ensure_ascii=False))
+    apps = migrated.get("apps")
+    if isinstance(apps, list):
+        for app in apps:
+            if isinstance(app, dict):
+                app.setdefault("keepAlive", False)
+                app.setdefault("desiredRunning", False)
+                app.setdefault("keepAliveGrant", None)
+    migrated["schemaVersion"] = 5
+    return migrated
+
+
 CONFIG_MIGRATIONS = {
     0: migrate_config_v0_to_v1,
     1: migrate_config_v1_to_v2,
     2: migrate_config_v2_to_v3,
     3: migrate_config_v3_to_v4,
+    4: migrate_config_v4_to_v5,
 }
 
 
@@ -983,7 +1000,10 @@ class Config:
                    "port": None, "emoji": None, "glyph": None, "icon": None,
                    "favicon": None, "kind": "service", "lastPid": None,
                    "lastPgid": None, "runToken": None,
-                   "attached": False, "lastExit": None, "createdAt": 0}
+                   "attached": False, "lastExit": None,
+                   "keepAlive": False, "desiredRunning": False,
+                   "keepAliveGrant": None,
+                   "createdAt": 0}
 
     def __init__(self, path, force_read_only_reason=None):
         self._lock = threading.RLock()
@@ -1052,6 +1072,28 @@ class Config:
                 app["importStatus"] = "blocked"
                 invalid_external_resource = True
             app["elevated"] = app.get("elevated") is True
+            app["keepAlive"] = app.get("keepAlive") is True
+            app["desiredRunning"] = (
+                app["keepAlive"] and app.get("desiredRunning") is True
+            )
+            grant = app.get("keepAliveGrant")
+            if (PLATFORM.name != "windows" or not isinstance(grant, dict)
+                    or set(grant) != {
+                    "version", "grantId", "kind", "bindingDigest",
+                    "configDigest",
+                } or grant.get("version") != 1
+                    or not isinstance(grant.get("grantId"), str)
+                    or not 16 <= len(grant["grantId"]) <= 128
+                    or grant.get("kind") not in {
+                        "elevatedProgram", "scheduledService"
+                    } or not isinstance(grant.get("bindingDigest"), str)
+                    or not re.fullmatch(
+                        r"sha256:[0-9a-f]{64}", grant["bindingDigest"]
+                    ) or not isinstance(grant.get("configDigest"), str)
+                    or not re.fullmatch(
+                        r"sha256:[0-9a-f]{64}", grant["configDigest"]
+                    )):
+                app["keepAliveGrant"] = None
             invalid_command_spec = False
             try:
                 command_spec = app.get("commandSpec")
@@ -1792,6 +1834,160 @@ def elevated_favorite(app):
     return bool(isinstance(app, dict) and app.get("elevated") is True)
 
 
+def keep_alive_supported(app):
+    """保活只适用于长期运行的服务与程序；一次性任务不得循环执行。"""
+    if not isinstance(app, dict):
+        return False
+    kind = app.get("kind") or "service"
+    if kind not in ("service", "program"):
+        return False
+    if scheduled_task_path(app) and kind != "service":
+        return False
+    return True
+
+
+def keep_alive_requires_elevation(app):
+    return bool(
+        PLATFORM.name == "windows"
+        and (
+            scheduled_task_path(app)
+            or docker_resource(app)
+            or elevated_favorite(app)
+            or app.get("attached") is True
+        )
+    )
+
+
+def keep_alive_grant_required(app):
+    return bool(
+        PLATFORM.name == "windows"
+        and (scheduled_task_path(app) or elevated_favorite(app))
+    )
+
+
+def keep_alive_grant_request(app):
+    if elevated_favorite(app):
+        spec = normalize_command_spec(app.get("commandSpec"))
+        return {
+            "appId": app["id"],
+            "kind": "elevatedProgram",
+            "request": {
+                "executable": spec.get("executable"),
+                "args": list(spec.get("args") or []),
+                "cwd": app.get("cwd") or ntpath.dirname(
+                    str(spec.get("executable") or "")
+                ),
+            },
+        }
+    path = scheduled_task_path(app)
+    if path:
+        return {
+            "appId": app["id"],
+            "kind": "scheduledService",
+            "path": path,
+        }
+    return None
+
+
+def keep_alive_config_digest(app):
+    request = keep_alive_grant_request(app)
+    if request is None:
+        return None
+    payload = json.dumps(
+        request, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def keep_alive_grant_matches_app(app):
+    grant = app.get("keepAliveGrant")
+    expected_kind = (
+        "elevatedProgram" if elevated_favorite(app)
+        else "scheduledService" if scheduled_task_path(app) else None
+    )
+    return bool(
+        isinstance(grant, dict)
+        and grant.get("kind") == expected_kind
+        and grant.get("configDigest") == keep_alive_config_digest(app)
+    )
+
+
+def keep_alive_persistent_authorized(app):
+    if app.get("keepAlive") is not True:
+        return False
+    if keep_alive_grant_required(app):
+        return keep_alive_grant_matches_app(app)
+    return keep_alive_requires_elevation(app)
+
+
+def keep_alive_row_fields(app):
+    requires_elevation = keep_alive_requires_elevation(app)
+    enabled = app.get("keepAlive") is True
+    persistent_authorization = keep_alive_persistent_authorized(app)
+    return {
+        "keepAlive": enabled,
+        "desiredRunning": enabled and app.get("desiredRunning") is True,
+        "keepAliveAvailable": keep_alive_supported(app),
+        "keepAliveRequiresElevation": requires_elevation,
+        "keepAlivePersistentAuthorization": persistent_authorization,
+        # Sensitive rows are projected per authenticated browser session later.
+        "keepAliveAuthorized": not requires_elevation,
+    }
+
+
+def keep_alive_resource_key(app):
+    task_path = scheduled_task_path(app)
+    if task_path:
+        return ("scheduled", task_path.casefold())
+    resource = docker_resource(app)
+    if resource:
+        return ("docker", json.dumps(
+            resource, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ))
+    if elevated_favorite(app):
+        try:
+            spec = normalize_command_spec(app.get("commandSpec"))
+        except CommandSpecError:
+            spec = app.get("commandSpec")
+        return (
+            "elevated",
+            json.dumps(spec, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            ntpath.normcase(ntpath.normpath(app.get("cwd") or "")),
+        )
+    if app.get("attached") is True:
+        try:
+            cwd = os.path.normcase(os.path.realpath(app.get("cwd") or ""))
+        except OSError:
+            cwd = str(app.get("cwd") or "")
+        return ("attached", app.get("port"), cwd)
+    return ("app", app.get("id"))
+
+
+def set_keep_alive_desired(cfg, app_id, desired, expected_generation=None):
+    """Persist user run intent before lifecycle control crosses the OS boundary."""
+    current = find_app(cfg.snapshot(), app_id)
+    if current is None or current.get("keepAlive") is not True:
+        return "applied", False
+
+    def op(_data, target):
+        target["desiredRunning"] = bool(desired)
+        return True
+
+    if PLATFORM.name == "windows":
+        status, changed, _ = cfg.mutate_app_if_generation(
+            app_id, expected_generation, op
+        )
+        if status == "applied" and changed and not desired:
+            # Rotate the already-paused main config into .bak as well; a later
+            # recovery must not resurrect an armed desired state.
+            cfg.update(lambda _data: False)
+        return status, bool(changed)
+    changed = cfg.update(lambda data: op(data, find_app(data, app_id)))
+    if changed and not desired:
+        cfg.update(lambda _data: False)
+    return "applied", bool(changed)
+
+
 def _program_args_match(expected_args, command_line):
     args = expected_args if isinstance(expected_args, list) else []
     if not args:
@@ -1966,6 +2162,7 @@ def scheduled_task_app_row(app, task):
     if command_spec is None:
         command_spec = legacy_command_spec(app.get("command") or "")
     return {
+        **keep_alive_row_fields(app),
         "id": app["id"],
         "name": app["name"],
         "command": app["command"],
@@ -2113,6 +2310,7 @@ def elevated_program_app_row(app, broker_status, program_processes=None):
         "action": action,
     }]
     return {
+        **keep_alive_row_fields(app),
         "id": app["id"], "name": app["name"], "command": app["command"],
         "commandSpec": app.get("commandSpec"),
         "runtimeIdentity": None,
@@ -2322,6 +2520,7 @@ def docker_app_row(app, snapshot):
     if issues:
         issue = {"code": issues[0]["kind"], "message": issues[0]["detail"]}
     return {
+        **keep_alive_row_fields(app),
         "id": app["id"], "name": app["name"], "command": app["command"],
         "commandSpec": app.get("commandSpec"),
         "runtimeIdentity": None,
@@ -2500,6 +2699,7 @@ def build_apps(
                 }],
             }
         apps.append({
+            **keep_alive_row_fields(app),
             "id": app["id"], "name": app["name"], "command": app["command"],
             "commandSpec": command_spec,
             "runtimeIdentity": app.get("runtimeIdentity"),
@@ -3638,6 +3838,358 @@ def clear_app_runtime(cfg, app_id, expected_token=None, last_exit=None):
             target["lastExit"] = last_exit
         return True
     return cfg.update(op)
+
+
+class KeepAliveSupervisor:
+    """Single low-overhead desired-state loop for explicitly armed cards."""
+
+    BACKOFF_SECONDS = (0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0)
+    STABLE_SECONDS = 30.0
+
+    def __init__(self, console, *, clock=time.monotonic, jitter=None):
+        self.console = console
+        self.clock = clock
+        self.jitter = jitter or (lambda delay: random.uniform(0.0, delay * 0.1))
+        self._guard = threading.RLock()
+        self._entries = {}
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread = None
+
+    def status(self, app_id):
+        with self._guard:
+            return dict(self._entries.get(app_id) or {
+                "state": "disabled", "attempts": 0,
+                "nextRetryAt": None, "nextObserveAt": None, "error": None,
+            })
+
+    def wake(self):
+        self._wake.set()
+
+    def stop(self):
+        self._stop.set()
+        self._wake.set()
+
+    def join(self, timeout=None):
+        if self._thread is not None:
+            self._thread.join(timeout)
+
+    def is_alive(self):
+        return bool(self._thread is not None and self._thread.is_alive())
+
+    def start(self):
+        if self._thread is not None:
+            return self
+        self._thread = threading.Thread(
+            target=self._run, name="keep-alive-supervisor", daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.is_set():
+            active = self.run_once()
+            timeout = 0.5 if active else 30.0
+            self._wake.wait(timeout)
+            self._wake.clear()
+
+    def _set_status(self, app_id, **values):
+        with self._guard:
+            current = dict(self._entries.get(app_id) or {})
+            current.update(values)
+            current.setdefault("attempts", 0)
+            current.setdefault("nextRetryAt", None)
+            current.setdefault("nextObserveAt", None)
+            current.setdefault("error", None)
+            self._entries[app_id] = current
+            return current
+
+    def _observe(self, app):
+        grant = app.get("keepAliveGrant")
+        if keep_alive_grant_required(app) and not keep_alive_grant_matches_app(app):
+            return "unknown", "特权保活尚未取得持久精确授权"
+        if elevated_favorite(app):
+            response = PLATFORM.keep_alive_grant_use(
+                grant["grantId"], app["id"], grant["bindingDigest"],
+                "observe"
+            )
+            if not response.get("ok"):
+                return "unknown", response.get("error") or response.get("code")
+            self._set_status(app["id"], leaseId=response.get("leaseId"))
+            if response.get("processes"):
+                return "running", None
+            if isinstance(response.get("leaseId"), str):
+                return "stopped", None
+            return "unknown", "管理员程序零实例观察未签发启动租约"
+        if docker_resource(app):
+            inspect_resource = getattr(DOCKER, "inspect", None)
+            snapshot = (
+                inspect_resource(docker_resource(app))
+                if inspect_resource is not None else DOCKER.discover()
+            )
+            row = docker_app_row(app, snapshot)
+            status = row.get("lifecycleStatus")
+            if status == "running":
+                return "running", None
+            if status == "stopped" and not row.get("health", {}).get("blocking"):
+                return "stopped", None
+            issue = row.get("runtimeIssue") or {}
+            return "unknown", issue.get("message") or "无法确认 Docker 资源状态"
+        task_path = scheduled_task_path(app)
+        if task_path:
+            response = PLATFORM.keep_alive_grant_use(
+                grant["grantId"], app["id"], grant["bindingDigest"],
+                "query"
+            )
+            if not response.get("ok"):
+                return "unknown", response.get("error") or response.get("code")
+            task = (response.get("tasks") or {}).get(task_path.casefold())
+            if not isinstance(task, dict):
+                return "unknown", "无法确认计划任务状态"
+            state = task.get("state") or "unknown"
+            if state in ("running", "queued"):
+                return "running", None
+            if (state == "ready" and task.get("enabled") is True
+                    and isinstance(response.get("leaseId"), str)):
+                self._set_status(app["id"], leaseId=response.get("leaseId"))
+                return "stopped", None
+            return "unknown", "计划任务未处于可安全运行状态"
+        if app.get("attached") is True:
+            listeners = scan_listeners()
+            pid = legacy_managed_pid(app, listeners=listeners)
+            if pid:
+                self._set_status(app["id"], attachedMisses=0)
+                return "running", None
+            port = app.get("port")
+            if port and any(item_port == port for _, item_port in listeners):
+                self._set_status(app["id"], attachedMisses=0)
+                return "unknown", "端口由无法匹配当前卡片身份的进程占用"
+            entry = self.status(app["id"])
+            misses = int(entry.get("attachedMisses") or 0) + 1
+            self._set_status(app["id"], attachedMisses=misses)
+            if misses < 2:
+                return "unknown", "正在复验外部认领服务是否已经退出"
+            return "stopped", None
+        if PLATFORM.name == "windows":
+            if app.get("runtimeIdentity") is not None:
+                try:
+                    identity = native_runtime_identity(app)
+                except (ConfigSchemaError, TypeError, ValueError) as exc:
+                    return "unknown", str(exc)
+                terminal = _inspect_windows_terminal(identity)
+                if terminal is not None:
+                    cleared, clear_status = _clear_windows_generation(
+                        self.console.cfg, app, terminal
+                    )
+                    if cleared:
+                        return "stopped", None
+                    return "unknown", (
+                        "Windows 运行终态清理尚未完成: %s" % clear_status
+                    )
+                state = inspect_windows_runtime(app)
+                if state.get("running"):
+                    return "running", None
+                return "unknown", state.get("issue")
+            return "stopped", None
+        if managed_pids(app):
+            return "running", None
+        return "stopped", None
+
+    def _start_managed(self, app):
+        health = inspect_app_health(app)
+        if health.get("blocking"):
+            issue = (health.get("issues") or [{}])[0]
+            return {"ok": False, "error": (
+                issue.get("detail") or issue.get("title") or "配置不可用"
+            )}
+        port = app.get("port")
+        occupied = [
+            (pid, observed_port)
+            for pid, observed_port in scan_listeners()
+            if observed_port == port
+        ] if port else []
+        if occupied:
+            return {
+                "ok": False,
+                "error": "端口 %d 已被 PID %d 占用" % (port, occupied[0][0]),
+            }
+        if PLATFORM.name == "windows":
+            return start_windows_app(self.console.cfg, app)
+        ok, error, proc, pgid, token = start_app(app)
+        if not ok:
+            return {"ok": False, "error": error or "启动失败"}
+        if not persist_started_app(
+                self.console.cfg, app["id"], proc, pgid, token):
+            stop_pid_tree(pgid)
+            return {"ok": False, "error": "应用已被删除，已取消保活启动"}
+        return {"ok": True, "pid": proc.pid}
+
+    def _start_app(self, app):
+        if elevated_favorite(app):
+            grant = app.get("keepAliveGrant") or {}
+            return PLATFORM.keep_alive_grant_use(
+                grant.get("grantId"), app["id"], grant.get("bindingDigest"),
+                "launch",
+                self.status(app["id"]).get("leaseId"),
+            )
+        if docker_resource(app):
+            return control_docker_app(DOCKER, app, True)
+        if scheduled_task_path(app):
+            grant = app.get("keepAliveGrant") or {}
+            return PLATFORM.keep_alive_grant_use(
+                grant.get("grantId"), app["id"], grant.get("bindingDigest"),
+                "run",
+                self.status(app["id"]).get("leaseId"),
+            )
+        return self._start_managed(app)
+
+    def _record_failure(self, app_id, entry, error, now):
+        attempts = int(entry.get("attempts") or 0) + 1
+        base = self.BACKOFF_SECONDS[min(
+            attempts - 1, len(self.BACKOFF_SECONDS) - 1
+        )]
+        delay = base + max(0.0, float(self.jitter(base)))
+        self._set_status(
+            app_id,
+            state="backoff",
+            attempts=attempts,
+            nextRetryAt=now + delay,
+            nextObserveAt=now + delay,
+            runningSince=None,
+            launchPending=False,
+            error=str(error or "启动失败"),
+        )
+
+    @staticmethod
+    def _observe_interval(app):
+        if docker_resource(app):
+            return 5.0
+        if scheduled_task_path(app) or elevated_favorite(app):
+            return 2.0
+        return 1.0
+
+    def run_once(self):
+        now = self.clock()
+        snapshot = self.console.cfg.snapshot()
+        config_writable = bool(
+            self.console.cfg.health_info().get("writable")
+        )
+        active = [
+            app for app in snapshot.get("apps") or []
+            if app.get("keepAlive") is True
+            and app.get("desiredRunning") is True
+            and keep_alive_supported(app)
+        ]
+        active_ids = {app["id"] for app in active}
+        resource_owners = {}
+        for app in active:
+            resource_owners.setdefault(keep_alive_resource_key(app), []).append(
+                app["id"]
+            )
+        conflicts = {
+            app_id
+            for owners in resource_owners.values() if len(owners) > 1
+            for app_id in owners
+        }
+        with self._guard:
+            for app_id in list(self._entries):
+                if app_id not in active_ids:
+                    self._entries.pop(app_id, None)
+        for app in active:
+            if self._stop.is_set():
+                break
+            app_id = app["id"]
+            if not config_writable:
+                self._set_status(
+                    app_id, state="blocked", nextRetryAt=None,
+                    error="配置处于只读保护，保活已暂停",
+                )
+                continue
+            if app_id in conflicts:
+                self._set_status(
+                    app_id,
+                    state="conflict",
+                    nextRetryAt=None,
+                    error="另一张保活卡片使用了相同的精确资源身份",
+                )
+                continue
+            entry = self.status(app_id)
+            next_retry = entry.get("nextRetryAt")
+            if isinstance(next_retry, (int, float)) and now < next_retry:
+                continue
+            next_observe = entry.get("nextObserveAt")
+            if (next_retry is None and isinstance(next_observe, (int, float))
+                    and now < next_observe):
+                continue
+            operation_lock = self.console.try_app_operation(app_id)
+            if operation_lock is None:
+                self._set_status(app_id, state="waiting", error=None)
+                continue
+            try:
+                current = find_app(self.console.cfg.snapshot(), app_id)
+                if (current is None or current.get("keepAlive") is not True
+                        or current.get("desiredRunning") is not True
+                        or not keep_alive_supported(current)):
+                    continue
+                observed, issue = self._observe(current)
+                next_observe = now + self._observe_interval(current)
+                if observed == "running":
+                    running_since = entry.get("runningSince")
+                    if not isinstance(running_since, (int, float)):
+                        running_since = now
+                    attempts = int(entry.get("attempts") or 0)
+                    launch_pending = entry.get("launchPending") is True
+                    if now - running_since >= self.STABLE_SECONDS:
+                        attempts = 0
+                        launch_pending = False
+                    self._set_status(
+                        app_id, state="watching", attempts=attempts,
+                        nextRetryAt=None, nextObserveAt=next_observe,
+                        runningSince=running_since,
+                        launchPending=launch_pending, error=None,
+                    )
+                    continue
+                if observed != "stopped":
+                    self._set_status(
+                        app_id, state="blocked", nextRetryAt=None,
+                        nextObserveAt=next_observe,
+                        error=str(issue or "运行状态无法确认"),
+                    )
+                    continue
+                running_since = entry.get("runningSince")
+                if (entry.get("launchPending") is True
+                        and isinstance(running_since, (int, float))
+                        and now - running_since < self.STABLE_SECONDS):
+                    self._record_failure(
+                        app_id, entry,
+                        "保活启动后在稳定窗口内退出", now,
+                    )
+                    continue
+                current = find_app(self.console.cfg.snapshot(), app_id)
+                if (current is None or current.get("keepAlive") is not True
+                        or current.get("desiredRunning") is not True):
+                    continue
+                result = self._start_app(current)
+                if result.get("ok"):
+                    self._set_status(
+                        app_id, state="starting", nextRetryAt=None,
+                        nextObserveAt=next_observe,
+                        runningSince=now, launchPending=True, error=None,
+                    )
+                else:
+                    self._record_failure(
+                        app_id, entry, result.get("error"), now
+                    )
+            except Exception as exc:
+                LOG.exception("保活检查失败: %s", app_id)
+                self._record_failure(app_id, entry, exc, now)
+            finally:
+                operation_lock.release()
+        return bool(active)
+
+
+def start_keep_alive_supervisor(console):
+    return KeepAliveSupervisor(console).start()
 
 
 def stop_app_for_update(cfg, app, timeout=5.0):
@@ -5258,6 +5810,7 @@ class ConsoleServer(ThreadingHTTPServer):
         self._console_action_guard = threading.Lock()
         self._console_action = None
         self._console_helper_pid = None
+        self.keep_alive_supervisor = None
 
     def _prune_control_sessions(self, now):
         self._browser_bootstraps = {
@@ -5345,6 +5898,18 @@ class ConsoleServer(ThreadingHTTPServer):
         with self._control_sessions_guard:
             for session in self._control_sessions.values():
                 session["elevated"] = False
+
+    def wake_keep_alive(self):
+        if self.keep_alive_supervisor is not None:
+            self.keep_alive_supervisor.wake()
+
+    def keep_alive_status(self, app_id):
+        if self.keep_alive_supervisor is not None:
+            return self.keep_alive_supervisor.status(app_id)
+        return {
+            "state": "disabled", "attempts": 0,
+            "nextRetryAt": None, "error": None,
+        }
 
     def handle_error(self, request, client_address):
         """空闲连接超时 / 客户端中途断开属正常现象，不刷 traceback。"""
@@ -5444,10 +6009,18 @@ class Handler(BaseHTTPRequestHandler):
         projected["elevationBroker"] = broker
         apps = []
         for app in projected.get("apps") or []:
-            if not app.get("elevated"):
-                apps.append(app)
-                continue
             row = dict(app)
+            row["keepAliveAuthorized"] = bool(
+                not row.get("keepAliveRequiresElevation")
+                or row.get("keepAlivePersistentAuthorization")
+                or session_authorized
+            )
+            row["keepAliveStatus"] = self.server.keep_alive_status(
+                row.get("id")
+            )
+            if not row.get("elevated"):
+                apps.append(row)
+                continue
             row_broker = dict(row.get("elevationBroker") or {})
             row_broker["sessionAuthorized"] = session_authorized
             row["elevationBroker"] = row_broker
@@ -6008,6 +6581,9 @@ class Handler(BaseHTTPRequestHandler):
                 if action == "attach":
                     self.handle_app_attach(app_id)
                     return
+                if action == "keep-alive":
+                    self.handle_app_keep_alive(app_id)
+                    return
                 if action == "scheduled-enabled":
                     self.handle_scheduled_task_enabled(app_id)
                     return
@@ -6137,6 +6713,15 @@ class Handler(BaseHTTPRequestHandler):
                 409,
                 "配置处于只读保护状态，请先恢复配置或权限",
                 "CONFIG_READ_ONLY",
+            )
+            return
+        if any(
+                isinstance(app.get("keepAliveGrant"), dict)
+                for app in self.server.cfg.snapshot().get("apps") or []):
+            self.send_err(
+                409,
+                "导入前请先逐卡关闭并撤销特权保活",
+                "KEEP_ALIVE_GRANT_REVOKE_REQUIRED",
             )
             return
         try:
@@ -6364,6 +6949,8 @@ class Handler(BaseHTTPRequestHandler):
                "icon": None, "favicon": None, "lastPid": None,
                "lastPgid": None, "runToken": None,
                "attached": False, "lastExit": None,
+               "keepAlive": False, "desiredRunning": False,
+               "keepAliveGrant": None,
                "createdAt": int(time.time())}
         automatic_icon = extract_program_icon(new_id, app)
         cwd_updated = False
@@ -6502,6 +7089,26 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._generation_matches(app, expected_generation):
             return
+        if app.get("keepAlive") is True:
+            persistent_authorized = keep_alive_persistent_authorized(app)
+            if (keep_alive_requires_elevation(app) and not persistent_authorized
+                    and not self._require_browser_session(elevated=True)):
+                return
+            desired_status, _ = set_keep_alive_desired(
+                self.server.cfg, app_id, True, expected_generation
+            )
+            if desired_status != "applied":
+                self._send_app_cas_failure(desired_status)
+                return
+            self.server.wake_keep_alive()
+            app = find_app(self.server.cfg.snapshot(), app_id)
+            if keep_alive_requires_elevation(app) and persistent_authorized:
+                self.send_json({
+                    "ok": True,
+                    "keepAliveResumed": True,
+                    "lifecycleStatus": "starting",
+                })
+                return
         if elevated_favorite(app):
             if not self._require_browser_session(elevated=True):
                 return
@@ -6624,6 +7231,14 @@ class Handler(BaseHTTPRequestHandler):
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
+        desired_status, _ = set_keep_alive_desired(
+            self.server.cfg, app_id, False, expected_generation
+        )
+        if desired_status != "applied":
+            self._send_app_cas_failure(desired_status)
+            return
+        self.server.wake_keep_alive()
+        app = find_app(self.server.cfg.snapshot(), app_id)
         if elevated_favorite(app):
             if not self._require_browser_session(elevated=True):
                 return
@@ -6751,6 +7366,194 @@ class Handler(BaseHTTPRequestHandler):
         if result.get("ok"):
             invalidate_state_cache()
         self.send_json(result, 200 if result.get("ok") else 409)
+
+    @serialized_app_operation
+    def handle_app_keep_alive(self, app_id):
+        data = self._read_json_request()
+        if data is None:
+            return
+        if set(data) != {"enabled", "expectedGeneration"}:
+            self.send_err(
+                400,
+                "保活请求只接受 enabled 与 expectedGeneration",
+                "INVALID_REQUEST",
+            )
+            return
+        enabled = data.get("enabled")
+        if not isinstance(enabled, bool):
+            self.send_err(400, "enabled 必须是布尔值", "INVALID_REQUEST")
+            return
+        valid, expected_generation = self._expected_generation(data)
+        if not valid:
+            return
+        _, app = self._get_app_or_404(app_id)
+        if app is None:
+            return
+        if not self._generation_matches(app, expected_generation):
+            return
+        if not keep_alive_supported(app):
+            self.send_err(
+                409,
+                "保活只适用于长期运行的服务或程序",
+                "KEEP_ALIVE_UNSUPPORTED",
+            )
+            return
+        if (enabled and keep_alive_requires_elevation(app)
+                and not self._require_browser_session(elevated=True)):
+            return
+
+        def apply_fields(fields):
+            def op(_data, target):
+                target.update(fields)
+                return {
+                    "ok": True,
+                    "keepAlive": target.get("keepAlive") is True,
+                    "desiredRunning": target.get("desiredRunning") is True,
+                }
+
+            if PLATFORM.name == "windows":
+                status, result, _ = self.server.cfg.mutate_app_if_generation(
+                    app_id, expected_generation, op
+                )
+                if status != "applied":
+                    return status, None
+                return status, result
+            result = self.server.cfg.update(
+                lambda current: op(current, find_app(current, app_id))
+            )
+            return "applied", result
+
+        def rotate_safe_backup():
+            # Config.update stores the pre-write state in .bak. Once a stop or
+            # revoke path has made the current state safe, rotate that same
+            # state into .bak so recovery cannot resurrect an armed intent.
+            self.server.cfg.update(lambda _data: False)
+
+        current_grant = app.get("keepAliveGrant")
+        if not enabled and isinstance(current_grant, dict):
+            pause_status, _ = apply_fields({"desiredRunning": False})
+            if pause_status != "applied":
+                self._send_app_cas_failure(pause_status)
+                return
+            rotate_safe_backup()
+            revoke = PLATFORM.keep_alive_grant_revoke(
+                current_grant["grantId"], app_id,
+                current_grant["bindingDigest"],
+            )
+            if not revoke.get("ok"):
+                self.server.wake_keep_alive()
+                self.send_json({
+                    "ok": False,
+                    "error": revoke.get("error") or "保活授权撤销失败，已暂停重试",
+                    "code": revoke.get("code") or "KEEP_ALIVE_REVOKE_FAILED",
+                }, 409)
+                return
+            status, result = apply_fields({
+                "keepAlive": False,
+                "desiredRunning": False,
+                "keepAliveGrant": None,
+            })
+            if status != "applied":
+                self._send_app_cas_failure(status)
+                return
+            rotate_safe_backup()
+        elif enabled and keep_alive_grant_required(app):
+            if isinstance(current_grant, dict):
+                stale_revoke = PLATFORM.keep_alive_grant_revoke(
+                    current_grant["grantId"], app_id,
+                    current_grant["bindingDigest"],
+                )
+                if not stale_revoke.get("ok"):
+                    self.send_json({
+                        "ok": False,
+                        "error": stale_revoke.get("error")
+                                 or "旧保活授权仍待撤销",
+                        "code": stale_revoke.get("code")
+                                or "KEEP_ALIVE_REVOKE_FAILED",
+                    }, 409)
+                    return
+            request = keep_alive_grant_request(app)
+            issued = PLATFORM.keep_alive_grant_issue(request)
+            if not issued.get("ok"):
+                self.send_json({
+                    "ok": False,
+                    "error": issued.get("error") or "无法签发精确保活授权",
+                    "code": issued.get("code") or "KEEP_ALIVE_GRANT_FAILED",
+                }, 409)
+                return
+            grant_id = issued.get("grantId")
+            digest = issued.get("resourceDigest")
+            grant_kind = request.get("kind") if isinstance(request, dict) else None
+            if (not isinstance(grant_id, str) or not 16 <= len(grant_id) <= 128
+                    or not isinstance(digest, str)
+                    or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+                    or grant_kind not in {"elevatedProgram", "scheduledService"}):
+                self.send_err(500, "Broker 返回了无效的保活授权")
+                return
+            metadata = {
+                "version": 1,
+                "grantId": grant_id,
+                "kind": grant_kind,
+                "bindingDigest": digest,
+                "configDigest": keep_alive_config_digest(app),
+            }
+            try:
+                status, result = apply_fields({
+                    "keepAlive": True,
+                    "desiredRunning": True,
+                    "keepAliveGrant": metadata,
+                })
+            except Exception:
+                PLATFORM.keep_alive_grant_revoke(
+                    grant_id, app_id, digest
+                )
+                raise
+            if status != "applied":
+                PLATFORM.keep_alive_grant_revoke(
+                    grant_id, app_id, digest
+                )
+                self._send_app_cas_failure(status)
+                return
+            # Persist the grant handle in both main and backup before the
+            # Broker can activate it; recovery must retain a revoke handle.
+            rotate_safe_backup()
+            activated = PLATFORM.keep_alive_grant_activate(
+                grant_id, app_id, digest
+            )
+            if not activated.get("ok"):
+                apply_fields({
+                    "keepAlive": False,
+                    "desiredRunning": False,
+                    "keepAliveGrant": metadata,
+                })
+                # Ensure .bak is paused too before a possibly ambiguous revoke.
+                self.server.cfg.update(lambda _data: False)
+                revoke_after_failure = PLATFORM.keep_alive_grant_revoke(
+                    grant_id, app_id, digest
+                )
+                if revoke_after_failure.get("ok"):
+                    cleared_status, _ = apply_fields({"keepAliveGrant": None})
+                    if cleared_status == "applied":
+                        rotate_safe_backup()
+                self.send_json({
+                    "ok": False,
+                    "error": activated.get("error") or "保活授权激活失败",
+                    "code": activated.get("code") or "KEEP_ALIVE_ACTIVATE_FAILED",
+                }, 409)
+                return
+        else:
+            status, result = apply_fields({
+                "keepAlive": enabled,
+                "desiredRunning": enabled,
+                "keepAliveGrant": None if not enabled else app.get("keepAliveGrant"),
+            })
+            if status != "applied":
+                self._send_app_cas_failure(status)
+                return
+            if not enabled:
+                rotate_safe_backup()
+        self.server.wake_keep_alive()
+        self.send_json(result)
 
     @serialized_app_operation
     def handle_scheduled_task_history(self, app_id):
@@ -6953,6 +7756,16 @@ class Handler(BaseHTTPRequestHandler):
             }, 422)
             return
 
+        if app.get("keepAlive") is True:
+            desired_status, _ = set_keep_alive_desired(
+                self.server.cfg, app_id, True, expected_generation
+            )
+            if desired_status != "applied":
+                self._send_app_cas_failure(desired_status)
+                return
+            self.server.wake_keep_alive()
+            app = find_app(self.server.cfg.snapshot(), app_id)
+
         if PLATFORM.name == "windows":
             stopped = stop_windows_app(
                 self.server.cfg,
@@ -7111,6 +7924,43 @@ class Handler(BaseHTTPRequestHandler):
             lifecycle_changed = any(
                 key in fields and fields[key] != app.get(key)
                 for key in lifecycle_fields)
+            grant = app.get("keepAliveGrant")
+            if lifecycle_changed and isinstance(grant, dict):
+                desired_status, _ = set_keep_alive_desired(
+                    self.server.cfg, m.group(1), False, expected_generation
+                )
+                if desired_status != "applied":
+                    self._send_app_cas_failure(desired_status)
+                    return
+                revoked = PLATFORM.keep_alive_grant_revoke(
+                    grant["grantId"], app["id"], grant["bindingDigest"]
+                )
+                if not revoked.get("ok"):
+                    self.send_json({
+                        "ok": False,
+                        "error": revoked.get("error") or "旧保活授权撤销失败",
+                        "code": revoked.get("code") or "KEEP_ALIVE_REVOKE_FAILED",
+                    }, 409)
+                    return
+
+                def clear_grant(_data, target):
+                    target["keepAlive"] = False
+                    target["desiredRunning"] = False
+                    target["keepAliveGrant"] = None
+                    return True
+
+                if PLATFORM.name == "windows":
+                    clear_status, _, _ = self.server.cfg.mutate_app_if_generation(
+                        m.group(1), expected_generation, clear_grant
+                    )
+                    if clear_status != "applied":
+                        self._send_app_cas_failure(clear_status)
+                        return
+                else:
+                    self.server.cfg.update(lambda current: clear_grant(
+                        current, find_app(current, m.group(1))
+                    ))
+                app = find_app(self.server.cfg.snapshot(), m.group(1))
             stopped_for_update = False
             if (PLATFORM.name == "windows" and lifecycle_changed
                     and app.get("runtimeIdentity") is not None):
@@ -7129,6 +7979,14 @@ class Handler(BaseHTTPRequestHandler):
                         "requiresStop": True,
                     }, 409)
                     return
+                desired_status, _ = set_keep_alive_desired(
+                    self.server.cfg, m.group(1), False, expected_generation
+                )
+                if desired_status != "applied":
+                    self._send_app_cas_failure(desired_status)
+                    return
+                self.server.wake_keep_alive()
+                app = find_app(self.server.cfg.snapshot(), m.group(1))
                 stopped = stop_windows_app(
                     self.server.cfg,
                     app,
@@ -7156,6 +8014,14 @@ class Handler(BaseHTTPRequestHandler):
                         "requiresStop": True,
                     }, 409)
                     return
+                desired_status, _ = set_keep_alive_desired(
+                    self.server.cfg, m.group(1), False, expected_generation
+                )
+                if desired_status != "applied":
+                    self._send_app_cas_failure(desired_status)
+                    return
+                self.server.wake_keep_alive()
+                app = find_app(self.server.cfg.snapshot(), m.group(1))
                 ok, stop_error, stopped_for_update = stop_app_for_update(
                     self.server.cfg, app)
                 if not ok:
@@ -7164,6 +8030,9 @@ class Handler(BaseHTTPRequestHandler):
 
             def op(c, target):
                 target.update(fields)
+                if not keep_alive_supported(target):
+                    target["keepAlive"] = False
+                    target["desiredRunning"] = False
                 if ("commandSpec" in fields or "cwd" in fields
                         or "scheduledTaskPath" in fields
                         or "dockerResource" in fields
@@ -7262,6 +8131,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._generation_matches(app, expected_generation):
             return
+        desired_status, _ = set_keep_alive_desired(
+            self.server.cfg, app_id, False, expected_generation
+        )
+        if desired_status != "applied":
+            self._send_app_cas_failure(desired_status)
+            return
+        app = find_app(self.server.cfg.snapshot(), app_id)
         stopped_for_delete = False
         terminal_identity = None
         if (PLATFORM.name == "windows"
@@ -7313,6 +8189,19 @@ class Handler(BaseHTTPRequestHandler):
                               (error or "应用未能正常退出"))
                 return
             stopped_for_delete = True
+
+        grant = app.get("keepAliveGrant")
+        if isinstance(grant, dict):
+            revoked = PLATFORM.keep_alive_grant_revoke(
+                grant["grantId"], app_id, grant["bindingDigest"]
+            )
+            if not revoked.get("ok"):
+                self.send_json({
+                    "ok": False,
+                    "error": revoked.get("error") or "保活授权撤销失败，删除已取消",
+                    "code": revoked.get("code") or "KEEP_ALIVE_REVOKE_FAILED",
+                }, 409)
+                return
 
         def op(c, target):
             before = len(c["apps"])
@@ -7582,6 +8471,8 @@ def _run_console(preferred_port=None, open_browser=True, storage_issues=None):
     write_control_credential(CONTROL_CREDENTIAL_PATH, server)
     print("总控台已启动: http://%s:%d/  (Ctrl+C 停止)" % (HOST, port), flush=True)
     reconcile_stop = start_windows_runtime_reconciler(cfg)
+    keep_alive_supervisor = start_keep_alive_supervisor(server)
+    server.keep_alive_supervisor = keep_alive_supervisor
     if open_browser:
         open_browser_later(server)
     try:
@@ -7590,6 +8481,8 @@ def _run_console(preferred_port=None, open_browser=True, storage_issues=None):
         pass
     finally:
         reconcile_stop.set()
+        keep_alive_supervisor.stop()
+        keep_alive_supervisor.join(2.0)
         if getattr(PLATFORM.capabilities, "manage_elevation_broker", False):
             try:
                 PLATFORM.lock_elevation_broker()

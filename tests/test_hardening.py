@@ -952,6 +952,48 @@ class StateMutationEndpointTests(unittest.TestCase):
             [app["id"] for app in self.h.cfg.snapshot()["apps"]],
             ["cccc0003", "bbbb0002", "aaaa0001"])
 
+    def test_managed_service_can_arm_and_disarm_persisted_keep_alive(self):
+        headers = {"Content-Type": "application/json"}
+        path = "/api/apps/aaaa0001/keep-alive"
+
+        status, armed, _ = self.h.request(
+            "POST", path,
+            json.dumps({"enabled": True, "expectedGeneration": None}),
+            headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(armed["keepAlive"])
+        self.assertTrue(armed["desiredRunning"])
+
+        status, disabled, _ = self.h.request(
+            "POST", path,
+            json.dumps({"enabled": False, "expectedGeneration": None}),
+            headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(disabled["keepAlive"])
+        self.assertFalse(disabled["desiredRunning"])
+
+        with open(self.h.config_path + ".bak", "r", encoding="utf-8") as f:
+            backup = json.load(f)
+        backup_app = server.find_app(backup, "aaaa0001")
+        self.assertFalse(backup_app["keepAlive"])
+        self.assertFalse(backup_app["desiredRunning"])
+
+        with tempfile.TemporaryDirectory() as td:
+            recovery_path = os.path.join(td, "config.json")
+            with open(recovery_path, "w", encoding="utf-8") as f:
+                f.write("{")
+            with open(recovery_path + ".bak", "w", encoding="utf-8") as f:
+                json.dump(backup, f, ensure_ascii=False)
+            recovered = server.Config(recovery_path)
+            recovered_app = server.find_app(
+                recovered.snapshot(), "aaaa0001"
+            )
+            self.assertTrue(recovered.health_info()["recoveredFromBackup"])
+            self.assertFalse(recovered_app["keepAlive"])
+            self.assertFalse(recovered_app["desiredRunning"])
+
     def test_delete_removes_config_icon_and_log_files(self):
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch.object(server, "ICONS_DIR", td), \

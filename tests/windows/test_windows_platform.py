@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from localops.command_spec import shell_command_spec
-from localops.elevation_broker import broker_task_sddl
+from localops.elevation_broker import BROKER_TASK_PATH, broker_task_sddl
 from localops.platform.contracts import (
     LaunchRequest,
     ScanStatus,
@@ -712,6 +712,45 @@ class WindowsPlatformTests(unittest.TestCase):
 
         task.GetSecurityDescriptor.return_value = canonical + "(A;;FR;;;WD)"
         self.assertFalse(self.platform._broker_task_security_locked(task))
+
+    def test_persistent_task_security_rejects_untrusted_writers(self):
+        owner_sid = self.platform._sid
+        locked = (
+            "O:SYD:(A;;FA;;;SY)(A;;FA;;;BA)"
+            f"(A;;FRFX;;;{owner_sid})"
+        )
+        writable = locked + "(A;;GA;;;AU)"
+
+        self.assertTrue(
+            self.platform._scheduled_sddl_write_locked(locked)
+        )
+        self.assertFalse(
+            self.platform._scheduled_sddl_write_locked(writable)
+        )
+
+    def test_keep_alive_broker_verification_uses_bounded_cache(self):
+        public = {"executable": r"C:\Program Files\LocalOps\LocalOps.exe"}
+        snapshot = ScheduledTaskSnapshot(
+            ScanStatus.OK,
+            {BROKER_TASK_PATH.casefold(): {
+                "path": BROKER_TASK_PATH,
+                "state": "running",
+            }},
+        )
+        with mock.patch.object(
+                self.platform, "_broker_public_config", return_value=public
+                ) as public_config, mock.patch.object(
+                    self.platform, "scheduled_tasks", return_value=snapshot
+                ) as scheduled, mock.patch.object(
+                    windows_adapter, "verify_broker_task", return_value=(True, None)
+                ), mock.patch.object(
+                    windows_adapter.time, "monotonic", side_effect=[100.0, 100.0, 101.0]
+                ):
+            self.platform._ensure_keep_alive_broker_running()
+            self.platform._ensure_keep_alive_broker_running()
+
+        public_config.assert_called_once_with()
+        scheduled.assert_called_once_with({BROKER_TASK_PATH})
 
     def test_executable_icon_uses_fixed_script_and_returns_png(self):
         png = b"\x89PNG\r\n\x1a\nfixture"

@@ -58,11 +58,13 @@ py -3.12 -m venv .venv
 
 Windows 用户数据固定写入 `%LOCALAPPDATA%\LocalOps\`。最终私有对象必须由当前用户 SID 拥有，并只向当前用户、SYSTEM 和 Administrators 授予受保护 DACL。Windows 新对象 owner 来自 token 的 `TokenOwner`；若管理员 token 的默认 owner 是 Builtin Administrators，只有 creation-time apply 才会在一次安全描述符更新中把 owner 归一为当前用户并同时写入 protected DACL。既有记录是 verify-only，Admin-owned 或其他 owner 一律拒绝。同一用户、同一数据目录通过 Named Mutex 保证只有一个写者。自定义数据或日志目录会拒绝盘符根、用户主目录、项目根目录、UNC 共享根以及 symlink/junction 路径。ACL 验证失败时配置进入只读保护。
 
-本阶段保留 Phase 3 的 IPv4/IPv6 监听、进程信息、Windows picker adapter、结构化 `commandSpec`、项目识别和显式导入，并把配置迁移到 schema v4，增加 Docker 收藏、程序收藏与管理员代理字段。真实 Windows native picker 与 Notification Center 投递仍是发行前验收项，现有 headless/API 测试不能替代。旧 `command` 字段继续保留；POSIX 命令仍只会标记为 `needs_review`，不会被猜测性转换或执行。
+本阶段保留 Phase 3 的 IPv4/IPv6 监听、进程信息、Windows picker adapter、结构化 `commandSpec`、项目识别和显式导入，并把配置迁移到 schema v5：v4 增加 Docker 收藏、程序收藏与管理员代理字段，v5 增加每卡保活选择、期望运行状态和非秘密的精确授权引用。真实 Windows native picker 与 Notification Center 投递仍是发行前验收项，现有 headless/API 测试不能替代。旧 `command` 字段继续保留；POSIX 命令仍只会标记为 `needs_review`，不会被猜测性转换或执行。
 
 Windows 不会自动发现或导入项目内旧 `data/` 或 macOS 配置。设置中心的导入向导只接受用户明确选择的本地 JSON 文件，并按“预览 → 路径映射 → 选择 → 提交”执行；预览零写入，提交不覆盖同 ID 应用、清空旧运行身份，并可在目标未发生后续修改时回滚。UNC/设备路径不会被探测或导入。
 
 Windows runner 是每个受管应用 Job Object 的唯一长期句柄持有者。目标进程先以 `CREATE_SUSPENDED` 创建，加入受保护 Job 并持久化精确 runtime identity 后才允许恢复；普通停止超时会保留身份，只有用户明确确认的 Force 操作才能通过 `TerminateJobObject` 结束该 Job。控制台关闭不会关闭 Job，runner 异常退出则通过 kill-on-close 清理自己的 Job。常驻 Windows 控制器必须从受保护 `%ProgramFiles%` onedir 以 `RunLevel Limited` 运行；检测到控制器自身已提权时，普通服务/任务启动会在创建任何 runtime record 或子进程前拒绝，避免把管理员 token 传给非管理员收藏项。
+
+保活是持久的期望运行状态：服务或程序异常退出后由单个后台监督器按 0.5 秒起步、最高 60 秒的退避恢复；手动停止会暂停期望运行，手动启动会重新启用。计划任务只允许 `kind=service` 的长期任务保活，一次性 `kind=task` 不会循环重跑。Docker 仅观察和启动精确资源身份，外部认领需连续两次可信空状态才转为 Local Ops 受管启动。管理员程序和长期计划任务在密码确认后由 Broker 签发精确、可撤销的持久 grant；交互代理锁定或控制器重启不撤销 grant。Broker 只允许对应 grant 的 observe/launch 或 query/run，并在每次动作前复验程序内容或任务定义；密码和通用管理员 token 不落盘。
 
 request/receipt 原子写入会先保护临时文件的 DACL，再替换为公开可见的最终文件。释放 active generation 前必须验证目录恰好包含三个私有 runtime records、terminal receipt 签名有效、Job 已空且 runner 不再存在；随后将 active 目录原子 rename 为严格派生的 cleanup tombstone，这次 rename 是 release commit。commit 后的恢复只删除 private、nonlink tombstone 中三个 runtime record 的 allowlisted subset，不做任何进程观察或控制；未知项、宽 ACL 或 link 会 fail closed 并保留 tombstone。
 
@@ -217,6 +219,7 @@ python3 server.py --preferred-port 9603  # 在 9600-9609 内指定优先端口
 ### 启动台（管理你的服务与任务）
 
 - **添加服务/任务**：点「+ 添加服务」卡片或页头快捷按钮。选择工作区文件夹后会自动识别项目类型（Node/pnpm、Hexo/Hugo、Django/FastAPI、Go、Rust、静态站点等）并给出候选命令；也可以「选择脚本」或完全手动填写。`service` 是长期服务（带端口语义），`task` 是有明确结束时间的批处理（强制无端口）。
+- **保活**：服务或程序卡片的闪电按钮会持久开启/关闭保活。停止按钮只暂停自动恢复而不丢失保活选择；再次启动会恢复期望运行。特权类卡片首次开启时要求密码确认，后续浏览器会话过期、交互代理锁定或控制器重启不会撤销已经签发的精确 grant。
 - **卡片**：大按钮启动/停止（任务是运行/中止）；右侧一排小按钮（复制链接/日志/诊断/重启/编辑/删除）常显，不用悬浮。运行中显示端口与时长；配置失效（目录/脚本丢失）会直接标出原因并禁用启动，点开「启动诊断」有修复建议。
 - **筛选**：每个分区右上角可按 全部/运行中/已停止/异常（任务为 全部/运行中/成功/失败/已取消）过滤，点按即时切换。
 - **排序**：鼠标拖拽，或聚焦卡片后按空格进入键盘排序（方向键移动，空格确认）。
@@ -320,7 +323,7 @@ $env:CONSOLE_LOG_DIR = 'D:\LocalOpsData\logs'
 4. 源码 checkout 在 macOS 运行 `make check`，在 Windows 运行 `py -3.12 tools\check_project.py --scope windows`；打包用户使用已经通过对应审计的完整 ZIP。
 5. 启动后检查应用数量、主题、关注关键字和一个可控服务的完整启停。
 
-当前配置为 schema v4，启动时逐版执行显式、幂等迁移。v3 为应用增加 `dockerResource`，v4 增加 `elevated` 与 `program` 类型；旧 `command` 仍保留，Windows 只执行通过静态预检的结构化 `commandSpec`。新程序不会静默降级它不认识的更高 schema；回退程序时仍应同时恢复与该版本匹配的数据备份。
+当前配置为 schema v5，启动时逐版执行显式、幂等迁移。v3 为应用增加 `dockerResource`，v4 增加 `elevated` 与 `program` 类型，v5 增加 `keepAlive`、`desiredRunning` 与可选的非秘密 `keepAliveGrant` 引用；旧配置迁移后默认关闭保活。配置导入会清除运行身份与保活授权，避免跨主机自动启动。旧 `command` 仍保留，Windows 只执行通过静态预检的结构化 `commandSpec`。新程序不会静默降级它不认识的更高 schema；回退程序时仍应同时恢复与该版本匹配的数据备份。
 
 ## 卸载
 

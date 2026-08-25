@@ -562,6 +562,31 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(app["dockerResource"])
         self.assertFalse(app["elevated"])
 
+    def test_schema_v4_to_v5_adds_disabled_keep_alive_intent_idempotently(self):
+        schema_v4 = {
+            **server.Config.DEFAULT,
+            "schemaVersion": 4,
+            "apps": [{
+                **server.Config.APP_DEFAULT,
+                "id": "deadbeef",
+                "name": "Managed service",
+                "command": "python -m http.server 8000",
+            }],
+        }
+        schema_v4["apps"][0].pop("keepAlive", None)
+        schema_v4["apps"][0].pop("desiredRunning", None)
+        schema_v4["apps"][0].pop("keepAliveGrant", None)
+
+        migrated, source_version = server.migrate_config(schema_v4)
+        migrated_again, current_source = server.migrate_config(migrated)
+
+        self.assertEqual(source_version, 4)
+        self.assertEqual(current_source, server.CURRENT_SCHEMA_VERSION)
+        self.assertEqual(migrated_again, migrated)
+        self.assertFalse(migrated["apps"][0]["keepAlive"])
+        self.assertFalse(migrated["apps"][0]["desiredRunning"])
+        self.assertIsNone(migrated["apps"][0]["keepAliveGrant"])
+
     def test_future_schema_is_not_silently_overwritten(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "config.json")

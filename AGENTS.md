@@ -58,7 +58,7 @@
   }],
   "watchedKeywords": ["ffmpeg"],
   "consolePort": 9600, "consolePid": 123, "consoleCwd": "/path/to/总控台",
-  "version": "1.0.0", "schemaVersion": 4,
+  "version": "1.0.0", "schemaVersion": 5,
   "platform": "macos", "capabilities": {"monitor_processes": true},
   "degraded": false, "degradedReasons": []
 }
@@ -92,6 +92,7 @@
 - `POST /api/apps/{id}/start` `{expectedGeneration:null}` → `{ok, pid, generationId?, lifecycleStatus?}` / `{ok:false, error, code?, health?}`（Windows 必须从停止状态 CAS；启动前复查配置健康，明确失效返回 422）
 - `POST /api/apps/{id}/stop` `{expectedGeneration, expectedProcesses?, force?}` → `{ok}` / `{ok:false, error, code?}`（Windows 普通停止超时保留身份，`force:true` 是单独确认后的显式操作；管理员程序停止必须携带状态快照中的 `expectedProcesses[{pid,createTime}]`，服务端再次核对当前用户、EXE 路径与创建时间）
 - `POST /api/apps/{id}/restart` `{expectedGeneration}` → `{ok, pid, generationId?}` / `{ok:false, error, code?}`（仅重启完整身份校验通过的受管进程；等待旧进程退出后再启动，不自动 Force）
+- `POST /api/apps/{id}/keep-alive` `{enabled: bool, expectedGeneration}` → `{ok, keepAlive, desiredRunning}`（只适用于长期 `service/program`；开启后异常退出自动恢复，手动 stop 持久暂停、手动 start 恢复。Windows 的计划任务、Docker、管理员程序和 attached 首次开启需浏览器 elevation；管理员程序与长期计划任务由 Broker 签发精确持久 grant，交互 lock 与控制器重启不撤销。`kind=task` 永不允许保活）
 - `POST /api/apps/{id}/diagnose` → `{ok, issues:[{kind,title,detail,fix,action?}], summary}`（本地规则诊断，不调外部 AI：合并运行前健康检查，并覆盖依赖未装/模块缺失、npm 脚本名错误、运行时端口占用、权限不足、pip 包缺失与退出码兜底判读；前端在配置失效或运行失败时显示诊断入口）
 - `POST /api/apps/{id}/attach` `{pid}` → `{ok, pid, cwdUpdated?, cwd?}` / `{ok:false, error}`（把已在监听配置端口的当前用户进程**认领**为本卡片受管进程：走 legacy 身份通道 lastPid+端口+UID+真实 cwd 四重校验，cwd 不一致时原子同步为进程实际目录；拒绝 task、无端口、已运行、非当前用户、他卡已认领与未监听该端口的进程。前端在端口诊断弹窗提供「认领为本卡片」）
 - `POST /api/apps/{id}/icon`（body 为 png/jpg/webp 原始字节）→ `{ok, icon}`
@@ -147,14 +148,15 @@
 - **keep-alive 陷阱**：所有 lifecycle POST/PUT/DELETE 都必须完整读取 JSON body；否则残留字节会污染同一 keep-alive 连接的下一个请求（method 可能被解析成 `{}GET` → 501）。新增拒绝分支也必须先按契约消费或安全关闭请求体。
 - **运行目录**：默认配置/图标位于 `~/Library/Application Support/总控台`，日志位于 `~/Library/Logs/总控台`；`CONSOLE_DATA_DIR` / `CONSOLE_LOG_DIR` 可显式覆盖，覆盖时对应目录不自动迁移旧 `data/`。
 - **配置**：读写加线程锁；写入用临时文件 + `os.replace` 防损坏；`schemaVersion` 逐版显式迁移；`.bak` 保留上一份良好版本。主配置与备份均不可读时进入只读保护，不覆盖原文件。
+- **保活**：单 supervisor 只检查显式 `keepAlive && desiredRunning` 卡片；普通/attached 约 1 秒、计划任务/管理员程序约 2 秒、Docker 约 5 秒观察，失败按 0.5/1/2/4/8/15/30/60 秒退避，稳定 30 秒后复位。所有自动动作复用每应用锁与精确身份，unknown 不当 stopped，重复资源身份 fail closed。Broker 持久 grant registry 位于受保护 ProgramData，controller 配置只保存非秘密 grantId/bindingDigest；grant 仅允许 elevated observe/launch 或 scheduled query/run，并以一次性租约防双启动。
 - **项目识别**：仅读取项目根目录下不超过 2MB 的已知配置/入口文件，不安装依赖、不执行配置、不扫描整个目录；显式 CLI 端口优先于框架默认端口。
 - **kill 安全**：只允许结束当前用户的进程。
 
 ## 配置 schema
 ```json
 {
-  "schemaVersion": 4,
-  "apps": [{"id": "8位hex", "name": "", "command": "", "commandSpec": null, "runtimeIdentity": null, "importStatus": null, "cwd": null, "port": null, "emoji": null, "icon": null, "favicon": null, "kind": "service", "dockerResource": null, "elevated": false, "lastPid": null, "lastPgid": null, "runToken": null, "attached": false, "lastExit": null, "createdAt": 0}],
+  "schemaVersion": 5,
+  "apps": [{"id": "8位hex", "name": "", "command": "", "commandSpec": null, "runtimeIdentity": null, "importStatus": null, "cwd": null, "port": null, "emoji": null, "icon": null, "favicon": null, "kind": "service", "dockerResource": null, "elevated": false, "lastPid": null, "lastPgid": null, "runToken": null, "attached": false, "lastExit": null, "keepAlive": false, "desiredRunning": false, "keepAliveGrant": null, "createdAt": 0}],
   "hidden": ["name:port"], "pinned": ["name:port"], "promoted": ["name:port"],
   "watchedKeywords": [],
   "uiTheme": "ops"

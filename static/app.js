@@ -24,6 +24,7 @@ import { buildGlyphGrid, initAppModal, initLogDrawer, openConfirm,
 import { configuredPort, actualPorts, portIsOpenable,
   preferredOpenPort } from './js/ports.js';
 import { lifecyclePayload, lifecycleSnapshot, runLifecycleMutation } from './js/lifecycle.js';
+import { buildStateHealthNotice, ConnectionFailureTracker } from './js/connectivity.js';
 
 /* ---------------- DOM 引用 ---------------- */
 const banner = $('#banner');
@@ -148,10 +149,29 @@ railBtns.forEach(b => b.addEventListener('click', () => switchView(b.dataset.vie
    ============================================================ */
 const POLL_INTERVAL_MS = 2000;
 const POLL_TIMEOUT_MS = 7000;
+const HEALTH_PROBE_TIMEOUT_MS = 2000;
 let pollPromise = null;
 let pollController = null;
 let pollTimer = null;
 let restartDeadlineTimer = null;
+const connectionFailures = new ConnectionFailureTracker(2);
+let stateRefreshDelayed = false;
+
+async function controlPlaneReachable() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), HEALTH_PROBE_TIMEOUT_MS);
+  try {
+    const response = await fetch('/api/health', {
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    return response.ok;
+  } catch (error) {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 function poll(force = false) {
   if (document.hidden && !force) return Promise.resolve(false);
@@ -191,6 +211,8 @@ function poll(force = false) {
       notifyTaskCompletions(state.data, data);
       state.data = data;
       state.lastUpdate = new Date();
+      connectionFailures.recordSuccess();
+      stateRefreshDelayed = false;
       notifyConfigMigration(data);
       const restartCompleted = state.restartingFrom && data.consolePid
         && data.consolePid !== state.restartingFrom;
@@ -213,7 +235,18 @@ function poll(force = false) {
       /* 页面进入后台时主动取消请求，不把它误报成断连。 */
       if (!document.hidden || timedOut) {
         const denied = e.status === 401 || e.status === 403;
-        setConnected(false, denied ? '控制台拒绝了当前页面的访问，请重新打开总控台。' : '');
+        const reachable = denied ? false : await controlPlaneReachable();
+        const failureStatus = connectionFailures.recordFailure({
+          controlPlaneReachable: reachable,
+          authRejected: denied,
+        });
+        stateRefreshDelayed = failureStatus.stateStale;
+        if (reachable) {
+          setConnected(true);
+        } else if (failureStatus.disconnected) {
+          setConnected(false, denied
+            ? '控制台拒绝了当前页面的访问，请重新打开总控台。' : '');
+        }
       }
       return false;
     } finally {
@@ -262,21 +295,10 @@ const HEALTH_COMPONENT_NAMES = {
   scheduled_tasks: 'Windows 计划任务',
 };
 function stateHealthNotice(data) {
-  if (!data) return '';
-  const health = data.configHealth || {};
-  const messages = [];
-  if (data.degraded) {
-    const components = [...new Set((data.degradedReasons || [])
-      .map(item => HEALTH_COMPONENT_NAMES[item && item.component] || '部分组件'))];
-    messages.push('降级运行：' + (components.length ? components.join('、') : '部分组件') +
-      '数据可能不完整');
-  }
-  if (health.writable === false) {
-    messages.push('配置处于只读保护，修改不会保存');
-  } else if (health.recoveredFromBackup) {
-    messages.push('配置已从备份恢复，请核对内容');
-  }
-  return messages.length ? messages.join('；') + '。' : '';
+  return buildStateHealthNotice(data, {
+    stateRefreshDelayed,
+    componentNames: HEALTH_COMPONENT_NAMES,
+  });
 }
 function setConnected(ok, message = '') {
   banner.dataset.connection = ok ? 'up' : 'down';

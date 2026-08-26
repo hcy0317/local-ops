@@ -1,7 +1,10 @@
+import hashlib
+import io
 import json
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -1503,6 +1506,676 @@ class ElevationBrokerInstallerTests(unittest.TestCase):
                     request_path, response_path
                 )
 
+    def test_bundle_digest_changes_when_only_static_assets_change(self):
+        with tempfile.TemporaryDirectory() as root:
+            bundle = Path(root) / "bundle"
+            static = bundle / "_internal" / "static"
+            static.mkdir(parents=True)
+            (bundle / "LocalOps.exe").write_bytes(b"same executable")
+            asset = static / "app.js"
+            asset.write_text("const version = 1;", encoding="utf-8")
+            before = broker_runtime._bundle_sha256(bundle)
+
+            asset.write_text("const version = 2;", encoding="utf-8")
+            after = broker_runtime._bundle_sha256(bundle)
+
+        self.assertNotEqual(before, after)
+
+    def test_bundle_digest_includes_empty_directories_and_creation_order(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = Path(root) / "first"
+            second = Path(root) / "second"
+            for bundle, names in (
+                    (first, ("z.txt", "A.txt")),
+                    (second, ("A.txt", "z.txt"))):
+                bundle.mkdir()
+                for name in names:
+                    (bundle / name).write_text(name, encoding="utf-8")
+            baseline = broker_runtime._bundle_sha256(first)
+            self.assertEqual(baseline, broker_runtime._bundle_sha256(second))
+
+            (first / "empty").mkdir()
+            self.assertNotEqual(
+                baseline, broker_runtime._bundle_sha256(first)
+            )
+
+    def test_bundle_digest_rejects_file_identity_change(self):
+        with tempfile.TemporaryDirectory() as root:
+            bundle = Path(root) / "bundle"
+            bundle.mkdir()
+            file_path = bundle / "LocalOps.exe"
+            file_path.write_bytes(b"executable")
+            actual_fstat = broker_runtime.os.fstat
+
+            def changed_identity(descriptor):
+                value = actual_fstat(descriptor)
+                return type("ChangedIdentity", (), {
+                    "st_dev": value.st_dev,
+                    "st_ino": value.st_ino + 1,
+                    "st_size": value.st_size,
+                    "st_mtime_ns": value.st_mtime_ns,
+                })()
+
+            with mock.patch.object(
+                    broker_runtime.os, "fstat", side_effect=changed_identity):
+                with self.assertRaisesRegex(OSError, "changed before"):
+                    broker_runtime._bundle_sha256(bundle)
+
+    def test_archive_extraction_rejects_links_and_casefold_collisions(self):
+        unsafe_names = (
+            "LocalOps.exe:evil", "./evil", "C:/evil", "foo//bar",
+            "foo/./bar", "evil.", "evil ", "CON", "COM¹", "bad\x01name",
+        )
+        cases = [
+            (("link", b"target", 0o120777 << 16),),
+            (("A.txt", b"A", 0), ("a.txt", b"a", 0)),
+        ]
+        cases.extend(
+            ((name, b"data", broker_runtime.stat.S_IFREG << 16),)
+            for name in unsafe_names
+        )
+        for entries in cases:
+            payload = io.BytesIO()
+            with zipfile.ZipFile(payload, "w") as archive:
+                for name, data, attributes in entries:
+                    info = zipfile.ZipInfo(name)
+                    info.external_attr = attributes
+                    archive.writestr(info, data)
+            payload.seek(0)
+            with tempfile.TemporaryDirectory() as root:
+                with self.assertRaises((OSError, ValueError)):
+                    broker_runtime._extract_bundle_archive(
+                        payload, Path(root) / "staging"
+                    )
+
+    def test_install_archive_handle_denies_concurrent_writers(self):
+        with tempfile.TemporaryDirectory() as root:
+            archive_path = Path(root) / "bundle.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("LocalOps.exe", b"executable")
+
+            with broker_runtime._open_install_archive(archive_path):
+                with self.assertRaises(OSError):
+                    open(archive_path, "r+b")
+
+            with open(archive_path, "r+b"):
+                with self.assertRaises((OSError, broker_runtime.pywintypes.error)):
+                    broker_runtime._open_install_archive(archive_path)
+
+    def test_bundle_protection_sets_admin_owner_before_readback(self):
+        with tempfile.TemporaryDirectory() as root:
+            bundle = Path(root) / "bundle"
+            bundle.mkdir()
+            (bundle / "LocalOps.exe").write_bytes(b"executable")
+            events = []
+            with mock.patch.object(
+                    broker_runtime, "_protect_path",
+                    side_effect=lambda path, *_args, **_kwargs: events.append(
+                        ("protect", Path(path).name)
+                    )), mock.patch.object(
+                        broker_runtime, "_set_protected_bundle_owner",
+                        side_effect=lambda path: events.append(
+                            ("owner", Path(path).name)
+                        )), mock.patch.object(
+                            broker_runtime, "_verify_protected_bundle",
+                            side_effect=lambda path, _owner: events.append(
+                                ("verify", Path(path).name)
+                            )):
+                broker_runtime._protect_bundle(bundle, OWNER_SID)
+
+        self.assertEqual(events[-1], ("verify", "bundle"))
+        self.assertIn(("owner", "bundle"), events)
+        self.assertIn(("owner", "LocalOps.exe"), events)
+
+    def test_bundle_acl_verifier_rejects_extra_user_write_rights(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "LocalOps.exe"
+            path.write_bytes(b"executable")
+            allow = broker_runtime.win32security.ACCESS_ALLOWED_ACE_TYPE
+            full = broker_runtime.ntsecuritycon.FILE_ALL_ACCESS
+            read_execute = (
+                broker_runtime.ntsecuritycon.FILE_GENERIC_READ
+                | broker_runtime.ntsecuritycon.FILE_GENERIC_EXECUTE
+            )
+            descriptor = mock.Mock()
+            dacl = mock.Mock()
+            descriptor.GetSecurityDescriptorOwner.return_value = (
+                broker_runtime._ADMINISTRATORS_SID
+            )
+            descriptor.GetSecurityDescriptorDacl.return_value = dacl
+            descriptor.GetSecurityDescriptorControl.return_value = (
+                broker_runtime.win32security.SE_DACL_PROTECTED, 0,
+            )
+
+            def verify_with(user_rights):
+                aces = [
+                    ((allow, 0), full, broker_runtime._SYSTEM_SID),
+                    ((allow, 0), full, broker_runtime._ADMINISTRATORS_SID),
+                    ((allow, 0), user_rights, OWNER_SID),
+                ]
+                dacl.GetAceCount.return_value = len(aces)
+                dacl.GetAce.side_effect = lambda index: aces[index]
+                with mock.patch.object(
+                        broker_runtime.win32security, "GetNamedSecurityInfo",
+                        return_value=descriptor), mock.patch.object(
+                            broker_runtime.win32security,
+                            "ConvertSidToStringSid", side_effect=lambda value: value):
+                    broker_runtime._verify_protected_bundle_path(
+                        path, OWNER_SID, directory=False
+                    )
+
+            verify_with(read_execute)
+            with self.assertRaises(PermissionError):
+                verify_with(
+                    read_execute | broker_runtime.ntsecuritycon.FILE_WRITE_DATA
+                )
+
+    def test_install_versions_the_complete_bundle_not_only_the_executable(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            source = base / "source"
+            static = source / "_internal" / "static"
+            static.mkdir(parents=True)
+            executable = source / "LocalOps.exe"
+            executable.write_bytes(b"same executable")
+            asset = static / "app.js"
+            asset.write_text("const version = 1;", encoding="utf-8")
+            bundle_archive = base / "bundle.zip"
+
+            def write_archive():
+                bundle_archive.unlink(missing_ok=True)
+                with zipfile.ZipFile(
+                        bundle_archive, "x", compression=zipfile.ZIP_DEFLATED
+                        ) as archive:
+                    archive.write(executable, "LocalOps.exe")
+                    archive.write(asset, "_internal/static/app.js")
+
+            write_archive()
+            broker_root = base / "ProgramFiles" / "LocalOps" / "Broker"
+            program_data = base / "ProgramData" / "LocalOps"
+            request = {
+                "schema": "localops-elevation-install.v1",
+                "ownerSid": OWNER_SID,
+                "passwordRecord": {"verifier": "opaque"},
+                "bundleArchive": str(bundle_archive),
+                "bundleSha256": hashlib.sha256(
+                    bundle_archive.read_bytes()
+                ).hexdigest(),
+                "executableName": "LocalOps.exe",
+            }
+            registered = []
+            protect_bundle = mock.Mock()
+            verify_bundle = mock.Mock()
+            write_config = mock.Mock()
+
+            def task_spec(path, owner_sid):
+                return {
+                    "ownerSid": owner_sid,
+                    "executable": path,
+                    "arguments": "-m localops.windows.elevation_broker serve",
+                    "workingDirectory": str(Path(path).parent),
+                    "sddl": "D:P(A;;FA;;;SY)",
+                }
+
+            patches = (
+                mock.patch.object(broker_runtime.sys, "frozen", True, create=True),
+                mock.patch.object(broker_runtime.sys, "executable", str(executable)),
+                mock.patch.object(
+                    broker_runtime, "_program_files_broker_dir",
+                    return_value=broker_root,
+                ),
+                mock.patch.object(
+                    broker_runtime, "_program_data_dir",
+                    return_value=program_data,
+                ),
+                mock.patch.object(
+                    broker_runtime, "_protect_bundle",
+                    side_effect=protect_bundle,
+                ),
+                mock.patch.object(
+                    broker_runtime, "_verify_protected_bundle",
+                    side_effect=verify_bundle,
+                ),
+                mock.patch.object(broker_runtime, "_protect_path"),
+                mock.patch.object(broker_runtime, "_verify_broker_data_ancestors"),
+                mock.patch.object(broker_runtime, "_verify_broker_public_directory"),
+                mock.patch.object(
+                    broker_runtime, "_write_json", side_effect=write_config
+                ),
+                mock.patch.object(broker_runtime, "_load_capability_registry"),
+                mock.patch.object(
+                    broker_runtime, "_register_task",
+                    side_effect=lambda spec: registered.append(spec),
+                ),
+                mock.patch.object(
+                    broker_runtime, "broker_task_spec", side_effect=task_spec,
+                ),
+                mock.patch.object(
+                    broker_runtime, "_broker_task_state",
+                    return_value=(False, False),
+                ),
+                mock.patch.object(broker_runtime, "_write_install_marker"),
+                mock.patch.object(broker_runtime, "_clear_install_marker"),
+            )
+            with patches[0], patches[1], patches[2], patches[3], \
+                    patches[4], patches[5], patches[6], patches[7], \
+                    patches[8], patches[9], patches[10], patches[11], \
+                    patches[12], patches[13], patches[14], patches[15]:
+                broker_runtime.install(request)
+                first_target = Path(registered[-1]["workingDirectory"])
+                self.assertEqual(
+                    (first_target / "_internal" / "static" / "app.js")
+                    .read_text(encoding="utf-8"),
+                    "const version = 1;",
+                )
+
+                asset.write_text("const version = 2;", encoding="utf-8")
+                write_archive()
+                request["bundleSha256"] = hashlib.sha256(
+                    bundle_archive.read_bytes()
+                ).hexdigest()
+                broker_runtime.install(request)
+                second_target = Path(registered[-1]["workingDirectory"])
+
+                registered.clear()
+                protect_bundle.reset_mock()
+                write_config.reset_mock()
+                verify_bundle.side_effect = PermissionError(
+                    "existing target ACL is not trusted"
+                )
+                with self.assertRaisesRegex(PermissionError, "not trusted"):
+                    broker_runtime.install(request)
+                self.assertEqual(registered, [])
+                write_config.assert_not_called()
+                self.assertTrue(protect_bundle.called)
+                self.assertTrue(all(
+                    Path(call.args[0]).name.startswith(".install-")
+                    for call in protect_bundle.call_args_list
+                ))
+
+                verify_bundle.side_effect = None
+                protect_bundle.side_effect = PermissionError(
+                    "staging ACL readback failed"
+                )
+                protect_bundle.reset_mock()
+                write_config.reset_mock()
+                asset.write_text("const version = 3;", encoding="utf-8")
+                write_archive()
+                request["bundleSha256"] = hashlib.sha256(
+                    bundle_archive.read_bytes()
+                ).hexdigest()
+                with self.assertRaisesRegex(PermissionError, "readback"):
+                    broker_runtime.install(request)
+                write_config.assert_not_called()
+                self.assertEqual(registered, [])
+                self.assertEqual(
+                    list(broker_root.glob(".install-*")), []
+                )
+
+            self.assertNotEqual(first_target, second_target)
+            self.assertEqual(
+                (second_target / "_internal" / "static" / "app.js")
+                .read_text(encoding="utf-8"),
+                "const version = 2;",
+            )
+            self.assertEqual(
+                (first_target / "LocalOps.exe").read_bytes(),
+                (second_target / "LocalOps.exe").read_bytes(),
+            )
+
+    def test_late_install_failures_restore_records_and_previous_task(self):
+        previous = {
+            "dataExists": True,
+            "capabilityExists": True,
+            "public": {"executable": r"C:\Program Files\LocalOps\old.exe"},
+            "secret": {"passwordRecord": {"verifier": "old"}},
+            "capabilityKey": b"k" * 32,
+            "capabilityRegistry": {"schema": "registry"},
+        }
+        new_public = {"executable": r"C:\Program Files\LocalOps\new.exe"}
+        new_secret = {"passwordRecord": {"verifier": "new"}}
+        new_spec = {"executable": new_public["executable"]}
+
+        for failure in ("public", "secret", "capability", "task"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root:
+                data_dir = Path(root) / "ProgramData" / "LocalOps"
+                data_dir.mkdir(parents=True)
+                write_count = 0
+                register_count = 0
+                events = []
+
+                def write_json(*_args, **_kwargs):
+                    nonlocal write_count
+                    write_count += 1
+                    if ((failure == "public" and write_count == 1)
+                            or (failure == "secret" and write_count == 2)):
+                        raise OSError(failure)
+
+                def load_capability(*_args, **_kwargs):
+                    if failure == "capability":
+                        raise OSError(failure)
+                    return b"k" * 32, "id", 0, {}
+
+                def register_task(_spec):
+                    nonlocal register_count
+                    register_count += 1
+                    events.append(
+                        "register-new" if register_count == 1 else "register-old"
+                    )
+                    if failure == "task" and register_count == 1:
+                        raise OSError(failure)
+
+                rollback = mock.Mock(side_effect=lambda *_args: events.append("records"))
+                run_previous = mock.Mock(side_effect=lambda: events.append("run"))
+                with mock.patch.object(
+                        broker_runtime, "_capture_install_records",
+                        return_value=previous), mock.patch.object(
+                            broker_runtime, "_broker_task_state",
+                            return_value=(True, True)), mock.patch.object(
+                                broker_runtime, "_program_data_dir",
+                                return_value=data_dir), mock.patch.object(
+                                    broker_runtime,
+                                    "_verify_broker_data_ancestors"), \
+                        mock.patch.object(
+                            broker_runtime, "_verify_broker_public_directory"), \
+                        mock.patch.object(
+                            broker_runtime, "_write_json",
+                            side_effect=write_json), mock.patch.object(
+                                broker_runtime, "_load_capability_registry",
+                                side_effect=load_capability), mock.patch.object(
+                                    broker_runtime, "_register_task",
+                                    side_effect=register_task), mock.patch.object(
+                                        broker_runtime, "broker_task_spec",
+                                        return_value={"executable": previous["public"]["executable"]}), \
+                        mock.patch.object(
+                            broker_runtime, "_run_broker_task",
+                            side_effect=run_previous), mock.patch.object(
+                                broker_runtime, "_rollback_install_records",
+                                side_effect=rollback), mock.patch.object(
+                                    broker_runtime, "_write_install_marker",
+                                    side_effect=lambda *_args: events.append("marker")), \
+                        mock.patch.object(
+                            broker_runtime, "_clear_install_marker",
+                            side_effect=lambda: events.append("clear")), \
+                        mock.patch.object(
+                            broker_runtime, "_stop_broker_task",
+                            side_effect=lambda: events.append("stop")), \
+                        mock.patch.object(
+                            broker_runtime, "_cleanup_new_data_directory",
+                            side_effect=lambda *_args: events.append("cleanup")):
+                    with self.assertRaisesRegex(OSError, failure):
+                        broker_runtime._commit_install_state(
+                            OWNER_SID, new_public, new_secret, new_spec
+                        )
+
+                rollback.assert_called_once_with(previous, OWNER_SID)
+                if failure == "task":
+                    self.assertEqual(register_count, 2)
+                    self.assertLess(events.index("records"), events.index("register-old"))
+                else:
+                    self.assertEqual(register_count, 0)
+                self.assertLess(events.index("records"), events.index("clear"))
+                self.assertLess(events.index("clear"), events.index("run"))
+                run_previous.assert_called_once_with()
+
+    def test_rollback_failure_keeps_marker_and_never_restarts_broker(self):
+        previous = {
+            "dataExists": True,
+            "capabilityExists": True,
+            "public": {"executable": r"C:\Program Files\LocalOps\old.exe"},
+            "secret": {},
+            "capabilityKey": b"k" * 32,
+            "capabilityRegistry": {},
+        }
+        marker_statuses = []
+        stop = mock.Mock()
+        clear = mock.Mock()
+        run = mock.Mock()
+        register_count = 0
+
+        def register(_spec):
+            nonlocal register_count
+            register_count += 1
+            raise OSError("new task" if register_count == 1 else "old task")
+
+        with tempfile.TemporaryDirectory() as root:
+            data_dir = Path(root) / "ProgramData" / "LocalOps"
+            data_dir.mkdir(parents=True)
+            with mock.patch.object(
+                    broker_runtime, "_capture_install_records",
+                    return_value=previous), mock.patch.object(
+                        broker_runtime, "_broker_task_state",
+                        return_value=(True, True)), mock.patch.object(
+                            broker_runtime, "_program_data_dir",
+                            return_value=data_dir), mock.patch.object(
+                                broker_runtime, "_verify_broker_data_ancestors"), \
+                    mock.patch.object(
+                        broker_runtime, "_verify_broker_public_directory"), \
+                    mock.patch.object(broker_runtime, "_write_json"), \
+                    mock.patch.object(
+                        broker_runtime, "_load_capability_registry",
+                        return_value=(b"k" * 32, "id", 0, {})), \
+                    mock.patch.object(
+                        broker_runtime, "_register_task", side_effect=register), \
+                    mock.patch.object(
+                        broker_runtime, "broker_task_spec", return_value={}), \
+                    mock.patch.object(
+                        broker_runtime, "_rollback_install_records",
+                        side_effect=OSError("records")), mock.patch.object(
+                            broker_runtime, "_write_install_marker",
+                            side_effect=lambda _owner, _spec, status: marker_statuses.append(status)), \
+                    mock.patch.object(
+                        broker_runtime, "_clear_install_marker",
+                        side_effect=clear), mock.patch.object(
+                            broker_runtime, "_stop_broker_task",
+                            side_effect=stop), mock.patch.object(
+                                broker_runtime, "_run_broker_task",
+                                side_effect=run):
+                with self.assertRaisesRegex(OSError, "rollback failed"):
+                    broker_runtime._commit_install_state(
+                        OWNER_SID, {"executable": "new"}, {}, {"executable": "new"}
+                    )
+
+        self.assertEqual(marker_statuses, ["in_progress", "rollback_failed"])
+        self.assertGreaterEqual(stop.call_count, 2)
+        clear.assert_not_called()
+        run.assert_not_called()
+
+    def test_install_repairs_missing_task_when_public_record_exists(self):
+        previous = {
+            "dataExists": True,
+            "capabilityExists": True,
+            "public": {"executable": r"C:\Program Files\LocalOps\old.exe"},
+            "secret": {},
+            "capabilityKey": b"k" * 32,
+            "capabilityRegistry": {},
+        }
+        register = mock.Mock()
+        stop = mock.Mock()
+        run = mock.Mock()
+        with tempfile.TemporaryDirectory() as root:
+            data_dir = Path(root) / "ProgramData" / "LocalOps"
+            data_dir.mkdir(parents=True)
+            with mock.patch.object(
+                    broker_runtime, "_capture_install_records",
+                    return_value=previous), mock.patch.object(
+                        broker_runtime, "_broker_task_state",
+                        return_value=(False, False)), mock.patch.object(
+                            broker_runtime, "_program_data_dir",
+                            return_value=data_dir), mock.patch.object(
+                                broker_runtime, "_verify_broker_data_ancestors"), \
+                    mock.patch.object(
+                        broker_runtime, "_verify_broker_public_directory"), \
+                    mock.patch.object(broker_runtime, "_write_json"), \
+                    mock.patch.object(
+                        broker_runtime, "_load_capability_registry",
+                        return_value=(b"k" * 32, "id", 0, {})), \
+                    mock.patch.object(
+                        broker_runtime, "_register_task", side_effect=register), \
+                    mock.patch.object(broker_runtime, "_write_install_marker"), \
+                    mock.patch.object(broker_runtime, "_clear_install_marker"), \
+                    mock.patch.object(
+                        broker_runtime, "_stop_broker_task", side_effect=stop), \
+                    mock.patch.object(
+                        broker_runtime, "_run_broker_task", side_effect=run):
+                broker_runtime._commit_install_state(
+                    OWNER_SID, {"executable": "new"}, {}, {"executable": "new"}
+                )
+
+        register.assert_called_once_with({"executable": "new"})
+        stop.assert_not_called()
+        run.assert_not_called()
+
+    def test_record_rollback_restores_existing_capability_state(self):
+        previous = {
+            "dataExists": True,
+            "capabilityExists": True,
+            "public": {"schema": "public"},
+            "secret": {"schema": "secret"},
+            "capabilityKey": b"k" * 32,
+            "capabilityRegistry": {"schema": "registry"},
+        }
+        write_json = mock.Mock()
+        write_key = mock.Mock()
+        validate = mock.Mock()
+        with mock.patch.object(
+                broker_runtime, "_write_json", side_effect=write_json), \
+                mock.patch.object(
+                    broker_runtime, "_write_secret_bytes", side_effect=write_key), \
+                mock.patch.object(
+                    broker_runtime, "_load_capability_registry",
+                    side_effect=validate):
+            broker_runtime._rollback_install_records(previous, OWNER_SID)
+
+        self.assertEqual(write_json.call_count, 3)
+        write_key.assert_called_once_with(
+            broker_runtime.capability_key_path(), b"k" * 32, OWNER_SID
+        )
+        validate.assert_called_once_with(OWNER_SID, create=False)
+
+    def test_record_rollback_removes_new_install_state(self):
+        with tempfile.TemporaryDirectory() as root:
+            data_dir = Path(root) / "ProgramData" / "LocalOps"
+            capability = data_dir / "capabilities"
+            capability.mkdir(parents=True)
+            public = data_dir / "elevation-broker.json"
+            secret = data_dir / "elevation-password.json"
+            key = capability / "key.bin"
+            registry = capability / "grants.json"
+            for path in (public, secret, key, registry):
+                path.write_bytes(b"record")
+            state = {
+                "dataExists": False,
+                "capabilityExists": False,
+                "public": None,
+                "secret": None,
+                "capabilityKey": None,
+                "capabilityRegistry": None,
+            }
+            with mock.patch.object(
+                    broker_runtime, "_program_data_dir",
+                    return_value=data_dir), mock.patch.object(
+                        broker_runtime, "_verify_broker_public_file"), \
+                    mock.patch.object(
+                        broker_runtime, "_verify_broker_public_directory"), \
+                    mock.patch.object(
+                        broker_runtime, "_verify_broker_only_path"), \
+                    mock.patch.object(
+                        broker_runtime, "_cleanup_capability_temporaries"):
+                broker_runtime._rollback_install_records(state, OWNER_SID)
+                broker_runtime._cleanup_new_data_directory(state, OWNER_SID)
+
+            self.assertFalse(data_dir.exists())
+
+    def test_broker_serve_refuses_incomplete_install_marker(self):
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root) / "elevation-install-incomplete.json"
+            marker.write_text("{}", encoding="utf-8")
+            verify = mock.Mock()
+            with mock.patch.object(
+                    broker_runtime, "install_incomplete_path",
+                    return_value=marker), mock.patch.object(
+                        broker_runtime, "_verify_broker_data_ancestors"), \
+                    mock.patch.object(
+                        broker_runtime, "_verify_broker_only_path",
+                        side_effect=verify):
+                result = broker_runtime.serve()
+
+        self.assertEqual(result, 3)
+        verify.assert_called_once_with(marker, directory=False)
+
+    def test_running_broker_rejects_next_request_when_marker_appears(self):
+        pipe = object()
+        write = mock.Mock()
+        flush = mock.Mock()
+        with mock.patch.object(
+                broker_runtime, "_runtime_install_blocked",
+                return_value=True), mock.patch.object(
+                    broker_runtime.win32file, "WriteFile",
+                    side_effect=write), mock.patch.object(
+                        broker_runtime.win32file, "FlushFileBuffers",
+                        side_effect=flush):
+            rejected = broker_runtime._reject_incomplete_install_request(pipe)
+
+        self.assertTrue(rejected)
+        payload = broker_runtime.decode_message(bytes(write.call_args.args[1]))
+        self.assertEqual(payload["code"], "BROKER_INSTALL_INCOMPLETE")
+        flush.assert_called_once_with(pipe)
+
+    def test_restart_failure_leaves_restored_old_task_stopped(self):
+        previous = {
+            "dataExists": True,
+            "capabilityExists": True,
+            "public": {"executable": r"C:\Program Files\LocalOps\old.exe"},
+            "secret": {},
+            "capabilityKey": b"k" * 32,
+            "capabilityRegistry": {},
+        }
+        marker_statuses = []
+        clear = mock.Mock()
+        stop = mock.Mock()
+        disable = mock.Mock()
+        with tempfile.TemporaryDirectory() as root:
+            data_dir = Path(root) / "ProgramData" / "LocalOps"
+            data_dir.mkdir(parents=True)
+            with mock.patch.object(
+                    broker_runtime, "_capture_install_records",
+                    return_value=previous), mock.patch.object(
+                        broker_runtime, "_broker_task_state",
+                        return_value=(True, True)), mock.patch.object(
+                            broker_runtime, "_program_data_dir",
+                            return_value=data_dir), mock.patch.object(
+                                broker_runtime, "_verify_broker_data_ancestors"), \
+                    mock.patch.object(
+                        broker_runtime, "_verify_broker_public_directory"), \
+                    mock.patch.object(
+                        broker_runtime, "_write_json",
+                        side_effect=OSError("public")), mock.patch.object(
+                            broker_runtime, "_write_install_marker",
+                            side_effect=lambda _owner, _spec, status: marker_statuses.append(status)), \
+                    mock.patch.object(
+                        broker_runtime, "_clear_install_marker",
+                        side_effect=clear), mock.patch.object(
+                            broker_runtime, "_stop_broker_task",
+                            side_effect=stop), mock.patch.object(
+                                broker_runtime, "_disable_broker_task",
+                                side_effect=disable), mock.patch.object(
+                                broker_runtime, "_rollback_install_records"), \
+                    mock.patch.object(
+                        broker_runtime, "_cleanup_new_data_directory"), \
+                    mock.patch.object(
+                        broker_runtime, "_run_broker_task",
+                        side_effect=OSError("restart")):
+                with self.assertRaisesRegex(OSError, "restored.*restart"):
+                    broker_runtime._commit_install_state(
+                        OWNER_SID, {"executable": "new"}, {}, {"executable": "new"}
+                    )
+
+        self.assertEqual(marker_statuses, ["in_progress"])
+        clear.assert_called_once_with()
+        stop.assert_called_once_with()
+        disable.assert_called_once_with()
+
     def test_task_upgrade_stops_the_previous_broker_instance(self):
         service = mock.Mock()
         folder = mock.Mock()
@@ -1531,12 +2204,32 @@ class ElevationBrokerInstallerTests(unittest.TestCase):
 
         registered.Stop.assert_called_once_with(0)
 
+    def test_restart_failure_guard_disables_registered_broker_task(self):
+        service = mock.Mock()
+        folder = mock.Mock()
+        registered = mock.Mock()
+        registered.State = 4
+        registered.Stop.side_effect = lambda _flags: setattr(
+            registered, "State", 3
+        )
+        service.GetFolder.return_value = folder
+        folder.GetTask.return_value = registered
+
+        with mock.patch.object(
+                broker_runtime.win32com.client, "Dispatch",
+                return_value=service):
+            broker_runtime._disable_broker_task()
+
+        registered.Stop.assert_called_once_with(0)
+        self.assertFalse(registered.Enabled)
+
     def test_elevated_helper_rejects_a_modified_install_transaction(self):
         request = {
             "schema": "localops-elevation-install.v1",
             "ownerSid": OWNER_SID,
             "passwordRecord": {"verifier": "opaque"},
-            "bundleSource": r"C:\\Local Ops",
+            "bundleArchive": r"C:\\Local Ops\\bundle.zip",
+            "bundleSha256": "a" * 64,
             "executableName": "LocalOps.exe",
         }
         digest = broker_install_request_digest(request)

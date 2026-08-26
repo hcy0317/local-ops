@@ -69,6 +69,20 @@ export function lifecycleSnapshot(app, platform = 'unknown') {
   });
 }
 
+/* Decide whether an elevated card can recover control by asking this browser
+   session to unlock. Once the session is already authorized, another password
+   prompt cannot turn an unverifiable protected process into a stoppable one. */
+export function elevatedControlGate(app, snapshot) {
+  const elevated = !!app && (
+    app.runtimeSource === 'windowsElevationBroker'
+    || app.runtimeSource === 'windowsElevationBrokerTask'
+  );
+  if (!elevated || snapshot.canStart || snapshot.canManage) return 'ready';
+  return app.elevationBroker
+    && app.elevationBroker.sessionAuthorized === true
+    ? 'unavailable' : 'authorize';
+}
+
 export function lifecyclePayload(snapshot, extra = {}) {
   const payload = { ...extra, expectedGeneration: snapshot.expectedGeneration };
   if (snapshot.expectedProcesses && snapshot.expectedProcesses.length) {

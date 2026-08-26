@@ -12,6 +12,7 @@ import {
   runLifecycleMutation,
   canForceStopAfterTimeout,
   runConfirmedForceStop,
+  elevatedControlGate,
 } from '../../static/js/lifecycle.js';
 
 const GENERATION_A = '3d6448f0-87a0-4ace-baad-3b80abca9e3e';
@@ -158,6 +159,23 @@ test('elevated program stop intent fails closed when an observed PID is reused',
   assert.equal(sameLifecycleGeneration(snapshot, app, 'windows'), true);
   app.observedProcesses = [{ pid: 1200, createTime: 2000.5 }];
   assert.equal(sameLifecycleGeneration(snapshot, app, 'windows'), false);
+});
+
+test('protected elevated process stops prompting after this browser session unlocks', () => {
+  const app = {
+    lifecycleStatus: 'running',
+    controlAvailable: false,
+    running: true,
+    runtimeSource: 'windowsElevationBroker',
+    observedRestricted: true,
+    observedProcesses: [],
+    elevationBroker: { sessionAuthorized: false },
+  };
+  const snapshot = lifecycleSnapshot(app, 'windows');
+
+  assert.equal(elevatedControlGate(app, snapshot), 'authorize');
+  app.elevationBroker.sessionAuthorized = true;
+  assert.equal(elevatedControlGate(app, snapshot), 'unavailable');
 });
 
 test('captured intent never substitutes a newer generation', () => {

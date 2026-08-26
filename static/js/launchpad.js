@@ -12,7 +12,8 @@ import { openConfirm, openAppModal, openLogs, getIconVer,
   openBrokerPassword } from './overlays.js';
 import { configuredPort, actualPorts, hasPortMismatch,
   preferredOpenPort, displayedPorts, portIsOpenable } from './ports.js';
-import { lifecyclePayload, lifecycleSnapshot, runLifecycleMutation } from './lifecycle.js';
+import { elevatedControlGate, lifecyclePayload, lifecycleSnapshot,
+  runLifecycleMutation } from './lifecycle.js';
 import { normalizeHostCpuPercent } from './metrics.js';
 import {
   insertBeforePinnedAddCard,
@@ -512,8 +513,10 @@ function updateAppCard(card, app) {
     r.stUp.hidden = true;
     setText(r.stUp, '');
   }
-  const needsBrokerAccess = isElevated && !app.controlAvailable;
-  const primaryState = needsBrokerAccess ? 'authorize'
+  const elevatedGate = elevatedControlGate(app, lifecycle);
+  const needsBrokerAccess = elevatedGate === 'authorize';
+  const primaryState = elevatedGate === 'unavailable' ? 'unavailable'
+    : needsBrokerAccess ? 'authorize'
     : lifecycle.busy ? lifecycle.status
     : lifecycle.uncertain || (!lifecycle.canStart && !lifecycle.canManage)
       ? 'unavailable' : '';
@@ -661,8 +664,16 @@ async function toggleApp(id, button, capturedIntent, confirmed = false) {
   const isElevated = elevatedProgram || elevatedTask;
   const intent = capturedIntent || lifecycleSnapshot(app, currentPlatform());
   const starting = intent.status === 'stopped';
-  if (isElevated && !intent.canStart && !intent.canManage) {
+  const elevatedGate = elevatedControlGate(app, intent);
+  if (elevatedGate === 'authorize') {
     openBrokerPassword();
+    return;
+  }
+  if (elevatedGate === 'unavailable') {
+    const issue = app.runtimeIssue || {};
+    toast(app.observedRestricted
+      ? '解锁已成功，但该进程身份仍受保护，无法安全停止'
+      : issue.message || issue.detail || '管理员程序控制当前不可用');
     return;
   }
   if (elevatedProgram && !starting && confirmed !== true) {

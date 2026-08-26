@@ -674,13 +674,15 @@ class ElevationBrokerHttpTests(unittest.TestCase):
 @unittest.skipUnless(sys.platform == "win32", "Windows broker runtime only")
 class ElevationBrokerRuntimeTests(unittest.TestCase):
     @staticmethod
-    def _scheduled_task_row(*, security_locked=True):
+    def _scheduled_task_row(
+            *, security_locked=True, run_level="highest",
+            principal_sid=OWNER_SID):
         return {
             "path": r"\Memos-Guard",
             "state": "ready",
             "enabled": True,
-            "principalSid": OWNER_SID,
-            "runLevel": "highest",
+            "principalSid": principal_sid,
+            "runLevel": run_level,
             "multipleInstances": "ignoreNew",
             "triggerCount": 1,
             "principalLogonType": 3,
@@ -697,11 +699,64 @@ class ElevationBrokerRuntimeTests(unittest.TestCase):
             "securityLocked": security_locked,
         }
 
+    def test_limited_owner_task_can_prepare_persistent_scheduled_grant(self):
+        task = self._scheduled_task_row(
+            security_locked=False, run_level="limited"
+        )
+        with mock.patch.object(
+                broker_runtime, "_scheduled", return_value={
+                    "ok": True,
+                    "tasks": {r"\memos-guard": task},
+                }):
+            record = broker_runtime._prepare_keepalive_grant({
+                "appId": APP_ID,
+                "kind": "scheduledService",
+                "path": r"\Memos-Guard",
+            }, OWNER_SID)
+
+        self.assertEqual(record["kind"], "scheduledService")
+        self.assertEqual(record["path"], r"\Memos-Guard")
+        self.assertTrue(record["taskFingerprint"].startswith("sha256:"))
+        self.assertIs(record["taskSecurityLocked"], False)
+
     def test_scheduled_grant_rejects_user_writable_security_descriptor(self):
         with self.assertRaises(ValueError):
             broker_runtime._task_security_record(
-                self._scheduled_task_row(security_locked=False)
+                self._scheduled_task_row(security_locked=False), OWNER_SID
             )
+
+    def test_user_writable_limited_task_must_belong_to_broker_owner(self):
+        with self.assertRaises(ValueError):
+            broker_runtime._task_security_record(
+                self._scheduled_task_row(
+                    security_locked=False,
+                    run_level="limited",
+                    principal_sid="S-1-5-21-9-8-7-1001",
+                ),
+                OWNER_SID,
+            )
+
+    def test_locked_task_must_still_belong_to_broker_owner(self):
+        with self.assertRaises(ValueError):
+            broker_runtime._task_security_record(
+                self._scheduled_task_row(
+                    security_locked=True,
+                    run_level="highest",
+                    principal_sid="S-1-5-21-9-8-7-1001",
+                ),
+                OWNER_SID,
+            )
+
+    def test_locked_highest_owner_task_remains_supported(self):
+        record = broker_runtime._task_security_record(
+            self._scheduled_task_row(
+                security_locked=True, run_level="highest"
+            ),
+            OWNER_SID,
+        )
+
+        self.assertEqual(record["runLevel"], "highest")
+        self.assertIs(record["securityLocked"], True)
 
     def test_elevated_batch_manager_owns_one_exact_job_per_app(self):
         created = []
@@ -1112,7 +1167,7 @@ class ElevationBrokerRuntimeTests(unittest.TestCase):
         now = [0.0]
         task = self._scheduled_task_row()
         fingerprint = broker_runtime._canonical_digest(
-            broker_runtime._task_security_record(task)
+            broker_runtime._task_security_record(task, OWNER_SID)
         )
         record = {
             "kind": "scheduledService",
@@ -1147,6 +1202,63 @@ class ElevationBrokerRuntimeTests(unittest.TestCase):
 
         self.assertEqual(complete.call_count, 2)
         runtime.assert_called_once_with(r"\Memos-Guard", OWNER_SID)
+
+    def test_mutable_limited_task_rechecks_full_definition_before_run(self):
+        now = [0.0]
+        task = self._scheduled_task_row(
+            security_locked=False, run_level="limited"
+        )
+        fingerprint = broker_runtime._canonical_digest(
+            broker_runtime._task_security_record(task, OWNER_SID)
+        )
+        record = {
+            "kind": "scheduledService",
+            "path": r"\Memos-Guard",
+            "taskFingerprint": fingerprint,
+            "taskSecurityLocked": False,
+        }
+        drifted = self._scheduled_task_row(
+            security_locked=False, run_level="limited"
+        )
+        drifted["definitionFingerprint"] = "sha256:" + "c" * 64
+        drifted["actionDetails"][0]["path"] = r"C:\Fixtures\changed.exe"
+        queries = iter((task, drifted))
+        calls = []
+
+        def scheduled(request, _owner_sid):
+            calls.append(dict(request))
+            if request["operation"] == "query":
+                selected = next(queries)
+                return {
+                    "ok": True,
+                    "tasks": {r"\memos-guard": selected},
+                }
+            return {"ok": True}
+
+        executor = broker_runtime._KeepAliveGrantExecutor(
+            OWNER_SID, clock=lambda: now[0]
+        )
+        with mock.patch.object(
+                broker_runtime, "_scheduled", side_effect=scheduled), \
+                mock.patch.object(
+                    broker_runtime, "_scheduled_runtime", return_value={
+                        "ok": True,
+                        "tasks": {r"\memos-guard": {
+                            "path": r"\Memos-Guard",
+                            "state": "ready",
+                            "enabled": True,
+                        }},
+                    },
+                ) as runtime:
+            self.assertTrue(executor("query", record)["ok"])
+            now[0] = 1.0
+            with self.assertRaisesRegex(ValueError, "definition changed"):
+                executor("run", record)
+
+        runtime.assert_not_called()
+        self.assertEqual(
+            [call["operation"] for call in calls], ["query", "query"]
+        )
 
     def test_registry_write_failure_removes_temporary_file(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.object(
@@ -1235,6 +1347,16 @@ class ElevationBrokerRuntimeTests(unittest.TestCase):
                     Path(r"C:\Program Files\Unsafe"),
                     OWNER_SID,
                     directory=True,
+                )
+
+    def test_persistent_program_rejects_executable_outside_program_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            executable = Path(td) / "replaceable.exe"
+            executable.write_bytes(b"fixture")
+
+            with self.assertRaisesRegex(ValueError, "Program Files"):
+                broker_runtime._protected_program_fingerprint(
+                    str(executable), OWNER_SID
                 )
 
     def test_broker_queries_and_stops_only_normalized_scheduled_task_path(self):

@@ -771,12 +771,13 @@ def _task_security_record(
     principal_sid = str(task.get("principalSid") or "")
     run_level = str(task.get("runLevel") or "")
     security_locked = task.get("securityLocked")
-    # A mutable task is safe only when Task Scheduler will execute it with the
-    # broker owner's limited token. Highest/foreign tasks still require a
-    # privileged-writer-only descriptor so the grant cannot become elevation.
-    limited_to_owner = (
+    owner_matches = principal_sid.casefold() == owner_sid.casefold()
+    # Task Scheduler forbids a low-privilege writer from registering Highest
+    # or foreign-principal tasks. Highest tasks still need a locked descriptor;
+    # mutable tasks are accepted only for the broker owner's Limited context.
+    privilege_boundary_valid = (
         run_level == "limited"
-        and principal_sid.casefold() == owner_sid.casefold()
+        or (run_level == "highest" and security_locked is True)
     )
     if (task.get("actionCount") != 1 or len(action_details) != 1
             or action_details[0].get("type") != "exec"
@@ -784,8 +785,8 @@ def _task_security_record(
             or not isinstance(definition_fingerprint, str)
             or not isinstance(security_fingerprint, str)
             or (security_locked is not True and security_locked is not False)
-            or (security_locked is not True and not limited_to_owner)
-            or not principal_sid):
+            or not owner_matches
+            or not privilege_boundary_valid):
         raise ValueError(
             "persistent scheduled keep-alive requires one fully verified Exec task"
         )
@@ -953,13 +954,13 @@ def _prepare_keepalive_grant(
         task = (response.get("tasks") or {}).get(path.casefold())
         if not response.get("ok") or not isinstance(task, Mapping):
             raise ValueError("scheduled keep-alive target is unavailable")
+        security_record = _task_security_record(task, owner_sid)
         return {
             "appId": app_id.lower(),
             "kind": kind,
             "path": path,
-            "taskFingerprint": _canonical_digest(
-                _task_security_record(task, owner_sid)
-            ),
+            "taskFingerprint": _canonical_digest(security_record),
+            "taskSecurityLocked": security_record["securityLocked"],
         }
     raise ValueError("keep-alive grant resource is invalid")
 
@@ -1016,12 +1017,13 @@ class _KeepAliveGrantExecutor:
 
         if record.get("kind") == "scheduledService":
             path = str(record.get("path") or "")
+            mutable_task = record.get("taskSecurityLocked") is False
             key = (
                 "scheduled",
                 path.casefold(),
                 str(record.get("taskFingerprint") or ""),
             )
-            if self._cached(key, now):
+            if not mutable_task and self._cached(key, now):
                 queried = _scheduled_runtime(path, self.owner_sid)
             else:
                 queried = _scheduled(
@@ -1035,7 +1037,8 @@ class _KeepAliveGrantExecutor:
                 )
                 if task_fingerprint != record.get("taskFingerprint"):
                     raise ValueError("scheduled keep-alive task definition changed")
-                self._remember(key, now)
+                if not mutable_task:
+                    self._remember(key, now)
             task = (queried.get("tasks") or {}).get(path.casefold())
             if not queried.get("ok") or not isinstance(task, Mapping):
                 self._verified.pop(key, None)

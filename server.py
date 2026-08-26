@@ -7066,10 +7066,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         order = {i: n for n, i in enumerate(ids)}
 
+        class InvalidAppOrder(ValueError):
+            pass
+
         def op(c):
+            app_ids = {
+                app.get("id") for app in c["apps"] if isinstance(app, dict)
+            }
+            if len(order) != len(ids) or any(i not in app_ids for i in ids):
+                raise InvalidAppOrder
             c["apps"].sort(key=lambda a: order.get(a.get("id"), len(order)))
 
-        self.server.cfg.update(op)
+        try:
+            self.server.cfg.update(op)
+        except InvalidAppOrder:
+            self.send_err(400, "ids 必须是当前应用的唯一 ID")
+            return
         self.send_json({"ok": True})
 
     @serialized_app_operation

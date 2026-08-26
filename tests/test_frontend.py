@@ -804,6 +804,14 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("pointercancel', onCancel", source)
         self.assertNotIn("pointercancel', onUp", source)
 
+    def test_mobile_pointer_sorting_binds_one_owner_and_lost_capture(self):
+        source = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        self.assertIn("const pointerSortSession = new PointerSortSession()", source)
+        self.assertIn("pointerSortSession.reserve(pointerId)", source)
+        self.assertIn("drag.pointerId !== pointerId", source)
+        self.assertIn("lostpointercapture', onLostCapture", source)
+        self.assertIn("beginDrag(card, ev, pointerId)", source)
+
     def test_add_cards_stay_after_existing_cards(self):
         source = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
         for statement in (

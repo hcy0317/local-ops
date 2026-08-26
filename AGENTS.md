@@ -8,7 +8,7 @@
 - `localops/platform/` — macOS/Windows 原生边界；Windows 运行依赖只允许从 `requirements-windows.txt` 安装
 - `localops/windows/` — Windows runner、Job Object 和 HMAC/receipt 协议；runner 是每个 Job 的唯一长期句柄持有者，不写主配置
 - `localops/docker_resources.py` — Docker CLI 只读发现与精确资源控制；Compose 身份为 project/workingDir/configFiles，单容器身份为完整 64 位 ID，只允许 start/stop
-- `localops/elevation_broker.py` / `localops/windows/elevation_broker.py` — Windows 管理员程序代理的密码、会话、固定任务与 Named Pipe 协议；代理只能由冻结 onedir 经一次 UAC 安装，并负责对受保护程序的精确观察与停止
+- `localops/elevation_broker.py` / `localops/windows/elevation_broker.py` — Windows 管理员代理的密码、会话、固定任务与 Named Pipe 协议；代理只能由冻结 onedir 经一次 UAC 安装，负责受保护程序的精确观察/停止，并用独立 kill-on-close Job 承载一次性管理员批处理
 - `localops/windows/packaged_entry.py` — PyInstaller windowed 入口；同一冻结 executable 同时分派 console 与 runner，并在无标准流时绑定私有 `console.log`
 - `tools/build_windows.py` / `requirements-build-windows.txt` — Python 3.12、PyInstaller onedir/windowed/x64 的确定性 unsigned zip 构建、sidecar/manifest 生成与内容审计；构建依赖不进入源码运行时依赖
 - `static/index.html` / `static/app.js`（入口）/ `static/js/{core,launchpad,lifecycle,services,overlays,ports,widgets}.js`（原生 ES Modules，无构建）/ `static/icons.js` — 前端（原生，禁框架/CDN/构建）；`core.js` 承载工具/API/浮层/状态/主题注册，`lifecycle.js` 冻结 generation 意图并执行 fail-closed 状态判断，`launchpad.js` 卡片+拖拽+诊断+启动台 KPI/分区过滤，`services.js` 表格+监控 KPI 火花线，`overlays.js` 模态+抽屉，`ports.js` 端口归一化纯函数，`widgets.js` 右侧信息栏（实时动态/告警、TOP5、小贴士、快捷操作）与导航轨状态；模块间用 `window.__poll` 共享轮询入口
@@ -83,7 +83,7 @@
 - `GET /api/docker/resources` → `{ok, resources:[...]}`（按需调用本地 Docker CLI，返回 Compose 项目与任意单容器的精确身份；不修改 daemon）
 
 ### 启动台应用
-- `POST /api/apps` `{name, command, commandSpec?, cwd?, port?, emoji?, glyph?, kind?, attachPid?, dockerResource?, elevated?}` → app 对象（`kind` 缺省 `service`；task/program 强制 port=null；Docker 与计划任务/管理员程序互斥；服务监控来源可带 `attachPid`，后端先校验 PID/端口/UID/cwd，再将卡片与运行身份一次写入，失败不创建半成品卡片）
+- `POST /api/apps` `{name, command, commandSpec?, cwd?, port?, emoji?, glyph?, kind?, attachPid?, dockerResource?, elevated?}` → app 对象（`kind` 缺省 `service`；task/program 强制 port=null；Docker 与计划任务/管理员启动互斥；`kind=task,elevated=true` 只接受选择器生成的 reviewed direct/structured cmd/PowerShell，不接受 raw shell；服务监控来源可带 `attachPid`，后端先校验 PID/端口/UID/cwd，再将卡片与运行身份一次写入，失败不创建半成品卡片）
 - `POST /api/pick` `{what: "dir"|"script"}` → `{ok, path}` / `{ok, canceled:true}`（osascript 弹 macOS 原生目录/文件选择框；取消不是错误）
 - `POST /api/project/detect` `{cwd}` → `{ok, cwd, name, files, candidates:[{command,label,source,port,kind,detail}]}`（只读分析项目根目录，不执行项目代码；识别 package.json scripts 与包管理器锁文件、Hexo/Hugo/Jekyll、Django/FastAPI/Flask/Streamlit、Docker Compose、Go、Rust、常用启动脚本及纯静态站点。Hexo 无 scripts 时仍返回 `hexo s` 服务与 `hexo cl` 任务）
 - `POST /api/apps/reorder` `{ids: [...]}` → `{ok}`（按 ids 重排 apps 数组；Python sort 稳定，未涉及的 id 相对顺序不变，服务/任务两区可独立拖拽排序互不干扰）
@@ -129,7 +129,7 @@
 - **Docker 控制**：Compose 只调用精确 project/workingDir/configFiles 对应的 `up --detach` / `stop`，单容器只调用完整 ID 的 `container start` / `container stop`；不得 `down`、删除、prune 或按显示名控制。Windows 冻结 windowless 控制器调用 Docker CLI 时必须带 `CREATE_NO_WINDOW`，不得因 2 秒轮询反复创建可见 `cmd/conhost`。
 - **Windows 计划任务控制**：关联卡片的启动/停止分别调用 Task Scheduler COM `Run` / `Stop(0)`；启禁只设置精确注册项的 `Enabled`。Limited 控制器若被拒绝连接 COM，则已认证 broker v3 仅代理规范化路径的 list/query/run/stop/toggle/history 固定操作，写操作还要求当前浏览器 elevation，会话/CLI 不得借用。不得按 PID 结束进程，且不得修改触发器、动作、主体、运行级别、`MultipleInstances` 或注册；强制停止和重启保持禁用。日志读取 Operational 频道的结构化 XML，并与 Local Ops 操作审计和当前状态合并；频道关闭时由日志抽屉提供显式启用入口，未修改任务 action 或接管 stdout/stderr。
 - **Windows 程序观察与停止**：程序卡片观察同名 EXE；可读进程必须属于当前用户，真实路径等于所选 EXE 或位于其父目录内，带参数时还要匹配完整参数尾部。仅当全部命中实例同时具备当前用户 SID、完整 EXE 路径和创建时间时，状态返回 `programStopAvailable=true` 与 `observedProcesses[{pid,createTime}]`，前端确认后才允许停止；请求和平台边界都会复验该快照，拒绝 PID 复用、路径变化、其他用户或部分可验证的混合实例。Windows 完全隐藏 token/path/command line 时，仅接受当前会话内唯一、同名且无参数的候选用于只读观察，并标记 `observedRestricted`，不授予停止权限。程序观察仍不创建受管 Job 身份，也不提供 restart。
-- **Windows 管理员程序代理**：Task Scheduler 只注册固定 `\\LocalOps-ElevationBroker`，无触发器且 action 固定到 Program Files 中经哈希验证的冻结包。首次安装经 `runas` UAC；安装事务固定到 `%LOCALAPPDATA%\LocalOps\runtime\elevation-install`，不得跟随 `CONSOLE_DATA_DIR`。升级在新定义注册后精确停止旧 broker 实例，再由解锁启动新协议。安装请求路径与摘要必须复验。密码只保存 PBKDF2 verifier，Named Pipe 会话绑定实际客户端 PID/create-time/SID；broker token 只驻留控制器内存，浏览器的管理员授权另按 HttpOnly 会话隔离，任一失效都必须重新输入。代理只接受 absolute `.exe` + args[] + absolute cwd 并以 `shell=False` 启动；停止前先由代理观察并冻结当前用户 SID + 完整 EXE + creation-time 身份，再对请求中的全部实例复验后终止，不接受 force/restart。源码 checkout 不得安装 broker。
+- **Windows 管理员程序与批处理代理**：Task Scheduler 只注册固定 `\\LocalOps-ElevationBroker`，无触发器且 action 固定到 Program Files 中经哈希验证的冻结包。首次安装经 `runas` UAC；安装事务固定到 `%LOCALAPPDATA%\LocalOps\runtime\elevation-install`，不得跟随 `CONSOLE_DATA_DIR`。升级在新定义注册后精确停止旧 broker 实例，再由解锁启动新协议。安装请求路径与摘要必须复验。密码只保存 PBKDF2 verifier，Named Pipe 会话绑定实际客户端 PID/create-time/SID；broker token 只驻留控制器内存，浏览器的管理员授权另按 HttpOnly 会话隔离，任一失效都必须重新输入。程序收藏只接受 absolute `.exe` + args[] + absolute cwd 并以 `shell=False` 启动；停止前先由代理观察并冻结当前用户 SID + 完整 EXE + creation-time 身份，再对请求中的全部实例复验后终止，不接受 force/restart。管理员批处理只接受 structured `.bat/.cmd/.ps1`，或无参数、absolute local `.exe/.com`；禁止 raw shell 和带参数 direct，结构化脚本的 cmd/PowerShell 固定到经 owner/DACL/reparse 验证的系统绝对解释器，不读取任务 cwd、PATH 或 COMSPEC。每个 app 同时最多一个运行，由 broker 独占的随机命名 kill-on-close Job 承载，查询可跨交互 lock/控制器重启，启动和停止仍要求浏览器 elevation，broker 退出会终止任务且不留下高权限孤儿。管理员批处理不提供保活，stdout/stderr 不以高权限写入用户可替换日志路径，只记录控制审计与退出结果。源码 checkout 不得安装 broker。
 - **Windows 总控台权限边界**：常驻 `LocalOps-Console` 必须以 `RunLevel Limited` 运行受保护 `%ProgramFiles%` onedir 中的 `LocalOps.exe`。管理员 token 下的控制器必须拒绝创建普通受管 Job，防止普通服务继承管理员权限；不得把用户可写的 `server.py`、venv 或 `Highest` 任务作为常驻控制器。`tools/install_windows_console_task.ps1` 只接受 broker 保护目录中的冻结 EXE，激活升级时先等待旧任务实例离开 Running/Queued，再注册和启动新定义，并验证 Limited 注册结果。
 - **Windows 单实例锁**：每数据目录 Mutex 的安全属性必须显式 `bInheritHandle=False`；当前命名空间与旧版可继承锁隔离，避免仍运行的业务子进程在控制器退出后继续阻塞新版控制器。
 - **Tailscale 远程会话**：HTTP 服务仍只绑定 `127.0.0.1`。可选 Tailscale Serve 网关必须只监听回环、保留真实 Host/Origin/Referer、先按 Tailscale 用户身份过滤，再用 `%LOCALAPPDATA%\LocalOps\tailscale-proxy-secret` 的只读挂载覆盖 `X-LocalOps-Tailscale-Proxy-Authorization`。只有安全只读首请求可签发普通会话；跨站、错误密钥、缺身份和直接写请求全部 fail closed，管理员能力仍需浏览器内再次输入密码。禁止 Funnel/公网暴露。
@@ -167,7 +167,7 @@
 
 - 中文 UI，单页两视图（侧边导航：启动台 / 服务监控），每 2s 轮询 `/api/state`
 - 启动台按服务/程序收藏/批处理任务三区渲染；Docker 资源从 daemon 发现后收藏，管理员程序用 EXE 选择器和逐行参数输入，不接受 shell 文本
-- Windows 管理员启动首次安装提示一次 UAC；以后每个 Local Ops 进程只输入一次密码。锁定时卡片主按钮打开密码弹层，解锁后本进程内所有管理员程序可直接启动
+- Windows 管理员启动首次安装提示一次 UAC；以后每个 Local Ops 进程只输入一次密码。程序和批处理任务均可选择管理员代理；批处理必须先通过“选择脚本”生成结构化命令。锁定时卡片主按钮打开密码弹层，解锁后本进程内管理员程序与任务可直接启动
 - 添加服务时选择工作区文件夹后自动调用项目识别并展示候选命令；用户点选候选后再填入命令/端口。原有“选择脚本”与手动填写入口必须保留
 - 编辑运行中服务时，表单内立即显示“停止服务”；停止操作不得关闭编辑面板或清除已经填写的内容，停止后恢复普通“保存”
 - 批处理运行中显示实时耗时和「中止」入口；结束后明确显示成功/取消/失败/中止、距今时间与耗时。失败时突出日志入口；首次加载已有历史不重复提醒

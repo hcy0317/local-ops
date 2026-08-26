@@ -9,6 +9,7 @@ from .contracts import (
     CwdSnapshot,
     ElevationBrokerResult,
     ElevationBrokerStatus,
+    ElevatedTaskResult,
     ListenerSnapshot,
     ManagedActivation,
     ManagedInspection,
@@ -113,6 +114,18 @@ class FakePlatform:
     )
     elevation_launch_result: ElevationBrokerResult = field(
         default_factory=lambda: ElevationBrokerResult(False, "unsupported")
+    )
+    elevated_task_launch_result: ElevatedTaskResult = field(
+        default_factory=lambda: ElevatedTaskResult(True, found=True, running=True,
+                                                   process_id=4401, started_at=1000)
+    )
+    elevated_task_query_result: ElevatedTaskResult = field(
+        default_factory=lambda: ElevatedTaskResult(True)
+    )
+    elevated_task_stop_result: ElevatedTaskResult = field(
+        default_factory=lambda: ElevatedTaskResult(True, found=True, running=False,
+                                                   exit_code=130, completed_at=2000,
+                                                   manually_stopped=True)
     )
     elevated_processes: ProcessSnapshot = field(
         default_factory=lambda: ProcessSnapshot(status=ScanStatus.OK)
@@ -343,6 +356,23 @@ class FakePlatform:
             cwd: str | None) -> ElevationBrokerResult:
         self.calls.append(("launch_elevated", (command_spec, cwd)))
         return self.elevation_launch_result
+
+    def launch_elevated_task(
+            self, app_id: str, command_spec: Mapping[str, object],
+            cwd: str) -> ElevatedTaskResult:
+        self.calls.append((
+            "launch_elevated_task", (app_id, command_spec, cwd)
+        ))
+        return self.elevated_task_launch_result
+
+    def query_elevated_task(self, app_id: str) -> ElevatedTaskResult:
+        self.calls.append(("query_elevated_task", app_id))
+        return self.elevated_task_query_result
+
+    def stop_elevated_task(self, app_id: str) -> ElevatedTaskResult:
+        self.calls.append(("stop_elevated_task", app_id))
+        self.elevated_task_query_result = self.elevated_task_stop_result
+        return self.elevated_task_stop_result
 
     def observe_elevated(
             self, command_spec: Mapping[str, object],

@@ -202,6 +202,7 @@ class BrokerSessionTests(unittest.TestCase):
         self.observations = []
         self.stops = []
         self.scheduled = []
+        self.elevated_tasks = []
         self.alive = {(1200, 77.25, "S-1-5-21-1-2-3-1001")}
         self.record = new_password_record(
             "correct horse battery staple",
@@ -231,8 +232,77 @@ class BrokerSessionTests(unittest.TestCase):
             scheduled=lambda request: self.scheduled.append(request) or {
                 "ok": True, "operation": request["operation"],
             },
+            elevated_task_launch=lambda request: (
+                self.elevated_tasks.append(("launch", request)) or {
+                    "ok": True, "appId": request["appId"], "running": True,
+                    "pid": 4401, "startedAt": 1000,
+                }
+            ),
+            elevated_task_query=lambda app_id: (
+                self.elevated_tasks.append(("query", app_id)) or {
+                    "ok": True, "appId": app_id, "found": True,
+                    "running": True, "pid": 4401, "startedAt": 1000,
+                }
+            ),
+            elevated_task_stop=lambda app_id: (
+                self.elevated_tasks.append(("stop", app_id)) or {
+                    "ok": True, "appId": app_id, "running": False,
+                    "exitCode": 130, "completedAt": 2000,
+                }
+            ),
+            grant_client_valid=lambda pid, created: (
+                pid, created
+            ) == (1200, 77.25),
             token_factory=lambda: "session-token",
         )
+
+    def test_elevated_batch_launch_query_and_stop_have_separate_authority(self):
+        request = {
+            "appId": "deadbeef",
+            "commandSpec": {
+                "version": 1, "mode": "direct",
+                "executable": r"C:\Tools\backup.exe", "args": ["--once"],
+                "shell": None, "text": None, "needsReview": False,
+            },
+            "cwd": r"C:\Tools",
+        }
+        rejected = self.protocol.handle({
+            "action": "elevated-task-launch", "request": request,
+        }, client_pid=1200)
+        self.assertEqual(rejected["code"], "BROKER_SESSION_INVALID")
+
+        self.protocol.handle({
+            "action": "unlock", "password": "correct horse battery staple",
+            "consolePid": 1200, "consoleCreateTime": 77.25,
+        }, client_pid=1200)
+        launched = self.protocol.handle({
+            "action": "elevated-task-launch", "token": "session-token",
+            "request": request,
+        }, client_pid=1200)
+        self.assertTrue(launched["ok"])
+
+        self.protocol.handle({
+            "action": "lock", "token": "session-token",
+        }, client_pid=1200)
+        queried = self.protocol.handle({
+            "action": "elevated-task-query", "appId": "deadbeef",
+            "clientCreateTime": 77.25,
+        }, client_pid=1200)
+        self.assertTrue(queried["running"])
+        stopped_while_locked = self.protocol.handle({
+            "action": "elevated-task-stop", "appId": "deadbeef",
+        }, client_pid=1200)
+        self.assertEqual(stopped_while_locked["code"], "BROKER_SESSION_INVALID")
+
+        self.protocol.handle({
+            "action": "unlock", "password": "correct horse battery staple",
+            "consolePid": 1200, "consoleCreateTime": 77.25,
+        }, client_pid=1200)
+        stopped = self.protocol.handle({
+            "action": "elevated-task-stop", "token": "session-token",
+            "appId": "deadbeef",
+        }, client_pid=1200)
+        self.assertEqual(stopped["exitCode"], 130)
 
     def test_scheduled_task_request_requires_bound_token_and_exact_operation(self):
         self.protocol.handle({

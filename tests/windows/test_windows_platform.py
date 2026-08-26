@@ -752,6 +752,48 @@ class WindowsPlatformTests(unittest.TestCase):
         public_config.assert_called_once_with()
         scheduled.assert_called_once_with({BROKER_TASK_PATH})
 
+    def test_elevated_batch_platform_uses_session_for_mutation_only(self):
+        self.platform._elevation_token = "session-token"
+        process = mock.Mock()
+        process.create_time.return_value = 88.5
+        responses = [
+            {"ok": True, "found": True, "running": True,
+             "pid": 4401, "startedAt": 1000},
+            {"ok": True, "found": True, "running": True,
+             "pid": 4401, "startedAt": 1000},
+            {"ok": True, "found": True, "running": False,
+             "exitCode": 130, "completedAt": 2000,
+             "manuallyStopped": True},
+        ]
+        spec = {
+            "version": 1, "mode": "direct",
+            "executable": r"C:\Tools\backup.exe", "args": [],
+            "shell": None, "text": None, "needsReview": False,
+        }
+        with mock.patch.object(
+                self.platform, "_ensure_keep_alive_broker_running"), \
+                mock.patch.object(
+                    windows_adapter.psutil, "Process", return_value=process
+                ), mock.patch.object(
+                    self.platform, "_broker_exchange", side_effect=responses
+                ) as exchange:
+            launched = self.platform.launch_elevated_task(
+                "deadbeef", spec, r"C:\Tools"
+            )
+            queried = self.platform.query_elevated_task("deadbeef")
+            stopped = self.platform.stop_elevated_task("deadbeef")
+
+        self.assertTrue(launched.running)
+        self.assertTrue(queried.running)
+        self.assertTrue(stopped.manually_stopped)
+        launch_message = exchange.call_args_list[0].args[0]
+        query_message = exchange.call_args_list[1].args[0]
+        stop_message = exchange.call_args_list[2].args[0]
+        self.assertEqual(launch_message["token"], "session-token")
+        self.assertNotIn("token", query_message)
+        self.assertEqual(query_message["clientCreateTime"], 88.5)
+        self.assertEqual(stop_message["token"], "session-token")
+
     def test_executable_icon_uses_fixed_script_and_returns_png(self):
         png = b"\x89PNG\r\n\x1a\nfixture"
         completed = SimpleNamespace(

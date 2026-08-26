@@ -20,6 +20,7 @@ from .contracts import (
     CwdSnapshot,
     ElevationBrokerResult,
     ElevationBrokerStatus,
+    ElevatedTaskResult,
     InstanceLock,
     LaunchRequest,
     ListenerSnapshot,
@@ -562,6 +563,29 @@ class MacOSPlatform:
         return ElevationBrokerResult(
             False, "Windows elevation broker is unavailable on macOS",
             "UNSUPPORTED_PLATFORM",
+        )
+
+    @staticmethod
+    def launch_elevated_task(
+            app_id: str, command_spec: Mapping[str, object],
+            cwd: str) -> ElevatedTaskResult:
+        return ElevatedTaskResult(
+            False, error="Windows elevation broker is unavailable on macOS",
+            code="UNSUPPORTED_PLATFORM",
+        )
+
+    @staticmethod
+    def query_elevated_task(app_id: str) -> ElevatedTaskResult:
+        return ElevatedTaskResult(
+            False, error="Windows elevation broker is unavailable on macOS",
+            code="UNSUPPORTED_PLATFORM",
+        )
+
+    @staticmethod
+    def stop_elevated_task(app_id: str) -> ElevatedTaskResult:
+        return ElevatedTaskResult(
+            False, error="Windows elevation broker is unavailable on macOS",
+            code="UNSUPPORTED_PLATFORM",
         )
 
     @staticmethod

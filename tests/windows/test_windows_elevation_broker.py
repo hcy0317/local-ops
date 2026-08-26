@@ -7,10 +7,11 @@ from unittest import mock
 
 import server
 from localops.elevation_broker import broker_install_request_digest
-from localops.command_spec import direct_command_spec
+from localops.command_spec import command_spec_for_executable, direct_command_spec
 from localops.platform.contracts import (
     ElevationBrokerResult,
     ElevationBrokerStatus,
+    ElevatedTaskResult,
     PlatformCapabilities,
     Principal,
     ProcessSnapshot,
@@ -30,6 +31,9 @@ else:
 APP_ID = "deadbeef"
 OWNER_SID = "S-1-5-21-100-200-300-1001"
 EXECUTABLE = r"C:\Tools\AdminTool.exe"
+SYSTEM32 = Path(
+    broker_runtime.os.environ.get("SystemRoot") or r"C:\Windows"
+) / "System32" if broker_runtime is not None else Path(r"C:\Windows\System32")
 
 
 def program_app():
@@ -475,6 +479,114 @@ class ElevationBrokerHttpTests(unittest.TestCase):
             "launch_elevated", (program_app()["commandSpec"], r"C:\Tools"),
         ), self.platform.calls)
 
+    def test_elevated_batch_uses_broker_job_and_preserves_task_outcome(self):
+        task = program_app()
+        task.update({
+            "name": "Admin backup",
+            "kind": "task",
+            "command": "whoami.exe",
+            "commandSpec": direct_command_spec(str(SYSTEM32 / "whoami.exe")),
+            "cwd": str(SYSTEM32),
+            "lastExit": {"status": "succeeded", "code": 0, "at": 10},
+        })
+        self.harness.cfg.update(
+            lambda data: data.__setitem__("apps", [task])
+        )
+        self.unlock_browser_session()
+
+        with mock.patch.object(server, "inspect_app_health", return_value={
+            "status": "ok", "blocking": False, "issues": [],
+        }):
+            status, started, _ = self.harness.request(
+                "POST", "/api/apps/deadbeef/start",
+                {"expectedGeneration": None}, self.headers,
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(started["ok"])
+        self.assertIn(
+            "launch_elevated_task", [call[0] for call in self.platform.calls]
+        )
+
+        self.platform.elevated_task_query_result = ElevatedTaskResult(
+            True, found=True, running=True, process_id=4401,
+            create_time=1000.25, started_at=1000,
+        )
+        status, state, _ = self.harness.request(
+            "GET", "/api/state", headers=self.headers,
+        )
+        self.assertEqual(status, 200)
+        row = state["apps"][0]
+        self.assertEqual(row["runtimeSource"], "windowsElevationBrokerTask")
+        self.assertTrue(row["running"])
+        self.assertEqual(row["lastExit"]["status"], "succeeded")
+
+        status, stopped, _ = self.harness.request(
+            "POST", "/api/apps/deadbeef/stop",
+            {"expectedGeneration": None, "force": False}, self.headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(stopped["ok"])
+        self.assertEqual(
+            self.harness.cfg.snapshot()["apps"][0]["lastExit"]["status"],
+            "stopped",
+        )
+
+    def test_elevated_batch_reconciler_persists_natural_failure(self):
+        task = program_app()
+        task.update({
+            "kind": "task",
+            "commandSpec": direct_command_spec(str(SYSTEM32 / "whoami.exe")),
+            "cwd": str(SYSTEM32),
+        })
+        self.harness.cfg.update(
+            lambda data: data.__setitem__("apps", [task])
+        )
+        self.platform.elevated_task_query_result = ElevatedTaskResult(
+            True, found=True, running=False, process_id=4401,
+            started_at=1000, completed_at=3500, exit_code=7,
+        )
+
+        server.reconcile_elevated_task_results(self.harness.cfg)
+
+        last_exit = self.harness.cfg.snapshot()["apps"][0]["lastExit"]
+        self.assertEqual(last_exit["status"], "failed")
+        self.assertEqual(last_exit["code"], 7)
+        self.assertEqual(last_exit["durationSec"], 2.5)
+
+    def test_running_elevated_batch_must_stop_before_card_delete(self):
+        task = program_app()
+        task.update({
+            "kind": "task",
+            "commandSpec": direct_command_spec(str(SYSTEM32 / "whoami.exe")),
+            "cwd": str(SYSTEM32),
+        })
+        self.harness.cfg.update(
+            lambda data: data.__setitem__("apps", [task])
+        )
+        self.platform.elevated_task_query_result = ElevatedTaskResult(
+            True, found=True, running=True, process_id=4401,
+            create_time=1000.25, started_at=1000,
+        )
+
+        status, body, _ = self.harness.request(
+            "DELETE", "/api/apps/deadbeef",
+            {"expectedGeneration": None}, self.headers,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(body["code"], "ELEVATION_SESSION_REQUIRED")
+        self.unlock_browser_session()
+        status, body, _ = self.harness.request(
+            "DELETE", "/api/apps/deadbeef",
+            {"expectedGeneration": None}, self.headers,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(self.harness.cfg.snapshot()["apps"], [])
+        self.assertIn(
+            "stop_elevated_task", [call[0] for call in self.platform.calls]
+        )
+
     def test_owned_elevated_program_stop_requires_exact_observed_processes(self):
         self.platform.stop_result = StopResult(True)
         self.unlock_browser_session()
@@ -590,6 +702,361 @@ class ElevationBrokerRuntimeTests(unittest.TestCase):
             broker_runtime._task_security_record(
                 self._scheduled_task_row(security_locked=False)
             )
+
+    def test_elevated_batch_manager_owns_one_exact_job_per_app(self):
+        created = []
+
+        class FakeRun:
+            def __init__(self, app_id, run_id, owner_sid, invocation, cwd):
+                self.app_id = app_id
+                self.running = True
+                self.closed = False
+                created.append((app_id, run_id, owner_sid, invocation, cwd))
+
+            def result(self):
+                return {
+                    "ok": True, "appId": self.app_id, "found": True,
+                    "running": self.running, "pid": 4401,
+                    "startedAt": 1000,
+                    "completedAt": None if self.running else 2000,
+                    "exitCode": None if self.running else 130,
+                }
+
+            def stop(self):
+                self.running = False
+                return self.result()
+
+            def close(self):
+                self.closed = True
+
+        manager = broker_runtime._ElevatedBatchTaskManager(
+            OWNER_SID, run_factory=FakeRun
+        )
+        with tempfile.TemporaryDirectory() as td:
+            request = {
+                "appId": APP_ID,
+                "commandSpec": direct_command_spec(
+                    str(SYSTEM32 / "whoami.exe")
+                ),
+                "cwd": td,
+            }
+            launched = manager.launch(request)
+            duplicate = manager.launch(request)
+
+        self.assertTrue(launched["running"])
+        self.assertEqual(
+            duplicate["code"], "BROKER_ELEVATED_TASK_ALREADY_RUNNING"
+        )
+        self.assertTrue(manager.query(APP_ID)["running"])
+        self.assertFalse(manager.stop(APP_ID)["running"])
+        self.assertEqual(created[0][0], APP_ID)
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(ValueError):
+                manager.launch({
+                    "appId": APP_ID,
+                    "commandSpec": {
+                        "version": 1, "mode": "powershell",
+                        "executable": None, "args": [],
+                        "shell": "powershell.exe",
+                        "text": "Remove-Item C:\\*", "needsReview": False,
+                    },
+                    "cwd": td,
+                })
+            with self.assertRaises(ValueError):
+                manager.launch({
+                    "appId": APP_ID,
+                    "commandSpec": direct_command_spec(
+                        "cmd.exe", ["/c", "Remove-Item C:\\*"]
+                    ),
+                    "cwd": td,
+                })
+            for interpreter in (
+                    "bash.exe", "powershell_ise.exe", "pythonw.exe"):
+                with self.subTest(interpreter=interpreter), \
+                        self.assertRaises(ValueError):
+                    manager.launch({
+                        "appId": APP_ID,
+                        "commandSpec": direct_command_spec(
+                            str(SYSTEM32 / interpreter), ["-c", "exit 0"]
+                        ),
+                        "cwd": td,
+                    })
+
+    def test_elevated_batch_uses_fixed_system_interpreters_not_cwd_or_path(self):
+        owner_sid = broker_runtime._owner_sid(broker_runtime.os.getpid())
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake_cmd = root / "cmd.exe"
+            fake_powershell = root / "powershell.exe"
+            cmd_script = root / "task.cmd"
+            ps_script = root / "task.ps1"
+            fake_cmd.write_bytes(b"not a system interpreter")
+            fake_powershell.write_bytes(b"not a system interpreter")
+            cmd_script.write_text("@exit /b 0\r\n", encoding="utf-8")
+            ps_script.write_text("exit 0\r\n", encoding="utf-8")
+            hostile_environment = {
+                "PATH": td,
+                "COMSPEC": str(fake_cmd),
+            }
+            with mock.patch.dict(
+                    broker_runtime.os.environ,
+                    hostile_environment,
+                    clear=False):
+                _, cmd_invocation, _ = (
+                    broker_runtime._prepare_elevated_task_request({
+                        "appId": APP_ID,
+                        "commandSpec": command_spec_for_executable(
+                            str(cmd_script), platform_name="windows"
+                        ),
+                        "cwd": td,
+                    }, owner_sid)
+                )
+                _, powershell_invocation, _ = (
+                    broker_runtime._prepare_elevated_task_request({
+                        "appId": APP_ID,
+                        "commandSpec": command_spec_for_executable(
+                            str(ps_script), platform_name="windows"
+                        ),
+                        "cwd": td,
+                    }, owner_sid)
+                )
+
+        windows = Path(broker_runtime.win32api.GetWindowsDirectory())
+        self.assertEqual(
+            Path(cmd_invocation["executable"]).resolve(),
+            (windows / "System32" / "cmd.exe").resolve(),
+        )
+        self.assertEqual(
+            Path(powershell_invocation["executable"]).resolve(),
+            (windows / "System32" / "WindowsPowerShell" / "v1.0"
+             / "powershell.exe").resolve(),
+        )
+
+    def test_elevated_batch_assign_failure_terminates_suspended_process(self):
+        job = mock.Mock()
+        job.assign.side_effect = OSError("fixture assign failure")
+        process_handle = mock.Mock(name="process_handle")
+        thread_handle = mock.Mock(name="thread_handle")
+        with mock.patch.object(
+                broker_runtime, "native_process_command",
+                return_value=(str(SYSTEM32 / "whoami.exe"), "whoami.exe")), \
+                mock.patch.object(
+                    broker_runtime.win32process, "CreateProcess",
+                    return_value=(process_handle, thread_handle, 4401, 0)), \
+                mock.patch.object(broker_runtime, "OwnedJob", return_value=job), \
+                mock.patch.object(
+                    broker_runtime.win32process, "TerminateProcess"
+                ) as terminate_process, \
+                mock.patch.object(broker_runtime.win32api, "CloseHandle"):
+            with self.assertRaisesRegex(OSError, "assign failure"):
+                broker_runtime._ElevatedBatchRun(
+                    APP_ID, "f" * 32, OWNER_SID,
+                    [str(SYSTEM32 / "whoami.exe")], str(SYSTEM32),
+                )
+
+        terminate_process.assert_called_once_with(process_handle, 1)
+        job.close.assert_called_once_with()
+
+    def test_elevated_batch_closes_first_stream_if_second_open_fails(self):
+        input_stream = mock.Mock()
+        with mock.patch.object(
+                broker_runtime, "native_process_command",
+                return_value=(str(SYSTEM32 / "whoami.exe"), "whoami.exe")), \
+                mock.patch(
+                    "builtins.open",
+                    side_effect=[input_stream, OSError("fixture open failure")],
+                ):
+            with self.assertRaisesRegex(OSError, "open failure"):
+                broker_runtime._ElevatedBatchRun(
+                    APP_ID, "f" * 32, OWNER_SID,
+                    [str(SYSTEM32 / "whoami.exe")], str(SYSTEM32),
+                )
+
+        input_stream.close.assert_called_once_with()
+
+    def test_elevated_batch_closes_streams_if_handle_conversion_fails(self):
+        input_stream = mock.Mock()
+        output_stream = mock.Mock()
+        input_stream.fileno.return_value = 101
+        output_stream.fileno.return_value = 102
+        msvcrt = __import__("msvcrt")
+        with mock.patch.object(
+                broker_runtime, "native_process_command",
+                return_value=(str(SYSTEM32 / "whoami.exe"), "whoami.exe")), \
+                mock.patch(
+                    "builtins.open", side_effect=[input_stream, output_stream]
+                ), \
+                mock.patch.object(
+                    msvcrt, "get_osfhandle",
+                    side_effect=[1001, OSError("fixture handle failure")],
+                ), \
+                mock.patch.object(
+                    broker_runtime.os, "set_handle_inheritable"
+                ) as set_inheritable:
+            with self.assertRaisesRegex(OSError, "handle failure"):
+                broker_runtime._ElevatedBatchRun(
+                    APP_ID, "f" * 32, OWNER_SID,
+                    [str(SYSTEM32 / "whoami.exe")], str(SYSTEM32),
+                )
+
+        set_inheritable.assert_not_called()
+        input_stream.close.assert_called_once_with()
+        output_stream.close.assert_called_once_with()
+
+    def test_elevated_batch_restores_first_inheritable_handle_on_failure(self):
+        input_stream = mock.Mock()
+        output_stream = mock.Mock()
+        input_stream.fileno.return_value = 101
+        output_stream.fileno.return_value = 102
+        calls = []
+
+        def set_inheritable(handle, inheritable):
+            calls.append((handle, inheritable))
+            if handle == 1002 and inheritable:
+                raise OSError("fixture inheritable failure")
+
+        msvcrt = __import__("msvcrt")
+        with mock.patch.object(
+                broker_runtime, "native_process_command",
+                return_value=(str(SYSTEM32 / "whoami.exe"), "whoami.exe")), \
+                mock.patch(
+                    "builtins.open", side_effect=[input_stream, output_stream]
+                ), \
+                mock.patch.object(
+                    msvcrt, "get_osfhandle", side_effect=[1001, 1002]
+                ), \
+                mock.patch.object(
+                    broker_runtime.os, "set_handle_inheritable",
+                    side_effect=set_inheritable,
+                ), \
+                mock.patch.object(
+                    broker_runtime.win32process, "CreateProcess"
+                ) as create_process:
+            with self.assertRaisesRegex(OSError, "inheritable failure"):
+                broker_runtime._ElevatedBatchRun(
+                    APP_ID, "f" * 32, OWNER_SID,
+                    [str(SYSTEM32 / "whoami.exe")], str(SYSTEM32),
+                )
+
+        self.assertEqual(calls, [
+            (1001, True), (1002, True), (1001, False),
+        ])
+        create_process.assert_not_called()
+        input_stream.close.assert_called_once_with()
+        output_stream.close.assert_called_once_with()
+
+    def test_elevated_batch_capacity_prunes_terminal_records_first(self):
+        class FakeRun:
+            def __init__(self, app_id, run_id, owner_sid, invocation, cwd):
+                self.app_id = app_id
+                self.closed = False
+
+            def result(self):
+                return {
+                    "ok": True, "appId": self.app_id, "found": True,
+                    "running": False, "completedAt": int(self.app_id, 16),
+                    "exitCode": 0,
+                }
+
+            def close(self):
+                self.closed = True
+
+        manager = broker_runtime._ElevatedBatchTaskManager(
+            OWNER_SID, run_factory=FakeRun
+        )
+        manager.runs = {
+            f"{index:08x}": FakeRun(
+                f"{index:08x}", "f" * 32, OWNER_SID, [], str(SYSTEM32)
+            )
+            for index in range(256)
+        }
+        launched = manager.launch({
+            "appId": "fffffffe",
+            "commandSpec": direct_command_spec(str(SYSTEM32 / "whoami.exe")),
+            "cwd": str(SYSTEM32),
+        })
+
+        self.assertTrue(launched["ok"])
+        self.assertIn("fffffffe", manager.runs)
+        self.assertEqual(len(manager.runs), 256)
+
+    def test_elevated_batch_capacity_rejects_only_when_all_records_run(self):
+        class ActiveRun:
+            def __init__(self, app_id):
+                self.app_id = app_id
+
+            def result(self):
+                return {
+                    "ok": True, "appId": self.app_id, "found": True,
+                    "running": True, "completedAt": None,
+                }
+
+            def close(self):
+                raise AssertionError("active record must not be pruned")
+
+        manager = broker_runtime._ElevatedBatchTaskManager(OWNER_SID)
+        manager.runs = {
+            f"{index:08x}": ActiveRun(f"{index:08x}")
+            for index in range(256)
+        }
+        refused = manager.launch({
+            "appId": "fffffffe",
+            "commandSpec": direct_command_spec(str(SYSTEM32 / "whoami.exe")),
+            "cwd": str(SYSTEM32),
+        })
+
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["code"], "BROKER_ELEVATED_TASK_CAPACITY")
+
+    def test_elevated_batch_manager_runs_and_stops_fixture_job(self):
+        owner_sid = broker_runtime._owner_sid(broker_runtime.os.getpid())
+        manager = broker_runtime._ElevatedBatchTaskManager(owner_sid)
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "wait.cmd"
+            script.write_text(
+                "@ping.exe 127.0.0.1 -n 31 >nul\r\n",
+                encoding="utf-8",
+            )
+            launched = manager.launch({
+                "appId": APP_ID,
+                "commandSpec": command_spec_for_executable(
+                    str(script), platform_name="windows"
+                ),
+                "cwd": td,
+            })
+            try:
+                self.assertTrue(launched["running"])
+                self.assertTrue(manager.query(APP_ID)["running"])
+            finally:
+                stopped = manager.stop(APP_ID)
+
+        self.assertFalse(stopped["running"])
+        self.assertEqual(stopped["exitCode"], 130)
+
+    def test_elevated_batch_manager_reports_fixture_exit_code(self):
+        owner_sid = broker_runtime._owner_sid(broker_runtime.os.getpid())
+        manager = broker_runtime._ElevatedBatchTaskManager(owner_sid)
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "fail.cmd"
+            script.write_text("@exit /b 7\r\n", encoding="utf-8")
+            manager.launch({
+                "appId": APP_ID,
+                "commandSpec": command_spec_for_executable(
+                    str(script), platform_name="windows"
+                ),
+                "cwd": td,
+            })
+            deadline = broker_runtime.time.monotonic() + 5.0
+            while broker_runtime.time.monotonic() < deadline:
+                result = manager.query(APP_ID)
+                if not result["running"]:
+                    break
+                broker_runtime.time.sleep(0.02)
+            else:
+                self.fail("fixture task did not exit")
+
+        self.assertEqual(result["exitCode"], 7)
+        self.assertIsNotNone(result["completedAt"])
 
     def test_client_image_attestation_cache_is_bounded_by_file_and_ttl(self):
         now = [0.0]

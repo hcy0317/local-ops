@@ -9,6 +9,7 @@ from .contracts import (
     CwdSnapshot,
     ElevationBrokerResult,
     ElevationBrokerStatus,
+    ElevatedTaskResult,
     ListenerSnapshot,
     ManagedInspection,
     ManagedRuntime,
@@ -177,6 +178,23 @@ class UnsupportedPlatform:
             self, command_spec: Mapping[str, object], cwd: str | None,
     ) -> ElevationBrokerResult:
         return ElevationBrokerResult(False, self._issue.message, self._issue.code)
+
+    def launch_elevated_task(
+            self, app_id: str, command_spec: Mapping[str, object],
+            cwd: str) -> ElevatedTaskResult:
+        return ElevatedTaskResult(
+            False, error=self._issue.message, code=self._issue.code
+        )
+
+    def query_elevated_task(self, app_id: str) -> ElevatedTaskResult:
+        return ElevatedTaskResult(
+            False, error=self._issue.message, code=self._issue.code
+        )
+
+    def stop_elevated_task(self, app_id: str) -> ElevatedTaskResult:
+        return ElevatedTaskResult(
+            False, error=self._issue.message, code=self._issue.code
+        )
 
     def observe_elevated(
             self, command_spec: Mapping[str, object],

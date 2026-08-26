@@ -114,6 +114,21 @@ class ElevationBrokerResult:
 
 
 @dataclass(frozen=True)
+class ElevatedTaskResult:
+    ok: bool
+    found: bool = False
+    running: bool = False
+    process_id: int | None = None
+    create_time: float | None = None
+    started_at: int | None = None
+    completed_at: int | None = None
+    exit_code: int | None = None
+    manually_stopped: bool = False
+    error: str | None = None
+    code: str | None = None
+
+
+@dataclass(frozen=True)
 class PickResult:
     path: str | None = None
     canceled: bool = False
@@ -333,6 +348,11 @@ class PlatformBackend(Protocol):
     def launch_elevated(
         self, command_spec: Mapping[str, object], cwd: str | None,
     ) -> ElevationBrokerResult: ...
+    def launch_elevated_task(
+        self, app_id: str, command_spec: Mapping[str, object], cwd: str,
+    ) -> ElevatedTaskResult: ...
+    def query_elevated_task(self, app_id: str) -> ElevatedTaskResult: ...
+    def stop_elevated_task(self, app_id: str) -> ElevatedTaskResult: ...
     def observe_elevated(
         self, command_spec: Mapping[str, object], cwd: str | None,
     ) -> ProcessSnapshot: ...

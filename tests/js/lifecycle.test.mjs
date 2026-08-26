@@ -68,6 +68,36 @@ test('running Windows scheduled task is controllable without a managed generatio
   assert.equal(snapshot.canDelete, true);
 });
 
+test('running elevated batch task is controllable without a managed generation', () => {
+  const snapshot = lifecycleSnapshot({
+    lifecycleStatus: 'running',
+    controlAvailable: true,
+    running: true,
+    runtimeIdentity: null,
+    runtimeSource: 'windowsElevationBrokerTask',
+    deleteAvailable: true,
+  }, 'windows');
+
+  assert.equal(snapshot.expectedGeneration, null);
+  assert.equal(snapshot.canManage, true);
+  assert.equal(snapshot.canDelete, true);
+});
+
+test('elevated batch task query failure keeps deletion fail closed', () => {
+  const snapshot = lifecycleSnapshot({
+    lifecycleStatus: 'unknown',
+    controlAvailable: false,
+    deleteAvailable: false,
+    running: false,
+    runtimeIdentity: null,
+    runtimeSource: 'windowsElevationBrokerTask',
+  }, 'windows');
+
+  assert.equal(snapshot.canStart, false);
+  assert.equal(snapshot.canManage, false);
+  assert.equal(snapshot.canDelete, false);
+});
+
 test('running Docker resource is controllable without a managed generation', () => {
   for (const runtimeSource of ['dockerCompose', 'dockerContainer']) {
     const snapshot = lifecycleSnapshot({

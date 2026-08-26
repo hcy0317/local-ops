@@ -430,6 +430,16 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("closeBrokerPassword", app)
         self.assertIn("$('#brokerPasswordMask').classList.contains('open')", app)
 
+    def test_batch_tasks_can_request_structured_administrator_launch(self):
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        lifecycle = (ROOT / "static/js/lifecycle.js").read_text(encoding="utf-8")
+        self.assertIn("program || task", overlays)
+        self.assertIn("modalKind === 'task' && fElevated.checked", overlays)
+        self.assertIn("&& fElevated.checked && !externalResourceMode()", overlays)
+        self.assertIn("windowsElevationBrokerTask", launchpad)
+        self.assertIn("windowsElevationBrokerTask", lifecycle)
+
     def test_program_ui_uses_direct_program_wording(self):
         sources = [
             (ROOT / "static/index.html").read_text(encoding="utf-8"),

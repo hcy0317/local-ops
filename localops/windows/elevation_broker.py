@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import ntpath
 import os
 from pathlib import Path
 import re
@@ -12,6 +13,7 @@ import shutil
 import secrets
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from typing import Mapping, Sequence
@@ -41,10 +43,22 @@ from localops.elevation_broker import (
     normalize_elevated_launch,
     normalize_elevated_stop,
     normalize_scheduled_request,
+    normalize_elevated_task_command_spec,
     make_keepalive_registry,
     validate_keepalive_registry,
 )
-from localops.windows.runner_protocol import decode_message, encode_message
+from localops.command_spec import (
+    is_local_windows_path,
+    prepared_invocation,
+    resolve_windows_executable,
+)
+from localops.windows.job_object import OwnedJob
+from localops.windows.runner_protocol import (
+    decode_message,
+    encode_message,
+    native_process_command,
+    validate_app_id,
+)
 
 
 _SYSTEM_SID = "S-1-5-18"
@@ -802,7 +816,7 @@ def _reject_user_writable(
     )
     dacl = descriptor.GetSecurityDescriptorDacl()
     write_mask = (
-        ntsecuritycon.FILE_GENERIC_WRITE
+        win32con.GENERIC_WRITE
         | ntsecuritycon.FILE_WRITE_DATA
         | ntsecuritycon.FILE_APPEND_DATA
         | ntsecuritycon.FILE_ADD_FILE
@@ -1171,6 +1185,329 @@ def _keepalive_client_valid(
         return False
 
 
+def _trusted_system_interpreter(mode: str, owner_sid: str) -> str:
+    if mode == "cmd":
+        relative = ("System32", "cmd.exe")
+    elif mode == "powershell":
+        relative = (
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+        )
+    else:
+        raise ValueError("elevated task interpreter mode is invalid")
+    windows = Path(win32api.GetWindowsDirectory())
+    expected = windows.joinpath(*relative)
+    expected_absolute = os.path.normcase(os.path.abspath(expected))
+    resolved = os.path.normcase(os.path.realpath(expected))
+    if (not expected.is_file() or expected.is_symlink()
+            or resolved != expected_absolute):
+        raise ValueError("elevated task system interpreter is unavailable")
+    cursor = windows
+    if (cursor.is_symlink()
+            or win32api.GetFileAttributes(
+                str(cursor)) & win32con.FILE_ATTRIBUTE_REPARSE_POINT):
+        raise ValueError(
+            "elevated task system interpreter path contains a reparse point"
+        )
+    _reject_user_writable(
+        cursor,
+        owner_sid,
+        directory=True,
+        allow_root_creator_owner=True,
+    )
+    for part in relative:
+        cursor /= part
+        if (cursor.is_symlink()
+                or win32api.GetFileAttributes(
+                    str(cursor)) & win32con.FILE_ATTRIBUTE_REPARSE_POINT):
+            raise ValueError(
+                "elevated task system interpreter path contains a reparse point"
+            )
+        _reject_user_writable(
+            cursor,
+            owner_sid,
+            directory=cursor != expected,
+            allow_root_creator_owner=cursor != expected,
+        )
+    return os.path.abspath(expected)
+
+
+def _prepare_elevated_task_request(
+        value: Mapping[str, object],
+        owner_sid: str) -> tuple[str, object, str]:
+    if set(value) != {"appId", "commandSpec", "cwd"}:
+        raise ValueError("elevated task request shape is invalid")
+    app_id = validate_app_id(value.get("appId"))
+    cwd_value = value.get("cwd")
+    if (not isinstance(cwd_value, str) or not ntpath.isabs(cwd_value)
+            or not is_local_windows_path(cwd_value)
+            or not os.path.isdir(cwd_value)):
+        raise ValueError("elevated task working directory is invalid")
+    cwd = os.path.abspath(cwd_value)
+    spec = normalize_elevated_task_command_spec(value.get("commandSpec"))
+    if spec.get("mode") in {"cmd", "powershell"}:
+        script = spec.get("executable")
+        if (not isinstance(script, str) or not ntpath.isabs(script)
+                or not is_local_windows_path(script) or not os.path.isfile(script)):
+            raise ValueError("elevated task script is unavailable")
+    mode = str(spec.get("mode") or "")
+    if mode in {"cmd", "powershell"}:
+        interpreter = _trusted_system_interpreter(mode, owner_sid)
+        environment = dict(os.environ)
+        if mode == "cmd":
+            environment["COMSPEC"] = interpreter
+        invocation = prepared_invocation(spec, env=environment)
+        if not isinstance(invocation, Mapping):
+            raise ValueError("elevated task structured invocation is invalid")
+        invocation = {**invocation, "executable": interpreter}
+    else:
+        invocation = prepared_invocation(spec)
+        executable = str(invocation[0])
+        resolved = resolve_windows_executable(
+            executable, env=os.environ, cwd=cwd
+        )
+        if resolved is None:
+            raise ValueError("elevated task executable is unavailable")
+        invocation = [resolved, *invocation[1:]]
+    native_process_command(invocation)
+    return app_id, invocation, cwd
+
+
+class _ElevatedBatchRun:
+    def __init__(
+            self, app_id: str, run_id: str, owner_sid: str,
+            invocation: object, cwd: str):
+        self.app_id = app_id
+        self.run_id = run_id
+        self.owner_sid = owner_sid
+        self.started_at = int(time.time() * 1000)
+        self.completed_at: int | None = None
+        self.exit_code: int | None = None
+        self.manually_stopped = False
+        self.process_handle = None
+        self.process_id: int | None = None
+        self.create_time: float | None = None
+        self.job: OwnedJob | None = None
+        self._start(invocation, cwd)
+
+    def _start(self, invocation: object, cwd: str) -> None:
+        application, command_line = native_process_command(invocation)
+        input_stream = output_stream = None
+        input_handle = output_handle = None
+        input_inheritable = output_inheritable = False
+        process_handle = thread_handle = None
+        job = None
+        try:
+            input_stream = open(os.devnull, "rb", buffering=0)
+            output_stream = open(os.devnull, "ab", buffering=0)
+            msvcrt = __import__("msvcrt")
+            input_handle = int(msvcrt.get_osfhandle(input_stream.fileno()))
+            output_handle = int(msvcrt.get_osfhandle(output_stream.fileno()))
+            os.set_handle_inheritable(input_handle, True)
+            input_inheritable = True
+            os.set_handle_inheritable(output_handle, True)
+            output_inheritable = True
+            startup = win32process.STARTUPINFO()
+            startup.dwFlags = (
+                win32con.STARTF_USESTDHANDLES
+                | win32con.STARTF_USESHOWWINDOW
+            )
+            startup.wShowWindow = win32con.SW_HIDE
+            startup.hStdInput = input_handle
+            startup.hStdOutput = output_handle
+            startup.hStdError = output_handle
+            process_handle, thread_handle, pid, _ = win32process.CreateProcess(
+                application,
+                command_line,
+                None,
+                None,
+                True,
+                win32process.CREATE_SUSPENDED
+                | win32process.CREATE_NEW_PROCESS_GROUP
+                | win32process.CREATE_UNICODE_ENVIRONMENT
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                None,
+                cwd,
+                startup,
+            )
+            job = OwnedJob(
+                "Local\\LocalOps-ElevatedBatch-" + self.run_id,
+                self.owner_sid,
+            )
+            job.assign(process_handle)
+            created = float(
+                win32process.GetProcessTimes(process_handle)["CreationTime"].timestamp()
+            )
+            previous = int(win32process.ResumeThread(thread_handle))
+            if previous != 1:
+                raise OSError("elevated task suspended count is invalid")
+            win32api.CloseHandle(thread_handle)
+            thread_handle = None
+            self.process_handle = process_handle
+            self.process_id = int(pid)
+            self.create_time = created
+            self.job = job
+        except Exception:
+            if process_handle is not None:
+                try:
+                    win32process.TerminateProcess(process_handle, 1)
+                except pywintypes.error:
+                    pass
+            if job is not None:
+                try:
+                    job.terminate(1)
+                except Exception:
+                    pass
+                job.close()
+            if thread_handle is not None:
+                win32api.CloseHandle(thread_handle)
+            if process_handle is not None:
+                win32api.CloseHandle(process_handle)
+            raise
+        finally:
+            if input_inheritable and input_handle is not None:
+                try:
+                    os.set_handle_inheritable(input_handle, False)
+                except OSError:
+                    pass
+            if output_inheritable and output_handle is not None:
+                try:
+                    os.set_handle_inheritable(output_handle, False)
+                except OSError:
+                    pass
+            if input_stream is not None:
+                input_stream.close()
+            if output_stream is not None:
+                output_stream.close()
+
+    def _refresh(self) -> None:
+        if self.completed_at is not None or self.job is None:
+            return
+        if self.job.members():
+            return
+        code = None
+        if self.process_handle is not None:
+            try:
+                code = int(win32process.GetExitCodeProcess(self.process_handle))
+            except pywintypes.error:
+                code = None
+            win32api.CloseHandle(self.process_handle)
+            self.process_handle = None
+        self.job.close()
+        self.job = None
+        self.exit_code = None if code == win32con.STILL_ACTIVE else code
+        self.completed_at = int(time.time() * 1000)
+
+    def result(self) -> dict[str, object]:
+        self._refresh()
+        return {
+            "ok": True,
+            "appId": self.app_id,
+            "found": True,
+            "running": self.completed_at is None,
+            "pid": self.process_id,
+            "createTime": self.create_time,
+            "startedAt": self.started_at,
+            "completedAt": self.completed_at,
+            "exitCode": self.exit_code,
+            "manuallyStopped": self.manually_stopped,
+        }
+
+    def stop(self) -> dict[str, object]:
+        self._refresh()
+        if self.job is not None:
+            self.job.terminate(130)
+            if not self.job.wait_empty(5.0):
+                raise OSError("elevated task Job did not stop")
+            self.exit_code = 130
+            self.manually_stopped = True
+            self.completed_at = int(time.time() * 1000)
+            if self.process_handle is not None:
+                win32api.CloseHandle(self.process_handle)
+                self.process_handle = None
+            self.job.close()
+            self.job = None
+        return self.result()
+
+    def close(self) -> None:
+        if self.job is not None:
+            self.job.close()
+            self.job = None
+        if self.process_handle is not None:
+            win32api.CloseHandle(self.process_handle)
+            self.process_handle = None
+
+
+class _ElevatedBatchTaskManager:
+    def __init__(self, owner_sid: str, *, run_factory=None):
+        self.owner_sid = owner_sid
+        self.run_factory = run_factory or _ElevatedBatchRun
+        self.runs: dict[str, object] = {}
+        self.lock = threading.RLock()
+
+    def _prune(self, maximum: int) -> None:
+        terminal = []
+        for app_id, run in self.runs.items():
+            result = run.result()
+            if not result["running"]:
+                terminal.append((int(result.get("completedAt") or 0), app_id))
+        while len(self.runs) > maximum and terminal:
+            _, app_id = min(terminal)
+            terminal = [item for item in terminal if item[1] != app_id]
+            old = self.runs.pop(app_id)
+            old.close()
+
+    def launch(self, request: Mapping[str, object]) -> dict[str, object]:
+        app_id, invocation, cwd = _prepare_elevated_task_request(
+            request, self.owner_sid
+        )
+        with self.lock:
+            previous = self.runs.get(app_id)
+            if previous is not None and previous.result()["running"]:
+                return {
+                    "ok": False,
+                    "code": "BROKER_ELEVATED_TASK_ALREADY_RUNNING",
+                    "error": "the elevated batch task is already running",
+                }
+            if previous is None:
+                self._prune(255)
+                if len(self.runs) >= 256:
+                    return {
+                        "ok": False,
+                        "code": "BROKER_ELEVATED_TASK_CAPACITY",
+                        "error": "too many elevated batch task records",
+                    }
+            if previous is not None:
+                previous.close()
+            run_id = uuid.uuid4().hex
+            run = self.run_factory(
+                app_id, run_id, self.owner_sid, invocation, cwd
+            )
+            self.runs[app_id] = run
+            return run.result()
+
+    def query(self, app_id: str) -> dict[str, object]:
+        app_id = validate_app_id(app_id)
+        with self.lock:
+            run = self.runs.get(app_id)
+            if run is None:
+                return {
+                    "ok": True, "appId": app_id,
+                    "found": False, "running": False,
+                }
+            return run.result()
+
+    def stop(self, app_id: str) -> dict[str, object]:
+        app_id = validate_app_id(app_id)
+        with self.lock:
+            run = self.runs.get(app_id)
+            if run is None:
+                return {
+                    "ok": True, "appId": app_id,
+                    "found": False, "running": False,
+                }
+            return run.stop()
+
+
 def serve() -> int:
     _verify_broker_data_ancestors(require_localops=True)
     expected_owner_sid = _owner_sid(os.getpid())
@@ -1192,6 +1529,7 @@ def serve() -> int:
     )
     revision_box = [revision]
     grant_executor = _KeepAliveGrantExecutor(owner_sid)
+    elevated_task_manager = _ElevatedBatchTaskManager(owner_sid)
     executable_sha256 = str(public.get("executableSha256") or "")
     client_image_attestation = _BoundedClientImageAttestation(
         owner_sid, executable_sha256
@@ -1229,6 +1567,9 @@ def serve() -> int:
             pid, created, owner_sid, executable_sha256,
             image_valid=client_image_attestation,
         ),
+        elevated_task_launch=elevated_task_manager.launch,
+        elevated_task_query=elevated_task_manager.query,
+        elevated_task_stop=elevated_task_manager.stop,
         grant_records=grants,
         persist_grants=persist_grants,
     )

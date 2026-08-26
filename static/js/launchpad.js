@@ -14,6 +14,12 @@ import { configuredPort, actualPorts, hasPortMismatch,
   preferredOpenPort, displayedPorts, portIsOpenable } from './ports.js';
 import { lifecyclePayload, lifecycleSnapshot, runLifecycleMutation } from './lifecycle.js';
 import { normalizeHostCpuPercent } from './metrics.js';
+import {
+  insertBeforePinnedAddCard,
+  PointerSortSession,
+  pointerSortIntent,
+  TOUCH_SORT_HOLD_MS,
+} from './sortable.js';
 
 const svcGrid = $('#svcGrid'), taskGrid = $('#taskGrid');
 const programGrid = $('#programGrid');
@@ -1093,8 +1099,9 @@ appDiagLogs.addEventListener('click', () => {
 });
 
 /* ---------------- 卡片拖拽排序（pointer 实现：滑块式跟手 + 虚线占位） ---------------- */
-let drag = null;  // { card, ph, grid, dx, dy, originIndex }
+let drag = null;  // { card, ph, grid, dx, dy, originIndex, pointerId }
 let keyboardSort = null;  // { card, grid, originalIds }
+const pointerSortSession = new PointerSortSession();
 const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 function gridAppCards(grid) {
@@ -1152,32 +1159,106 @@ function cardPointerDown(e) {
   if (e.target.closest('button')) return;   // 按钮上不触发拖拽
   const card = e.currentTarget;
   const sx = e.clientX, sy = e.clientY;
+  const pointerId = e.pointerId;
+  if (!pointerSortSession.reserve(pointerId)) return;
+  const pointerType = e.pointerType || 'mouse';
+  const startedAt = performance.now();
+  let lastX = sx, lastY = sy;
+  let holdTimer = null;
+  let captured = false;
   const clearListeners = () => {
+    if (holdTimer !== null) clearTimeout(holdTimer);
+    holdTimer = null;
     window.removeEventListener('pointermove', onMove);
     window.removeEventListener('pointerup', onUp);
     window.removeEventListener('pointercancel', onCancel);
+    card.removeEventListener('lostpointercapture', onLostCapture);
+  };
+  const releaseTouchPointer = () => {
+    card.removeEventListener('lostpointercapture', onLostCapture);
+    if (captured && card.releasePointerCapture) {
+      try {
+        if (!card.hasPointerCapture || card.hasPointerCapture(pointerId)) {
+          card.releasePointerCapture(pointerId);
+        }
+      } catch (error) { /* pointer capture 已失效 */ }
+    }
+    captured = false;
+  };
+  const finishPointerSession = () => {
+    clearListeners();
+    releaseTouchPointer();
+    pointerSortSession.release(pointerId);
+  };
+  const captureTouchPointer = () => {
+    if (pointerType !== 'touch' || !card.setPointerCapture) return;
+    try {
+      card.setPointerCapture(pointerId);
+      captured = !card.hasPointerCapture || card.hasPointerCapture(pointerId);
+      card.addEventListener('lostpointercapture', onLostCapture);
+    } catch (error) { /* pointer 已结束 */ }
+  };
+  const beginTrackedDrag = ev => {
+    if (!pointerSortSession.activate(pointerId) || drag || keyboardSort) {
+      finishPointerSession();
+      return;
+    }
+    beginDrag(card, ev, pointerId);
+    captureTouchPointer();
   };
   const onMove = ev => {
+    if (!pointerSortSession.owns(ev.pointerId)) return;
+    lastX = ev.clientX;
+    lastY = ev.clientY;
     if (!drag) {
-      if (Math.abs(ev.clientX - sx) + Math.abs(ev.clientY - sy) < 6) return;  // 点击阈值
-      beginDrag(card, ev);
+      const intent = pointerSortIntent(
+        pointerType, ev.clientX - sx, ev.clientY - sy,
+        performance.now() - startedAt);
+      if (intent === 'wait') return;
+      if (intent === 'cancel') { finishPointerSession(); return; }
+      beginTrackedDrag(ev);
     }
+    if (!drag || drag.pointerId !== pointerId) return;
+    if (pointerType === 'touch' && ev.cancelable) ev.preventDefault();
     moveDrag(ev);
   };
-  const onUp = () => {
-    clearListeners();
-    if (drag) endDrag();
+  const onUp = ev => {
+    if (!pointerSortSession.owns(ev.pointerId)) return;
+    if (drag && drag.pointerId === pointerId) endDrag();
+    finishPointerSession();
   };
-  const onCancel = () => {
+  const onCancel = ev => {
+    if (!pointerSortSession.owns(ev.pointerId)) return;
     clearListeners();
-    if (drag) cancelPointerDrag();
+    if (drag && drag.pointerId === pointerId) cancelPointerDrag();
+    releaseTouchPointer();
+    pointerSortSession.release(pointerId);
   };
-  window.addEventListener('pointermove', onMove);
+  const onLostCapture = ev => {
+    if (!pointerSortSession.owns(ev.pointerId)) return;
+    clearListeners();
+    captured = false;
+    if (drag && drag.pointerId === pointerId) cancelPointerDrag();
+    pointerSortSession.release(pointerId);
+  };
+  window.addEventListener('pointermove', onMove, { passive: false });
   window.addEventListener('pointerup', onUp);
   window.addEventListener('pointercancel', onCancel);
+  if (pointerType === 'touch') {
+    holdTimer = setTimeout(() => {
+      holdTimer = null;
+      if (!pointerSortSession.owns(pointerId)) return;
+      if (drag || keyboardSort) { finishPointerSession(); return; }
+      const intent = pointerSortIntent(
+        pointerType, lastX - sx, lastY - sy, TOUCH_SORT_HOLD_MS);
+      if (intent === 'start') beginTrackedDrag({
+        clientX: lastX, clientY: lastY, pointerId,
+      });
+    }, TOUCH_SORT_HOLD_MS);
+  }
 }
 
-function beginDrag(card, e) {
+function beginDrag(card, e, pointerId) {
   const grid = card.parentNode;
   const rect = card.getBoundingClientRect();
   const originIndex = gridAppCards(grid).indexOf(card);
@@ -1198,6 +1279,7 @@ function beginDrag(card, e) {
   document.body.classList.add('dragging-on');
   drag = {
     card, ph, grid, originIndex,
+    pointerId,
     dx: e.clientX - rect.left,
     dy: e.clientY - rect.top,
   };
@@ -1206,6 +1288,7 @@ function beginDrag(card, e) {
 
 function moveDrag(e) {
   const d = drag;
+  if (!d || e.pointerId !== d.pointerId) return;
   d.card.style.transform =
     'translate(' + (e.clientX - d.dx) + 'px,' + (e.clientY - d.dy) + 'px)';
   const hit = document.elementFromPoint(e.clientX, e.clientY);
@@ -1221,10 +1304,9 @@ function moveDrag(e) {
       flip(d.grid, () => d.grid.insertBefore(d.ph, ref));
     }
   } else if (over && d.grid.contains(over)) {
-    /* 添加卡上 → 网格末尾。添加卡被 prepend 到网格首位，
-       insertBefore(d.ph, over) 会把卡片插到首位，与“末尾”意图相反。 */
-    if (d.ph !== d.grid.lastChild) {
-      flip(d.grid, () => d.grid.appendChild(d.ph));
+    /* 添加卡是固定尾锚点；占位框只能停在它前面。 */
+    if (d.ph.nextSibling !== over) {
+      flip(d.grid, () => insertBeforePinnedAddCard(d.grid, d.ph));
     }
   }
 }
@@ -1243,7 +1325,7 @@ function cancelPointerDrag() {
   const remaining = gridAppCards(d.grid);
   const anchor = remaining[d.originIndex] || null;
   if (anchor) d.grid.insertBefore(d.card, anchor);
-  else d.grid.appendChild(d.card);
+  else insertBeforePinnedAddCard(d.grid, d.card);
   d.ph.remove();
   resetPointerDragCard(d);
   d.card.focus({ preventScroll: true });
@@ -1344,7 +1426,7 @@ function finishKeyboardSort(commit) {
       .map(card => [card.dataset.key, card]));
     for (const id of session.originalIds) {
       const card = byId.get(id);
-      if (card) session.grid.appendChild(card);
+      if (card) insertBeforePinnedAddCard(session.grid, card);
     }
   }
   session.card.classList.remove('keyboard-sorting');

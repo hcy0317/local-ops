@@ -952,6 +952,19 @@ class StateMutationEndpointTests(unittest.TestCase):
             [app["id"] for app in self.h.cfg.snapshot()["apps"]],
             ["cccc0003", "bbbb0002", "aaaa0001"])
 
+        before_invalid = self.h.cfg.snapshot()
+        for ids in (
+                ["addSvcCard", "not-an-app"],
+                ["aaaa0001", "aaaa0001"],
+        ):
+            status, body, _ = self.h.request(
+                "POST", "/api/apps/reorder",
+                json.dumps({"ids": ids}), headers,
+            )
+            self.assertEqual(status, 400)
+            self.assertFalse(body["ok"])
+            self.assertEqual(self.h.cfg.snapshot(), before_invalid)
+
     def test_managed_service_can_arm_and_disarm_persisted_keep_alive(self):
         headers = {"Content-Type": "application/json"}
         path = "/api/apps/aaaa0001/keep-alive"

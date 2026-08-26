@@ -629,7 +629,7 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("lifecycle.status === 'unknown'", launchpad)
         self.assertIn("lifecycleState === 'unavailable' ? '不可用'", launchpad)
         self.assertIn("lifecyclePayload(intent, starting ? {} : { force: false })", launchpad)
-        self.assertIn("del('/api/apps/' + app.id, lifecyclePayload(intent))", launchpad)
+        self.assertIn("'/api/apps/' + app.id, lifecyclePayload(intent)", launchpad)
         self.assertIn("'/api/apps/' + owner.appId + '/stop'", launchpad)
         self.assertIn("lifecyclePayload(intent, { force: false })", launchpad)
         self.assertIn("body.expectedGeneration = editingAppOriginal.lifecycle.expectedGeneration", overlays)

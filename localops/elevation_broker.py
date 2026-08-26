@@ -14,6 +14,12 @@ import subprocess
 import time
 from typing import Callable, Mapping
 
+from localops.command_spec import (
+    CommandSpecError,
+    is_local_windows_path,
+    normalize_command_spec,
+)
+
 
 PASSWORD_RECORD_SCHEMA = "localops-elevation-password.v1"
 DEFAULT_PBKDF2_ITERATIONS = 600_000
@@ -23,6 +29,44 @@ BROKER_PUBLIC_SCHEMA = "localops-elevation-broker.v1"
 BROKER_INSTALL_SCHEMA = "localops-elevation-install.v1"
 KEEPALIVE_REGISTRY_SCHEMA = "localops-elevation-keepalive-registry.v1"
 _SID_RE = re.compile(r"^S-\d(?:-\d+)+$", re.IGNORECASE)
+_ELEVATED_TASK_DENIED_DIRECT = re.compile(
+    r"(?:cmd|powershell(?:_ise)?|pwsh|(?:ba|z|c|k)?sh|wsl|busybox|"
+    r"py|pythonw?(?:\d+(?:\.\d+)*)?|node|ruby|perl|php|"
+    r"wscript|cscript|mshta|rundll32)\.exe\Z",
+    re.IGNORECASE,
+)
+
+
+def normalize_elevated_task_command_spec(value: object) -> dict[str, object]:
+    spec = normalize_command_spec(value)
+    mode = spec.get("mode")
+    executable = spec.get("executable")
+    if (spec.get("needsReview") is True or mode == "legacy-posix"
+            or spec.get("text") is not None or mode not in {
+                "direct", "cmd", "powershell",
+            } or not isinstance(executable, str)):
+        raise CommandSpecError(
+            "elevated task requires a reviewed structured command"
+        )
+    if (mode in {"cmd", "powershell"}
+            and (not ntpath.isabs(executable)
+                 or not is_local_windows_path(executable))):
+        raise CommandSpecError(
+            "elevated task script must use an absolute local path"
+        )
+    if mode == "direct":
+        if (ntpath.splitext(executable)[1].casefold() not in {".exe", ".com"}
+                or spec.get("args") or not ntpath.isabs(executable)
+                or not is_local_windows_path(executable)):
+            raise CommandSpecError(
+                "elevated task direct mode requires an absolute local EXE or "
+                "COM without arguments"
+            )
+        if _ELEVATED_TASK_DENIED_DIRECT.fullmatch(ntpath.basename(executable)):
+            raise CommandSpecError(
+                "elevated task direct mode cannot use a command interpreter"
+            )
+    return spec
 
 
 def broker_install_request_digest(request: Mapping[str, object]) -> str:
@@ -364,6 +408,9 @@ class ElevationBrokerProtocol:
             grant_prepare: Callable[[Mapping[str, object]], dict[str, object]] | None = None,
             grant_execute: Callable[[str, Mapping[str, object]], dict[str, object]] | None = None,
             grant_client_valid: Callable[[int, float], bool] | None = None,
+            elevated_task_launch: Callable[[Mapping[str, object]], dict[str, object]] | None = None,
+            elevated_task_query: Callable[[str], dict[str, object]] | None = None,
+            elevated_task_stop: Callable[[str], dict[str, object]] | None = None,
             grant_records: Mapping[str, object] | None = None,
             persist_grants: Callable[[Mapping[str, object]], None] | None = None):
         _record_values(password_record)
@@ -383,6 +430,9 @@ class ElevationBrokerProtocol:
         self._grant_client_valid = grant_client_valid or (
             lambda _pid, _created: False
         )
+        self._elevated_task_launch = elevated_task_launch
+        self._elevated_task_query = elevated_task_query
+        self._elevated_task_stop = elevated_task_stop
         self._persist_grants = persist_grants or (lambda _records: None)
         self._grants = self._normalize_grants(grant_records or {})
         pending_cutoff = time.time() - 3600.0
@@ -662,16 +712,66 @@ class ElevationBrokerProtocol:
                     "ok": False, "code": "BROKER_KEEPALIVE_ACTION_FAILED",
                     "error": str(exc),
                 }
+        if action == "elevated-task-query":
+            if not self._grant_caller_valid(message, client_pid):
+                return {"ok": False, "code": "BROKER_ELEVATED_TASK_CLIENT_INVALID"}
+            app_id = message.get("appId")
+            if (not isinstance(app_id, str)
+                    or not re.fullmatch(r"[0-9a-fA-F]{8}", app_id)
+                    or self._elevated_task_query is None):
+                return {"ok": False, "code": "BROKER_ELEVATED_TASK_INVALID"}
+            try:
+                response = self._elevated_task_query(app_id.lower())
+                if not isinstance(response, dict) or "ok" not in response:
+                    raise ValueError("elevated task query response is invalid")
+                return response
+            except (OSError, TypeError, ValueError) as exc:
+                return {
+                    "ok": False, "code": "BROKER_ELEVATED_TASK_QUERY_FAILED",
+                    "error": str(exc),
+                }
         if not self._authorized(message, client_pid):
             return {"ok": False, "code": "BROKER_SESSION_INVALID"}
+        if action == "elevated-task-launch":
+            if self._elevated_task_launch is None:
+                return {"ok": False, "code": "BROKER_ELEVATED_TASK_UNSUPPORTED"}
+            try:
+                request = message.get("request")
+                if not isinstance(request, Mapping):
+                    raise ValueError("elevated task launch request is invalid")
+                response = self._elevated_task_launch(request)
+                if not isinstance(response, dict) or "ok" not in response:
+                    raise ValueError("elevated task launch response is invalid")
+                return response
+            except (OSError, TypeError, ValueError) as exc:
+                return {
+                    "ok": False, "code": "BROKER_ELEVATED_TASK_LAUNCH_FAILED",
+                    "error": str(exc),
+                }
+        if action == "elevated-task-stop":
+            app_id = message.get("appId")
+            if (not isinstance(app_id, str)
+                    or not re.fullmatch(r"[0-9a-fA-F]{8}", app_id)
+                    or self._elevated_task_stop is None):
+                return {"ok": False, "code": "BROKER_ELEVATED_TASK_INVALID"}
+            try:
+                response = self._elevated_task_stop(app_id.lower())
+                if not isinstance(response, dict) or "ok" not in response:
+                    raise ValueError("elevated task stop response is invalid")
+                return response
+            except (OSError, TypeError, ValueError) as exc:
+                return {
+                    "ok": False, "code": "BROKER_ELEVATED_TASK_STOP_FAILED",
+                    "error": str(exc),
+                }
         if action == "status":
             return {
                 "ok": True,
                 "unlocked": True,
-                "protocolVersion": 4,
+                "protocolVersion": 5,
                 "capabilities": [
                     "launch", "observe", "stop", "scheduled",
-                    "keepalive-grants",
+                    "keepalive-grants", "elevated-batch-tasks",
                 ],
             }
         if action == "launch":

@@ -322,13 +322,16 @@ function syncScheduledTaskMode({ inferKind = false } = {}) {
   const docker = selectedDockerResource();
   const external = scheduled || !!docker;
   const program = modalKind === 'program';
+  const elevatedTask = modalKind === 'task' && fElevated.checked
+    && currentPlatform() === 'windows' && !external;
   const wasExternal = fCmd.readOnly;
   cwdField.hidden = external;
   detectPanel.hidden = external || detectPanel.hidden;
   btnPickScript.hidden = external;
-  btnDetectProject.hidden = external || program;
-  fCmd.readOnly = external || program;
+  btnDetectProject.hidden = external || program || elevatedTask;
+  fCmd.readOnly = external || program || elevatedTask;
   if (scheduled) {
+    fElevated.checked = false;
     fCwd.value = '';
     fPort.value = '';
     fCmd.value = scheduledTaskCommand(path);
@@ -337,6 +340,7 @@ function syncScheduledTaskMode({ inferKind = false } = {}) {
     if (!fName.value.trim() && row) fName.value = row.name || row.path || '';
     if (inferKind && row && row.state === 'running') setModalKind('service');
   } else if (docker) {
+    fElevated.checked = false;
     fCwd.value = docker.kind === 'compose' ? docker.workingDir || '' : '';
     fPort.value = '';
     fCmd.value = dockerResourceCommand(docker);
@@ -352,6 +356,8 @@ function syncScheduledTaskMode({ inferKind = false } = {}) {
   }
   setText(fCmdLabel, scheduled ? '计划任务入口' : docker ? 'Docker 启动入口'
     : modalKind === 'task' ? '执行命令' : '启动命令');
+  elevatedField.hidden = !(program || modalKind === 'task') || external
+    || currentPlatform() !== 'windows';
   portField.hidden = external || modalKind !== 'service';
   fPort.disabled = external || modalKind !== 'service';
   refreshEditSaveMode();
@@ -593,8 +599,10 @@ function modalLifecycleChanged() {
     (fCwd.value.trim() || null) !== (editingAppOriginal.cwd || null) ||
     currentPort !== (editingAppOriginal.port == null ? null : editingAppOriginal.port) ||
     modalKind !== (editingAppOriginal.kind || 'service') ||
-    (modalKind === 'program' && fElevated.checked !== editingAppOriginal.elevated) ||
-    (modalKind === 'program' && JSON.stringify(selectedCommandSpec) !==
+    ((modalKind === 'program' || modalKind === 'task')
+      && fElevated.checked !== editingAppOriginal.elevated) ||
+    ((modalKind === 'program' || (modalKind === 'task' && fElevated.checked))
+      && JSON.stringify(selectedCommandSpec) !==
       JSON.stringify(editingAppOriginal.commandSpec)) ||
     selectedScheduledTaskPath() !== (editingAppOriginal.scheduledTaskPath || null) ||
     dockerResourceKey(selectedDockerResource()) !==
@@ -657,15 +665,19 @@ function setModalKind(kind) {
     b.setAttribute('aria-pressed', String(active));
   });
   const program = modalKind === 'program';
+  const task = modalKind === 'task';
+  const elevatedTask = task && fElevated.checked
+    && currentPlatform() === 'windows' && !externalResourceMode();
   scheduledTaskField.hidden = program || currentPlatform() !== 'windows'
     || !hasCapability('monitor_scheduled_tasks');
   dockerResourceField.hidden = program || !hasCapability('monitor_docker');
   programArgsField.hidden = !program;
-  elevatedField.hidden = !program || currentPlatform() !== 'windows';
+  elevatedField.hidden = !(program || task) || externalResourceMode()
+    || currentPlatform() !== 'windows';
   portField.hidden = modalKind !== 'service' || externalResourceMode();
   fPort.disabled = modalKind !== 'service' || externalResourceMode();
-  fCmd.readOnly = externalResourceMode() || program;
-  btnDetectProject.hidden = program || externalResourceMode();
+  fCmd.readOnly = externalResourceMode() || program || elevatedTask;
+  btnDetectProject.hidden = program || elevatedTask || externalResourceMode();
   btnPickScript.hidden = externalResourceMode();
   setText(btnPickScript, program ? '选择 EXE' : '选择脚本…');
   setText(fCmdLabel, scheduledTaskMode() ? '计划任务入口'
@@ -720,14 +732,16 @@ export function openAppModal(app, presetKind, focusAction = '') {
   const programArgs = app && app.commandSpec && app.commandSpec.mode === 'direct'
     && Array.isArray(app.commandSpec.args) ? app.commandSpec.args : [];
   fProgramArgs.value = programArgs.join('\n');
-  fElevated.checked = app ? app.elevated === true : currentPlatform() === 'windows';
+  const initialKind = presetKind || (app && app.kind) || 'service';
+  fElevated.checked = app ? app.elevated === true
+    : initialKind === 'program' && currentPlatform() === 'windows';
   scheduledTaskField.hidden = currentPlatform() !== 'windows'
     || !hasCapability('monitor_scheduled_tasks');
   dockerResourceField.hidden = !hasCapability('monitor_docker');
   renderScheduledTaskOptions((app && app.scheduledTaskPath) || '');
   renderDockerResourceOptions((app && app.dockerResource) || null);
   [fName, fCmd, fCwd, fPort].forEach(clearFieldError);
-  setModalKind(presetKind || (app && app.kind) || 'service');
+  setModalKind(initialKind);
   syncScheduledTaskMode();
   appearanceDetails.open = !!(app && (app.icon || app.glyph));
   syncGlyphGrid();
@@ -978,6 +992,14 @@ async function saveApp() {
       args: fProgramArgs.value.split(/\r?\n/).filter(value => value !== ''),
     };
   }
+  if (modalKind === 'task' && fElevated.checked) {
+    const mode = selectedCommandSpec && selectedCommandSpec.mode;
+    if (!selectedCommandSpec || selectedCommandSpec.needsReview
+        || !['direct', 'cmd', 'powershell'].includes(mode)
+        || selectedCommandSpec.text != null) {
+      return fieldError(fCmd, '管理员批处理必须使用“选择脚本”生成的结构化命令');
+    }
+  }
   const port = modalKind !== 'service' || externalResourceMode() ? null : readPortValue();
   if (Number.isNaN(port)) return fieldError(fPort, '端口必须是 1–65535 之间的整数');
   const body = {
@@ -989,7 +1011,8 @@ async function saveApp() {
     kind: modalKind,
     scheduledTaskPath: selectedScheduledTaskPath(),
     dockerResource: selectedDockerResource(),
-    elevated: modalKind === 'program' && fElevated.checked,
+    elevated: (modalKind === 'program' || modalKind === 'task')
+      && fElevated.checked && !externalResourceMode(),
   };
   if (selectedCommandSpec) body.commandSpec = selectedCommandSpec;
   if (externalResourceMode()) delete body.commandSpec;
@@ -1179,7 +1202,7 @@ export function initAppModal({ onAddService, onAddTask, onAddProgram }) {
     }
     refreshEditSaveMode();
   });
-  fElevated.addEventListener('change', refreshEditSaveMode);
+  fElevated.addEventListener('change', () => setModalKind(modalKind));
 
   /* 图标：上传 / 粘贴 / 清除 */
   btnPickIcon.addEventListener('click', () => iconFile.click());

@@ -88,6 +88,7 @@ from .contracts import (
     CwdSnapshot,
     ElevationBrokerResult,
     ElevationBrokerStatus,
+    ElevatedTaskResult,
     LaunchRequest,
     ListenerSnapshot,
     ManagedActivation,
@@ -2155,6 +2156,105 @@ class WindowsPlatform:
                 str(response.get("code") or "BROKER_LAUNCH_FAILED"),
             )
         return ElevationBrokerResult(True, process_id=int(response["pid"]))
+
+    @staticmethod
+    def _elevated_task_result(
+            response: Mapping[str, object]) -> ElevatedTaskResult:
+        return ElevatedTaskResult(
+            bool(response.get("ok")),
+            found=response.get("found") is True,
+            running=response.get("running") is True,
+            process_id=(
+                int(response["pid"])
+                if isinstance(response.get("pid"), int)
+                and not isinstance(response.get("pid"), bool) else None
+            ),
+            create_time=(
+                float(response["createTime"])
+                if isinstance(response.get("createTime"), (int, float))
+                and not isinstance(response.get("createTime"), bool) else None
+            ),
+            started_at=(
+                int(response["startedAt"])
+                if isinstance(response.get("startedAt"), int)
+                and not isinstance(response.get("startedAt"), bool) else None
+            ),
+            completed_at=(
+                int(response["completedAt"])
+                if isinstance(response.get("completedAt"), int)
+                and not isinstance(response.get("completedAt"), bool) else None
+            ),
+            exit_code=(
+                int(response["exitCode"])
+                if isinstance(response.get("exitCode"), int)
+                and not isinstance(response.get("exitCode"), bool) else None
+            ),
+            manually_stopped=response.get("manuallyStopped") is True,
+            error=(None if response.get("ok") else str(
+                response.get("error") or "elevated task operation failed"
+            )),
+            code=(None if response.get("ok") else str(
+                response.get("code") or "BROKER_ELEVATED_TASK_FAILED"
+            )),
+        )
+
+    def launch_elevated_task(
+            self, app_id: str, command_spec: Mapping[str, object],
+            cwd: str) -> ElevatedTaskResult:
+        if self._elevation_token is None:
+            return ElevatedTaskResult(
+                False, error="elevation broker is locked",
+                code="BROKER_SESSION_LOCKED",
+            )
+        try:
+            response = self._broker_exchange({
+                "action": "elevated-task-launch",
+                "token": self._elevation_token,
+                "request": {
+                    "appId": app_id,
+                    "commandSpec": dict(command_spec),
+                    "cwd": cwd,
+                },
+            }, timeout_ms=15000)
+            return self._elevated_task_result(response)
+        except (OSError, TypeError, ValueError, pywintypes.error) as exc:
+            return ElevatedTaskResult(
+                False, error=str(exc), code="BROKER_ELEVATED_TASK_LAUNCH_FAILED"
+            )
+
+    def query_elevated_task(self, app_id: str) -> ElevatedTaskResult:
+        try:
+            self._ensure_keep_alive_broker_running()
+            response = self._broker_exchange({
+                "action": "elevated-task-query",
+                "appId": app_id,
+                "clientCreateTime": psutil.Process(self.self_pid).create_time(),
+            }, timeout_ms=2000)
+            return self._elevated_task_result(response)
+        except (OSError, psutil.Error, TypeError, ValueError,
+                pywintypes.error) as exc:
+            self._invalidate_keep_alive_broker_verification()
+            return ElevatedTaskResult(
+                False, error=str(exc), code="BROKER_ELEVATED_TASK_QUERY_FAILED"
+            )
+
+    def stop_elevated_task(self, app_id: str) -> ElevatedTaskResult:
+        if self._elevation_token is None:
+            return ElevatedTaskResult(
+                False, error="elevation broker is locked",
+                code="BROKER_SESSION_LOCKED",
+            )
+        try:
+            response = self._broker_exchange({
+                "action": "elevated-task-stop",
+                "token": self._elevation_token,
+                "appId": app_id,
+            }, timeout_ms=15000)
+            return self._elevated_task_result(response)
+        except (OSError, TypeError, ValueError, pywintypes.error) as exc:
+            return ElevatedTaskResult(
+                False, error=str(exc), code="BROKER_ELEVATED_TASK_STOP_FAILED"
+            )
 
     def observe_elevated(
             self, command_spec: Mapping[str, object],

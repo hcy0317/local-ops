@@ -142,6 +142,54 @@ class WindowsPhase3ContractTests(unittest.TestCase):
         self.assertEqual(fields["commandSpec"]["mode"], "legacy-posix")
         self.assertTrue(fields["commandSpec"]["needsReview"])
 
+    def test_elevated_batch_requires_a_reviewed_structured_script(self):
+        structured = {
+            "version": 1,
+            "mode": "powershell",
+            "executable": r"C:\Tasks\backup.ps1",
+            "args": [],
+            "shell": "powershell.exe",
+            "text": None,
+            "needsReview": False,
+        }
+        fields, error = server.validate_app_fields({
+            "name": "Admin backup",
+            "command": "powershell.exe -File C:\\Tasks\\backup.ps1",
+            "commandSpec": structured,
+            "cwd": r"C:\Tasks",
+            "kind": "task",
+            "elevated": True,
+        }, partial=False)
+
+        self.assertIsNone(error)
+        self.assertEqual(fields["kind"], "task")
+        self.assertTrue(fields["elevated"])
+
+        raw = dict(structured, executable=None, text="Remove-Item C:\\*")
+        _, error = server.validate_app_fields({
+            "name": "Unsafe admin shell",
+            "command": "raw",
+            "commandSpec": raw,
+            "cwd": r"C:\Tasks",
+            "kind": "task",
+            "elevated": True,
+        }, partial=False)
+        self.assertIn("管理员批处理", error)
+
+        for executable, args in (
+                (r"C:\Windows\System32\cmd.exe", ["/c", "exit 0"]),
+                (r"C:\Tools\bash.exe", ["-c", "exit 0"]),
+                (r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell_ise.exe",
+                 ["-File", r"C:\Tasks\raw.ps1"]),
+                (r"C:\Python312\pythonw.exe", ["-c", "raise SystemExit(0)"])):
+            with self.subTest(executable=executable):
+                _, error = server.validate_app_fields({
+                    "name": "Disguised shell", "command": "display only",
+                    "commandSpec": direct_command_spec(executable, args),
+                    "cwd": r"C:\Tasks", "kind": "task", "elevated": True,
+                }, partial=False)
+                self.assertIn("结构化脚本", error)
+
     def test_schema_migration_never_executes_or_accesses_network(self):
         schema_v1 = {
             "schemaVersion": 1,

@@ -31,6 +31,8 @@ export function lifecycleSnapshot(app, platform = 'unknown') {
       || app.runtimeSource === 'dockerContainer');
   const externalProgram = !!app
     && app.runtimeSource === 'windowsElevationBroker';
+  const externalElevatedTask = !!app
+    && app.runtimeSource === 'windowsElevationBrokerTask';
   const status = (!windows && !macos) || (windows && (!hasExplicitStatus || !hasExplicitControl))
     ? 'unknown' : normalizedStatus(app);
   const generation = generationId(app);
@@ -47,6 +49,7 @@ export function lifecycleSnapshot(app, platform = 'unknown') {
       ? app.controlAvailable
       : macos && (status === 'stopped' || status === 'running');
   const generationReady = externalScheduled || externalDocker
+    || externalElevatedTask
     || (externalProgram && expectedProcesses.length > 0) || macos || status === 'stopped'
     || (status === 'running' && UUID_RE.test(generation || ''));
   const canStart = controlAvailable && status === 'stopped';
@@ -58,7 +61,8 @@ export function lifecycleSnapshot(app, platform = 'unknown') {
     expectedProcesses: Object.freeze(expectedProcesses),
     canStart,
     canManage,
-    canDelete: externalScheduled || externalDocker || (!!app && app.deleteAvailable === true)
+    canDelete: externalScheduled || externalDocker
+      || (!!app && app.deleteAvailable === true)
       || canStart || canManage,
     busy: status === 'starting' || status === 'stopping',
     uncertain: status === 'orphaned' || status === 'unknown',

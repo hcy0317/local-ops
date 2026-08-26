@@ -34,6 +34,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from localops.platform.contracts import (
+    ElevatedTaskResult,
     LaunchRequest,
     PlatformScanError,
     RuntimeIdentity,
@@ -67,7 +68,10 @@ from localops.docker_resources import (
     DockerSnapshot,
     normalize_docker_resource,
 )
-from localops.elevation_broker import new_password_record
+from localops.elevation_broker import (
+    new_password_record,
+    normalize_elevated_task_command_spec,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_PATH = os.path.join(BASE_DIR, "VERSION")
@@ -1831,7 +1835,19 @@ def scheduled_task_path(app):
 
 
 def elevated_favorite(app):
-    return bool(isinstance(app, dict) and app.get("elevated") is True)
+    return bool(
+        isinstance(app, dict)
+        and app.get("elevated") is True
+        and (app.get("kind") or "service") == "program"
+    )
+
+
+def elevated_task(app):
+    return bool(
+        isinstance(app, dict)
+        and app.get("elevated") is True
+        and (app.get("kind") or "service") == "task"
+    )
 
 
 def keep_alive_supported(app):
@@ -2234,6 +2250,105 @@ def elevation_broker_public(status):
     }
 
 
+def elevated_task_last_exit(app, result):
+    if (not isinstance(result, ElevatedTaskResult) or not result.ok
+            or not result.found or result.running
+            or result.completed_at is None):
+        return app.get("lastExit")
+    started_at = result.started_at
+    duration = (
+        round(max(0.0, (result.completed_at - started_at) / 1000.0), 3)
+        if isinstance(started_at, int) else None
+    )
+    manually_stopped = result.manually_stopped
+    code = None if manually_stopped else result.exit_code
+    return {
+        "status": "stopped" if manually_stopped else classify_task_exit(code),
+        "code": code,
+        "at": int(result.completed_at / 1000),
+        "startedAt": started_at,
+        "durationSec": duration,
+    }
+
+
+def elevated_task_app_row(app, broker_status, result=None):
+    broker = elevation_broker_public(broker_status)
+    query_ok = isinstance(result, ElevatedTaskResult) and result.ok
+    running = bool(query_ok and result.found and result.running)
+    unlocked = bool(
+        broker["installed"] and broker["verified"] and broker["unlocked"]
+    )
+    query_failed = bool(result is not None and not query_ok)
+    if query_failed:
+        detail = result.error or "管理员批处理状态查询失败。"
+        issue_code = result.code or "BROKER_ELEVATED_TASK_QUERY_FAILED"
+    elif not broker["installed"]:
+        detail = "管理员启动代理尚未安装。"
+        issue_code = "BROKER_NOT_INSTALLED"
+    elif not broker["verified"]:
+        detail = "管理员启动代理定义无法验证，需要重新安装。"
+        issue_code = "BROKER_TASK_MISMATCH"
+    else:
+        detail = "本次 Local Ops 会话尚未输入解锁密码。"
+        issue_code = "BROKER_SESSION_LOCKED"
+    blocking = query_failed or (not running and not unlocked)
+    issues = [] if not blocking else [{
+        "kind": "elevation-broker-locked",
+        "severity": "error",
+        "title": "管理员批处理不可用",
+        "detail": detail,
+        "fix": "请完成代理安装或输入本次会话的解锁密码。",
+        "action": (
+            "install-elevation-broker"
+            if not broker["installed"] or not broker["verified"]
+            else "unlock-elevation-broker"
+        ),
+    }]
+    uptime = None
+    if running and isinstance(result.started_at, int):
+        uptime = max(0, int(time.time() - result.started_at / 1000.0))
+    return {
+        **keep_alive_row_fields(app),
+        "id": app["id"], "name": app["name"], "command": app["command"],
+        "commandSpec": app.get("commandSpec"),
+        "runtimeIdentity": None,
+        "runtimeSource": "windowsElevationBrokerTask",
+        "scheduledTask": None,
+        "scheduledTaskPath": None,
+        "scheduledTaskControlAvailable": False,
+        "dockerResource": None,
+        "docker": None,
+        "elevated": True,
+        "elevationBroker": broker,
+        "lifecycleStatus": (
+            "unknown" if query_failed else "running" if running else "stopped"
+        ),
+        "controlAvailable": bool(unlocked and not query_failed),
+        "deleteAvailable": not query_failed,
+        "runtimeIssue": (
+            {"code": issue_code, "message": detail} if blocking else None
+        ),
+        "importStatus": "ready",
+        "platformCompatibility": {"status": "ready", "reasons": []},
+        "cwd": app.get("cwd"), "port": None,
+        "emoji": app.get("emoji"), "glyph": app.get("glyph"),
+        "icon": app.get("icon"), "favicon": app.get("favicon"),
+        "running": running,
+        "pid": result.process_id if running else None,
+        "uptimeSec": uptime,
+        "kind": "task", "attached": False,
+        "lastExit": elevated_task_last_exit(app, result),
+        "health": {
+            "status": "error" if blocking else "ok",
+            "blocking": blocking,
+            "issues": issues,
+        },
+        "ports": [], "openHosts": {}, "listening": False,
+        "portOccupied": False, "portOccupiedPid": None, "portOwner": None,
+        "portConflict": False, "portConflictApps": [], "legacyManaged": False,
+    }
+
+
 def elevated_program_app_row(app, broker_status, program_processes=None):
     broker = elevation_broker_public(broker_status)
     executable = None
@@ -2557,7 +2672,8 @@ def docker_app_row(app, snapshot):
 
 def build_apps(
         cfg, listeners, groups=None, scheduled_tasks=None, docker_snapshot=None,
-        broker_status=None, program_processes=None):
+        broker_status=None, program_processes=None,
+        elevated_task_statuses=None):
     """token 校验通过或严格命中旧版身份的进程才算 running。
 
     多张卡片可共享配置端口；只有当前真实监听者不属于本卡片时才返回
@@ -2568,11 +2684,13 @@ def build_apps(
         port_map.setdefault(port, []).append(pid)
     apps_cfg = cfg.get("apps") or []
     scheduled_tasks = scheduled_tasks or {}
+    elevated_task_statuses = elevated_task_statuses or {}
     runtime_states = (
         {app["id"]: inspect_windows_runtime(app) for app in apps_cfg
          if not scheduled_task_path(app)
          and not docker_resource(app)
-         and not elevated_favorite(app)}
+         and not elevated_favorite(app)
+         and not elevated_task(app)}
         if PLATFORM.name == "windows" else {}
     )
     if PLATFORM.name == "windows":
@@ -2609,6 +2727,11 @@ def build_apps(
         if elevated_favorite(app):
             apps.append(elevated_program_app_row(
                 app, broker_status, program_processes
+            ))
+            continue
+        if elevated_task(app):
+            apps.append(elevated_task_app_row(
+                app, broker_status, elevated_task_statuses.get(app["id"])
             ))
             continue
         if docker_resource(app):
@@ -2814,10 +2937,30 @@ def build_state(cfg, console_port, config_health=None):
     except Exception as exc:
         LOG.exception("构建管理员启动代理状态失败")
         broker_status = None
-        if any(elevated_favorite(app) for app in (cfg.get("apps") or [])):
+        if any(
+                elevated_favorite(app) or elevated_task(app)
+                for app in (cfg.get("apps") or [])):
             degraded_reasons.append({
                 "component": "elevation_broker", "error": str(exc),
             })
+    elevated_task_statuses = {}
+    if broker_status is not None and getattr(broker_status, "running", False):
+        for app in cfg.get("apps") or []:
+            if not elevated_task(app):
+                continue
+            try:
+                result = PLATFORM.query_elevated_task(app["id"])
+            except Exception as exc:
+                result = ElevatedTaskResult(
+                    False, error=str(exc),
+                    code="BROKER_ELEVATED_TASK_QUERY_FAILED",
+                )
+            elevated_task_statuses[app["id"]] = result
+            if not result.ok:
+                degraded_reasons.append({
+                    "component": "elevated_tasks",
+                    "error": result.error or result.code,
+                })
     try:
         program_processes = build_program_process_snapshot(cfg, broker_status)
     except Exception as exc:
@@ -2830,7 +2973,7 @@ def build_state(cfg, console_port, config_health=None):
     try:
         apps = build_apps(
             cfg, listeners, groups, scheduled_tasks, docker_snapshot,
-            broker_status, program_processes,
+            broker_status, program_processes, elevated_task_statuses,
         )
     except Exception:
         LOG.exception("构建启动台状态失败")
@@ -3634,6 +3777,45 @@ def launch_elevated_program_app(platform, app):
     return payload
 
 
+def launch_elevated_task_app(platform, app):
+    result = platform.launch_elevated_task(
+        app["id"], app.get("commandSpec"), app.get("cwd") or HOME_DIR
+    )
+    payload = {
+        "ok": bool(getattr(result, "ok", False)),
+        "pid": getattr(result, "process_id", None),
+        "runtimeSource": "windowsElevationBrokerTask",
+    }
+    if not payload["ok"]:
+        payload["error"] = (
+            getattr(result, "error", None) or "管理员批处理启动失败"
+        )
+        payload["code"] = (
+            getattr(result, "code", None)
+            or "BROKER_ELEVATED_TASK_LAUNCH_FAILED"
+        )
+    record_app_action(app, "管理员批处理启动", payload)
+    return payload
+
+
+def stop_elevated_task_app(platform, app):
+    result = platform.stop_elevated_task(app["id"])
+    payload = {
+        "ok": bool(getattr(result, "ok", False)),
+        "runtimeSource": "windowsElevationBrokerTask",
+    }
+    if not payload["ok"]:
+        payload["error"] = (
+            getattr(result, "error", None) or "管理员批处理中止失败"
+        )
+        payload["code"] = (
+            getattr(result, "code", None)
+            or "BROKER_ELEVATED_TASK_STOP_FAILED"
+        )
+    record_app_action(app, "管理员批处理中止", payload)
+    return payload
+
+
 def stop_windows_app(
         cfg, app, *, force=False, timeout=APP_STOP_TIMEOUT_SEC,
         initial_inspection=None):
@@ -3748,6 +3930,56 @@ def start_windows_runtime_reconciler(cfg, interval=30.0):
     threading.Thread(
         target=_reconcile_loop,
         name="windows-runtime-reconciler",
+        daemon=True,
+    ).start()
+    return stop
+
+
+def reconcile_elevated_task_results(cfg):
+    if PLATFORM.name != "windows":
+        return
+    for app in cfg.snapshot().get("apps", []):
+        if not elevated_task(app):
+            continue
+        result = PLATFORM.query_elevated_task(app["id"])
+        last_exit = elevated_task_last_exit(app, result)
+        if (not isinstance(last_exit, dict)
+                or last_exit == app.get("lastExit")):
+            continue
+
+        def op(data, app_id=app["id"], expected=last_exit):
+            target = find_app(data, app_id)
+            if target is None or not elevated_task(target):
+                return False
+            target["lastExit"] = expected
+            return True
+
+        if cfg.update(op):
+            record_app_action(app, "管理员批处理完成", {
+                "ok": last_exit.get("status") == "succeeded",
+                "status": last_exit.get("status"),
+                "code": last_exit.get("code"),
+                "durationSec": last_exit.get("durationSec"),
+            })
+            invalidate_state_cache()
+
+
+def start_elevated_task_reconciler(cfg, interval=2.0):
+    stop = threading.Event()
+    if PLATFORM.name != "windows":
+        return stop
+
+    def _reconcile_loop():
+        while not stop.is_set():
+            try:
+                reconcile_elevated_task_results(cfg)
+            except Exception:
+                LOG.exception("Elevated task background reconciliation failed")
+            stop.wait(max(1.0, float(interval)))
+
+    threading.Thread(
+        target=_reconcile_loop,
+        name="elevated-task-reconciler",
         daemon=True,
     ).start()
     return stop
@@ -5750,7 +5982,25 @@ def validate_app_fields(data, partial):
         )
         fields["port"] = None
         fields["kind"] = "service"
+    elif fields.get("elevated") and fields.get("kind") == "task":
+        if PLATFORM.name != "windows":
+            return None, "管理员批处理仅支持 Windows"
+        try:
+            fields["commandSpec"] = normalize_elevated_task_command_spec(
+                fields.get("commandSpec")
+            )
+        except CommandSpecError as exc:
+            if ("interpreter" in str(exc)
+                    or "direct mode requires" in str(exc)):
+                return None, (
+                    "管理员批处理的 direct 程序必须是无参数的绝对本机 "
+                    "EXE/COM，带参数命令请使用结构化脚本"
+                )
+            return None, "管理员批处理必须选择经过复核的结构化脚本或程序"
+        fields["port"] = None
     elif fields.get("elevated"):
+        if fields.get("kind") != "program":
+            return None, "管理员启动仅适用于批处理任务或程序"
         spec = fields.get("commandSpec")
         executable = spec.get("executable") if isinstance(spec, dict) else None
         if (not isinstance(spec, dict) or spec.get("mode") != "direct"
@@ -7121,6 +7371,39 @@ class Handler(BaseHTTPRequestHandler):
                     "lifecycleStatus": "starting",
                 })
                 return
+        if elevated_task(app):
+            if not self._require_browser_session(elevated=True):
+                return
+            if not self._require_capability(
+                    "launch_elevated", "当前平台未启用管理员批处理启动"):
+                return
+            if expected_generation is not None:
+                self.send_err(
+                    409, "管理员批处理没有受管 generation",
+                    "GENERATION_MISMATCH",
+                )
+                return
+            current = PLATFORM.query_elevated_task(app_id)
+            if current.ok and current.found and current.running:
+                self.send_err(
+                    409, "管理员批处理正在运行",
+                    "BROKER_ELEVATED_TASK_ALREADY_RUNNING",
+                )
+                return
+            health = inspect_app_health(app)
+            if health["blocking"]:
+                issue = health["issues"][0]
+                self.send_json({
+                    "ok": False,
+                    "error": "%s：%s" % (issue["title"], issue["detail"]),
+                    "health": health,
+                }, 422)
+                return
+            result = launch_elevated_task_app(PLATFORM, app)
+            if result.get("ok"):
+                invalidate_state_cache()
+            self.send_json(result, 200 if result.get("ok") else 409)
+            return
         if elevated_favorite(app):
             if not self._require_browser_session(elevated=True):
                 return
@@ -7251,6 +7534,36 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.server.wake_keep_alive()
         app = find_app(self.server.cfg.snapshot(), app_id)
+        if elevated_task(app):
+            if not self._require_browser_session(elevated=True):
+                return
+            if expected_generation is not None:
+                self.send_err(
+                    409, "管理员批处理不使用受管运行代次",
+                    "GENERATION_MISMATCH",
+                )
+                return
+            if force:
+                self.send_err(
+                    409, "管理员批处理中止不支持强制模式",
+                    "ELEVATED_TASK_FORCE_UNSUPPORTED",
+                )
+                return
+            result = stop_elevated_task_app(PLATFORM, app)
+            if result.get("ok"):
+                task_state = PLATFORM.query_elevated_task(app_id)
+                last_exit = elevated_task_last_exit(app, task_state)
+
+                def op(config):
+                    target = find_app(config, app_id)
+                    if (target is not None and elevated_task(target)
+                            and isinstance(last_exit, dict)):
+                        target["lastExit"] = last_exit
+
+                self.server.cfg.update(op)
+                invalidate_state_cache()
+            self.send_json(result, 200 if result.get("ok") else 409)
+            return
         if elevated_favorite(app):
             if not self._require_browser_session(elevated=True):
                 return
@@ -7975,6 +8288,31 @@ class Handler(BaseHTTPRequestHandler):
                 app = find_app(self.server.cfg.snapshot(), m.group(1))
             stopped_for_update = False
             if (PLATFORM.name == "windows" and lifecycle_changed
+                    and elevated_task(app)):
+                task_state = PLATFORM.query_elevated_task(app["id"])
+                if not task_state.ok:
+                    self.send_err(
+                        409,
+                        task_state.error or "管理员批处理状态无法确认",
+                        task_state.code or "BROKER_ELEVATED_TASK_QUERY_FAILED",
+                    )
+                    return
+                if task_state.found and task_state.running:
+                    if not stop_before_update:
+                        self.send_json({
+                            "ok": False,
+                            "error": "管理员批处理正在运行，请先中止；填写内容会保留",
+                            "requiresStop": True,
+                        }, 409)
+                        return
+                    if not self._require_browser_session(elevated=True):
+                        return
+                    stopped = stop_elevated_task_app(PLATFORM, app)
+                    if not stopped.get("ok"):
+                        self.send_json(stopped, 409)
+                        return
+                    stopped_for_update = True
+            elif (PLATFORM.name == "windows" and lifecycle_changed
                     and app.get("runtimeIdentity") is not None):
                 if not self._require_capability(
                         "stop_managed",
@@ -8152,7 +8490,24 @@ class Handler(BaseHTTPRequestHandler):
         app = find_app(self.server.cfg.snapshot(), app_id)
         stopped_for_delete = False
         terminal_identity = None
-        if (PLATFORM.name == "windows"
+        if PLATFORM.name == "windows" and elevated_task(app):
+            task_state = PLATFORM.query_elevated_task(app_id)
+            if not task_state.ok:
+                self.send_err(
+                    409,
+                    task_state.error or "管理员批处理状态无法确认，删除已取消",
+                    task_state.code or "BROKER_ELEVATED_TASK_QUERY_FAILED",
+                )
+                return
+            if task_state.found and task_state.running:
+                if not self._require_browser_session(elevated=True):
+                    return
+                stopped = stop_elevated_task_app(PLATFORM, app)
+                if not stopped.get("ok"):
+                    self.send_json(stopped, 409)
+                    return
+                stopped_for_delete = True
+        elif (PLATFORM.name == "windows"
                 and app.get("runtimeIdentity") is not None):
             try:
                 identity = native_runtime_identity(app)
@@ -8483,6 +8838,7 @@ def _run_console(preferred_port=None, open_browser=True, storage_issues=None):
     write_control_credential(CONTROL_CREDENTIAL_PATH, server)
     print("总控台已启动: http://%s:%d/  (Ctrl+C 停止)" % (HOST, port), flush=True)
     reconcile_stop = start_windows_runtime_reconciler(cfg)
+    elevated_task_reconcile_stop = start_elevated_task_reconciler(cfg)
     keep_alive_supervisor = start_keep_alive_supervisor(server)
     server.keep_alive_supervisor = keep_alive_supervisor
     if open_browser:
@@ -8493,6 +8849,7 @@ def _run_console(preferred_port=None, open_browser=True, storage_issues=None):
         pass
     finally:
         reconcile_stop.set()
+        elevated_task_reconcile_stop.set()
         keep_alive_supervisor.stop()
         keep_alive_supervisor.join(2.0)
         if getattr(PLATFORM.capabilities, "manage_elevation_broker", False):

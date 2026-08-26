@@ -310,23 +310,25 @@ function updateAppCard(card, app) {
   const isScheduled = app.runtimeSource === 'windowsTaskScheduler';
   const isDocker = app.runtimeSource === 'dockerCompose'
     || app.runtimeSource === 'dockerContainer';
-  const isElevated = app.runtimeSource === 'windowsElevationBroker';
+  const elevatedProgram = app.runtimeSource === 'windowsElevationBroker';
+  const elevatedTask = app.runtimeSource === 'windowsElevationBrokerTask';
+  const isElevated = elevatedProgram || elevatedTask;
   const managedService = kind === 'service' && !isScheduled && !isDocker
     && !isElevated;
-  const managedTask = isTask && !isScheduled && !isDocker;
-  const regularProgram = isProgram && !isElevated;
-  const elevatedProgram = isProgram && isElevated;
+  const managedTask = isTask && !isScheduled && !isDocker && !elevatedTask;
+  const regularProgram = isProgram && !elevatedProgram;
   card.classList.toggle('runtime-managed', managedService);
   card.classList.toggle('runtime-task', managedTask);
   card.classList.toggle('runtime-scheduled', isScheduled);
   card.classList.toggle('runtime-docker', isDocker);
   card.classList.toggle('runtime-program', regularProgram);
-  card.classList.toggle('runtime-elevated', elevatedProgram);
+  card.classList.toggle('runtime-elevated', isElevated);
   const runtimeLabel = managedService ? '本地受管'
     : managedTask ? '本地任务'
       : isScheduled ? '计划任务'
         : isDocker ? 'Docker'
-          : elevatedProgram ? '管理员启动'
+          : elevatedTask ? '管理员任务'
+            : elevatedProgram ? '管理员启动'
             : regularProgram ? '常规启动' : '';
   setText(r.runtimeBadge, runtimeLabel);
   r.runtimeBadge.hidden = !runtimeLabel;
@@ -335,7 +337,8 @@ function updateAppCard(card, app) {
       : isScheduled ? 'Windows 计划任务'
         : isDocker ? (app.runtimeSource === 'dockerCompose'
           ? 'Docker Compose' : 'Docker 容器')
-          : elevatedProgram ? '通过管理员代理启动'
+          : elevatedTask ? '通过管理员代理运行批处理任务'
+            : elevatedProgram ? '通过管理员代理启动'
             : regularProgram ? '使用当前用户权限启动' : '';
   const scheduledState = isScheduled && app.scheduledTask
     ? app.scheduledTask.state : '';
@@ -377,7 +380,9 @@ function updateAppCard(card, app) {
   } else if (isDocker && lifecycle.status === 'stopped') {
     stTxt = '已停止 · ' + (app.runtimeSource === 'dockerCompose'
       ? 'Docker Compose' : 'Docker 容器');
-  } else if (isElevated && app.running) {
+  } else if (elevatedTask && app.running) {
+    stTxt = '运行中 · 管理员任务';
+  } else if (elevatedProgram && app.running) {
     stTxt = app.programStopAvailable
       ? '运行中 · 可停止'
       : app.observedRestricted
@@ -507,7 +512,7 @@ function updateAppCard(card, app) {
     r.stUp.hidden = true;
     setText(r.stUp, '');
   }
-  const needsBrokerAccess = isElevated && !app.running && !lifecycle.canStart;
+  const needsBrokerAccess = isElevated && !app.controlAvailable;
   const primaryState = needsBrokerAccess ? 'authorize'
     : lifecycle.busy ? lifecycle.status
     : lifecycle.uncertain || (!lifecycle.canStart && !lifecycle.canManage)
@@ -651,20 +656,32 @@ async function toggleApp(id, button, capturedIntent, confirmed = false) {
   const isScheduled = app.runtimeSource === 'windowsTaskScheduler';
   const isDocker = app.runtimeSource === 'dockerCompose'
     || app.runtimeSource === 'dockerContainer';
-  const isElevated = app.runtimeSource === 'windowsElevationBroker';
+  const elevatedProgram = app.runtimeSource === 'windowsElevationBroker';
+  const elevatedTask = app.runtimeSource === 'windowsElevationBrokerTask';
+  const isElevated = elevatedProgram || elevatedTask;
   const intent = capturedIntent || lifecycleSnapshot(app, currentPlatform());
   const starting = intent.status === 'stopped';
-  if (isElevated && !app.running && !intent.canStart) {
+  if (isElevated && !intent.canStart && !intent.canManage) {
     openBrokerPassword();
     return;
   }
-  if (isElevated && !starting && confirmed !== true) {
+  if (elevatedProgram && !starting && confirmed !== true) {
     openConfirm({
       title: '停止程序',
       bodyHtml: '确定要停止 <b>' + escapeHtml(app.name || '程序') + '</b> 吗？' +
         '<div class="confirm-detail">仅会停止当前卡片已验证的程序实例；' +
         '执行前仍会复验用户、EXE 路径和进程创建时间。</div>',
       okText: '停止程序',
+      onOk: () => toggleApp(id, button, intent, true),
+    });
+    return;
+  }
+  if (elevatedTask && !starting && confirmed !== true) {
+    openConfirm({
+      title: '中止管理员任务',
+      bodyHtml: '确定要中止 <b>' + escapeHtml(app.name || '任务') + '</b> 吗？' +
+        '<div class="confirm-detail">只会终止该卡片由管理员代理持有的独立 Job。</div>',
+      okText: '中止任务',
       onOk: () => toggleApp(id, button, intent, true),
     });
     return;
@@ -733,8 +750,10 @@ async function toggleApp(id, button, capturedIntent, confirmed = false) {
         latest.runtimeSource === 'dockerCompose'
         || latest.runtimeSource === 'dockerContainer'
       );
-      const latestElevated = latest
-        && latest.runtimeSource === 'windowsElevationBroker';
+      const latestElevated = latest && (
+        latest.runtimeSource === 'windowsElevationBroker'
+        || latest.runtimeSource === 'windowsElevationBrokerTask'
+      );
       const latestCapability = latestElevated
         ? (latestLifecycle.canManage ? 'stop_managed' : 'launch_elevated')
         : latestDocker ? 'control_docker' : latestScheduled

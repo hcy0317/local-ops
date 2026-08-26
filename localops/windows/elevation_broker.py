@@ -5,17 +5,21 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import msvcrt
 import ntpath
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
 import shutil
 import secrets
+import stat
 import subprocess
 import sys
 import threading
 import time
 import uuid
+import zipfile
 from typing import Mapping, Sequence
 
 import ntsecuritycon
@@ -76,6 +80,17 @@ _CAPABILITY_TEMP_RE = re.compile(
 )
 _KEEP_ALIVE_ATTESTATION_TTL = 30.0
 _KEEP_ALIVE_RESOURCE_VERIFY_TTL = 30.0
+_MAX_INSTALL_ARCHIVE_ENTRIES = 10_000
+_MAX_INSTALL_ARCHIVE_BYTES = 1024 * 1024 * 1024
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *("COM" + suffix for suffix in "123456789¹²³"),
+    *("LPT" + suffix for suffix in "123456789¹²³"),
+}
+_WINDOWS_INVALID_NAME_CHARS = frozenset('<>:"\\|?*')
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_INSTALL_INCOMPLETE_SCHEMA = "localops-elevation-install-incomplete.v1"
+_ACTIVE_TASK_STATES = {2, 4}
 
 
 def _program_data_dir() -> Path:
@@ -124,6 +139,10 @@ def public_config_path() -> Path:
 
 def secret_config_path() -> Path:
     return _program_data_dir() / "elevation-password.json"
+
+
+def install_incomplete_path() -> Path:
+    return _program_data_dir() / "elevation-install-incomplete.json"
 
 
 def capability_dir() -> Path:
@@ -405,20 +424,269 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _bundle_sort_key(name: str) -> tuple[str, str]:
+    return name.casefold(), name
+
+
+def _bundle_metadata(path: Path, *, directory: bool) -> os.stat_result:
+    metadata = path.stat(follow_symlinks=False)
+    attributes = int(getattr(metadata, "st_file_attributes", 0))
+    expected = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(
+        metadata.st_mode
+    )
+    if (not expected or path.is_symlink()
+            or attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+        raise OSError("broker bundle contains a reparse or invalid entry")
+    return metadata
+
+
+def _bundle_entries(root: Path):
+    _bundle_metadata(root, directory=True)
+
+    def visit(directory: Path):
+        _bundle_metadata(directory, directory=True)
+        with os.scandir(directory) as iterator:
+            entries = sorted(list(iterator), key=lambda item: _bundle_sort_key(
+                item.name
+            ))
+        folded = [entry.name.casefold() for entry in entries]
+        if len(folded) != len(set(folded)):
+            raise OSError("broker bundle contains case-folding name collisions")
+        for entry in entries:
+            candidate = directory / entry.name
+            metadata = candidate.stat(follow_symlinks=False)
+            attributes = int(getattr(metadata, "st_file_attributes", 0))
+            if (entry.is_symlink()
+                    or attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                raise OSError("broker bundle contains a reparse point")
+            if stat.S_ISDIR(metadata.st_mode):
+                yield "D", candidate, metadata
+                yield from visit(candidate)
+            elif stat.S_ISREG(metadata.st_mode):
+                yield "F", candidate, metadata
+            else:
+                raise OSError("broker bundle contains an invalid entry")
+
+    yield from visit(root)
+
+
+def _metadata_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        int(metadata.st_dev), int(metadata.st_ino), int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+    )
+
+
+def _hash_stable_file(digest, path: Path, expected: os.stat_result) -> None:
+    with open(path, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if _metadata_identity(opened) != _metadata_identity(expected):
+            raise OSError("broker bundle file changed before hashing")
+        total = 0
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            total += len(chunk)
+            digest.update(chunk)
+    after = path.stat(follow_symlinks=False)
+    if (total != expected.st_size
+            or _metadata_identity(after) != _metadata_identity(expected)):
+        raise OSError("broker bundle file changed while hashing")
+
+
+def _bundle_sha256(root: Path) -> str:
+    digest = hashlib.sha256(b"localops-bundle-v1\0")
+    file_count = 0
+    for kind, candidate, metadata in _bundle_entries(root):
+        relative = candidate.relative_to(root).as_posix().encode("utf-8")
+        digest.update(kind.encode("ascii"))
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        if kind == "F":
+            digest.update(metadata.st_size.to_bytes(8, "big"))
+            _hash_stable_file(digest, candidate, metadata)
+            file_count += 1
+    if file_count == 0:
+        raise OSError("broker bundle is empty")
+    return digest.hexdigest()
+
+
+def _open_install_archive(path: Path):
+    handle = win32file.CreateFile(
+        str(path),
+        win32con.GENERIC_READ,
+        win32con.FILE_SHARE_READ,
+        None,
+        win32con.OPEN_EXISTING,
+        win32con.FILE_ATTRIBUTE_NORMAL | _FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    try:
+        descriptor = msvcrt.open_osfhandle(
+            handle.Detach(), os.O_RDONLY | os.O_BINARY
+        )
+    except Exception:
+        handle.Close()
+        raise
+    try:
+        return os.fdopen(descriptor, "rb")
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _canonical_archive_entry(raw: str, *, directory: bool) -> PurePosixPath:
+    normalized = raw[:-1] if directory else raw
+    relative = PurePosixPath(normalized)
+    canonical = relative.as_posix() + ("/" if directory else "")
+    if (not normalized or raw != canonical or raw.startswith("/")
+            or "\\" in raw or "\0" in raw):
+        raise ValueError("broker bundle archive contains a non-canonical entry")
+    for part in relative.parts:
+        device_name = part.split(".", 1)[0].upper()
+        if (not part or part in {".", ".."} or part[-1] in {".", " "}
+                or device_name in _WINDOWS_RESERVED_NAMES
+                or any(ord(char) < 32 or char in _WINDOWS_INVALID_NAME_CHARS
+                       for char in part)):
+            raise ValueError("broker bundle archive contains an unsafe Windows name")
+    return relative
+
+
+def _extract_bundle_archive(stream, staging: Path) -> None:
+    with zipfile.ZipFile(stream, "r") as archive:
+        infos = archive.infolist()
+        if not 0 < len(infos) <= _MAX_INSTALL_ARCHIVE_ENTRIES:
+            raise ValueError("broker bundle archive entry count is invalid")
+        total_size = sum(info.file_size for info in infos)
+        if total_size > _MAX_INSTALL_ARCHIVE_BYTES:
+            raise ValueError("broker bundle archive is too large")
+        validated = []
+        casefolded = set()
+        canonical_prefixes = {}
+        for info in infos:
+            raw = info.filename
+            directory = info.is_dir()
+            mode = (info.external_attr >> 16) & 0xFFFF
+            if (stat.S_ISLNK(mode)
+                    or (mode and directory and not stat.S_ISDIR(mode))
+                    or (mode and not directory and not stat.S_ISREG(mode))
+                    or info.flag_bits & 0x1):
+                raise ValueError("broker bundle archive contains an unsafe entry")
+            relative = _canonical_archive_entry(raw, directory=directory)
+            normalized = relative.as_posix()
+            folded = normalized.casefold()
+            if folded in casefolded:
+                raise ValueError("broker bundle archive contains duplicate entries")
+            casefolded.add(folded)
+            for depth in range(1, len(relative.parts) + 1):
+                prefix = "/".join(relative.parts[:depth])
+                folded_prefix = prefix.casefold()
+                previous = canonical_prefixes.setdefault(folded_prefix, prefix)
+                if previous != prefix:
+                    raise ValueError(
+                        "broker bundle archive contains case-folding collisions"
+                    )
+            validated.append((info, relative, directory))
+        staging.mkdir(parents=False, exist_ok=False)
+        for info, relative, directory in sorted(
+                validated,
+                key=lambda row: (
+                    len(row[1].parts), not row[2],
+                    row[1].as_posix().casefold(), row[1].as_posix(),
+                )):
+            target = staging.joinpath(*relative.parts)
+            if os.path.commonpath((
+                    os.path.abspath(staging), os.path.abspath(target)
+                    )) != os.path.abspath(staging):
+                raise ValueError("broker bundle archive escaped staging")
+            if directory:
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            written = 0
+            with archive.open(info, "r") as source, open(target, "xb") as output:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > info.file_size:
+                        raise ValueError("broker bundle archive size changed")
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+            if written != info.file_size:
+                raise ValueError("broker bundle archive is truncated")
+
+
+def _verify_protected_bundle_path(
+        path: Path, owner_sid: str, *, directory: bool) -> None:
+    _bundle_metadata(path, directory=directory)
+    descriptor = win32security.GetNamedSecurityInfo(
+        str(path), win32security.SE_FILE_OBJECT,
+        win32security.OWNER_SECURITY_INFORMATION
+        | win32security.DACL_SECURITY_INFORMATION,
+    )
+    owner = win32security.ConvertSidToStringSid(
+        descriptor.GetSecurityDescriptorOwner()
+    )
+    dacl = descriptor.GetSecurityDescriptorDacl()
+    aces = [
+        dacl.GetAce(index) for index in range(dacl.GetAceCount())
+    ] if dacl is not None else []
+    inherit = (
+        win32con.OBJECT_INHERIT_ACE | win32con.CONTAINER_INHERIT_ACE
+        if directory else 0
+    )
+    expected = {
+        _SYSTEM_SID: (ntsecuritycon.FILE_ALL_ACCESS, inherit),
+        _ADMINISTRATORS_SID: (ntsecuritycon.FILE_ALL_ACCESS, inherit),
+        owner_sid: (
+            ntsecuritycon.FILE_GENERIC_READ | ntsecuritycon.FILE_GENERIC_EXECUTE,
+            inherit,
+        ),
+    }
+    actual = {}
+    for ace in aces:
+        if ace[0][0] != win32security.ACCESS_ALLOWED_ACE_TYPE:
+            raise PermissionError("broker bundle ACL contains a non-allow ACE")
+        sid = win32security.ConvertSidToStringSid(ace[2])
+        if sid in actual:
+            raise PermissionError("broker bundle ACL contains duplicate principals")
+        actual[sid] = (int(ace[1]), int(ace[0][1]))
+    control = descriptor.GetSecurityDescriptorControl()[0]
+    if (owner not in {_SYSTEM_SID, _ADMINISTRATORS_SID}
+            or actual != expected
+            or not control & win32security.SE_DACL_PROTECTED):
+        raise PermissionError("broker bundle ACL verification failed")
+
+
+def _verify_protected_bundle(root: Path, owner_sid: str) -> None:
+    _verify_protected_bundle_path(root, owner_sid, directory=True)
+    for kind, candidate, _metadata in _bundle_entries(root):
+        _verify_protected_bundle_path(
+            candidate, owner_sid, directory=kind == "D"
+        )
+
+
+def _set_protected_bundle_owner(path: Path) -> None:
+    win32security.SetNamedSecurityInfo(
+        str(path), win32security.SE_FILE_OBJECT,
+        win32security.OWNER_SECURITY_INFORMATION,
+        win32security.ConvertStringSidToSid(_ADMINISTRATORS_SID),
+        None, None, None,
+    )
+
+
 def _protect_bundle(root: Path, owner_sid: str) -> None:
     user_rx = ntsecuritycon.FILE_GENERIC_READ | ntsecuritycon.FILE_GENERIC_EXECUTE
-    for current, dirs, files in os.walk(root):
-        current_path = Path(current)
-        if current_path.is_symlink():
-            raise OSError("broker bundle contains a link")
-        _protect_path(current_path, owner_sid, directory=True, user_access=user_rx)
-        for name in [*dirs, *files]:
-            candidate = current_path / name
-            if candidate.is_symlink():
-                raise OSError("broker bundle contains a link")
-            _protect_path(
-                candidate, owner_sid, directory=candidate.is_dir(), user_access=user_rx
-            )
+    entries = list(_bundle_entries(root))
+    _protect_path(root, owner_sid, directory=True, user_access=user_rx)
+    _set_protected_bundle_owner(root)
+    for kind, candidate, _metadata in entries:
+        _protect_path(
+            candidate, owner_sid, directory=kind == "D", user_access=user_rx
+        )
+        _set_protected_bundle_owner(candidate)
+    _verify_protected_bundle(root, owner_sid)
 
 
 def _register_task(spec: Mapping[str, str]) -> None:
@@ -449,13 +717,13 @@ def _register_task(spec: Mapping[str, str]) -> None:
             BROKER_TASK_PATH.lstrip("\\"), definition, 6,
             spec["ownerSid"], None, 3, spec["sddl"],
         )
-        if int(registered.State or 0) == 4:
+        if int(registered.State or 0) in _ACTIVE_TASK_STATES:
             registered.Stop(0)
             deadline = time.monotonic() + 10.0
-            while (int(registered.State or 0) == 4
+            while (int(registered.State or 0) in _ACTIVE_TASK_STATES
                    and time.monotonic() < deadline):
                 time.sleep(0.05)
-            if int(registered.State or 0) == 4:
+            if int(registered.State or 0) in _ACTIVE_TASK_STATES:
                 raise TimeoutError(
                     "previous elevation broker instance did not stop"
                 )
@@ -464,41 +732,386 @@ def _register_task(spec: Mapping[str, str]) -> None:
         pythoncom.CoUninitialize()
 
 
+def _broker_task_state() -> tuple[bool, bool]:
+    pythoncom.CoInitialize()
+    service = folder = registered = None
+    try:
+        service = win32com.client.Dispatch("Schedule.Service")
+        service.Connect()
+        folder = service.GetFolder("\\")
+        try:
+            registered = folder.GetTask(BROKER_TASK_PATH.lstrip("\\"))
+        except pywintypes.com_error as exc:
+            if int(getattr(exc, "hresult", 0)) == -2147024894:
+                return False, False
+            raise
+        return True, int(registered.State or 0) == 4
+    finally:
+        registered = folder = service = None
+        pythoncom.CoUninitialize()
+
+
+def _broker_task_running() -> bool:
+    return _broker_task_state()[1]
+
+
+def _stop_broker_task() -> None:
+    pythoncom.CoInitialize()
+    service = folder = registered = None
+    try:
+        service = win32com.client.Dispatch("Schedule.Service")
+        service.Connect()
+        folder = service.GetFolder("\\")
+        try:
+            registered = folder.GetTask(BROKER_TASK_PATH.lstrip("\\"))
+        except pywintypes.com_error as exc:
+            if int(getattr(exc, "hresult", 0)) == -2147024894:
+                return
+            raise
+        if int(registered.State or 0) not in _ACTIVE_TASK_STATES:
+            return
+        registered.Stop(0)
+        deadline = time.monotonic() + 10.0
+        while (int(registered.State or 0) in _ACTIVE_TASK_STATES
+               and time.monotonic() < deadline):
+            time.sleep(0.05)
+        if int(registered.State or 0) in _ACTIVE_TASK_STATES:
+            raise TimeoutError("elevation broker task did not stop")
+    finally:
+        registered = folder = service = None
+        pythoncom.CoUninitialize()
+
+
+def _run_broker_task() -> None:
+    pythoncom.CoInitialize()
+    service = folder = registered = instance = None
+    try:
+        service = win32com.client.Dispatch("Schedule.Service")
+        service.Connect()
+        folder = service.GetFolder("\\")
+        registered = folder.GetTask(BROKER_TASK_PATH.lstrip("\\"))
+        instance = registered.Run("")
+    finally:
+        instance = registered = folder = service = None
+        pythoncom.CoUninitialize()
+
+
+def _delete_broker_task() -> None:
+    pythoncom.CoInitialize()
+    service = folder = None
+    try:
+        service = win32com.client.Dispatch("Schedule.Service")
+        service.Connect()
+        folder = service.GetFolder("\\")
+        try:
+            folder.DeleteTask(BROKER_TASK_PATH.lstrip("\\"), 0)
+        except pywintypes.com_error as exc:
+            if int(getattr(exc, "hresult", 0)) != -2147024894:
+                raise
+    finally:
+        folder = service = None
+        pythoncom.CoUninitialize()
+
+
+def _disable_broker_task() -> None:
+    pythoncom.CoInitialize()
+    service = folder = registered = None
+    try:
+        service = win32com.client.Dispatch("Schedule.Service")
+        service.Connect()
+        folder = service.GetFolder("\\")
+        try:
+            registered = folder.GetTask(BROKER_TASK_PATH.lstrip("\\"))
+        except pywintypes.com_error as exc:
+            if int(getattr(exc, "hresult", 0)) == -2147024894:
+                return
+            raise
+        if int(registered.State or 0) in _ACTIVE_TASK_STATES:
+            registered.Stop(0)
+        registered.Enabled = False
+    finally:
+        registered = folder = service = None
+        pythoncom.CoUninitialize()
+
+
+def _write_install_marker(
+        owner_sid: str, spec: Mapping[str, str], status: str) -> None:
+    _write_json(install_incomplete_path(), {
+        "schema": _INSTALL_INCOMPLETE_SCHEMA,
+        "ownerSid": owner_sid,
+        "status": status,
+        "executable": str(spec.get("executable") or ""),
+        "updatedAt": int(time.time() * 1000),
+    }, owner_sid, secret=True)
+    _verify_broker_only_path(install_incomplete_path(), directory=False)
+
+
+def _clear_install_marker() -> None:
+    path = install_incomplete_path()
+    if not path.exists():
+        return
+    _verify_broker_only_path(path, directory=False)
+    path.unlink()
+
+
+def _install_marker_active() -> bool:
+    path = install_incomplete_path()
+    if not path.exists():
+        return False
+    _verify_broker_only_path(path, directory=False)
+    return True
+
+
+def _runtime_install_blocked() -> bool:
+    try:
+        return _install_marker_active()
+    except OSError:
+        return True
+
+
+def _capture_install_records(owner_sid: str) -> dict[str, object]:
+    data_dir = _program_data_dir()
+    data_exists = data_dir.exists()
+    state: dict[str, object] = {
+        "dataExists": data_exists,
+        "capabilityExists": False,
+        "public": None,
+        "secret": None,
+        "capabilityKey": None,
+        "capabilityRegistry": None,
+    }
+    if not data_exists:
+        return state
+    _verify_broker_data_ancestors(require_localops=True)
+    _verify_broker_public_directory(data_dir, owner_sid)
+    public_path = public_config_path()
+    if public_path.exists():
+        _verify_broker_public_file(public_path, owner_sid)
+        state["public"] = _read_json(public_path)
+    secret_path = secret_config_path()
+    if secret_path.exists():
+        _verify_broker_only_path(secret_path, directory=False)
+        state["secret"] = _read_json(secret_path)
+    directory = capability_dir()
+    if directory.exists():
+        _load_capability_registry(owner_sid, create=False)
+        state["capabilityExists"] = True
+        state["capabilityKey"] = capability_key_path().read_bytes()
+        state["capabilityRegistry"] = _read_json(capability_registry_path())
+    return state
+
+
+def _remove_install_record(path: Path, *, public: bool, owner_sid: str) -> None:
+    if not path.exists():
+        return
+    if public:
+        _verify_broker_public_file(path, owner_sid)
+    else:
+        _verify_broker_only_path(path, directory=False)
+    path.unlink()
+
+
+def _rollback_install_records(
+        state: Mapping[str, object], owner_sid: str) -> None:
+    public = state.get("public")
+    secret = state.get("secret")
+    key = state.get("capabilityKey")
+    registry = state.get("capabilityRegistry")
+    if isinstance(public, Mapping):
+        _write_json(public_config_path(), public, owner_sid, secret=False)
+    else:
+        _remove_install_record(
+            public_config_path(), public=True, owner_sid=owner_sid
+        )
+    if isinstance(secret, Mapping):
+        _write_json(secret_config_path(), secret, owner_sid, secret=True)
+    else:
+        _remove_install_record(
+            secret_config_path(), public=False, owner_sid=owner_sid
+        )
+    if isinstance(key, bytes) and isinstance(registry, Mapping):
+        _write_secret_bytes(capability_key_path(), key, owner_sid)
+        _write_json(
+            capability_registry_path(), registry, owner_sid, secret=True
+        )
+        _load_capability_registry(owner_sid, create=False)
+    elif not state.get("capabilityExists"):
+        directory = capability_dir()
+        if directory.exists():
+            _verify_broker_only_path(directory, directory=True)
+            _cleanup_capability_temporaries(directory)
+            _remove_install_record(
+                capability_key_path(), public=False, owner_sid=owner_sid
+            )
+            _remove_install_record(
+                capability_registry_path(), public=False, owner_sid=owner_sid
+            )
+            if any(directory.iterdir()):
+                raise OSError("new capability directory contains unknown entries")
+            directory.rmdir()
+
+
+def _cleanup_new_data_directory(
+        state: Mapping[str, object], owner_sid: str) -> None:
+    data_dir = _program_data_dir()
+    if state.get("dataExists") or not data_dir.exists():
+        return
+    _verify_broker_public_directory(data_dir, owner_sid)
+    if any(data_dir.iterdir()):
+        raise OSError("new broker data directory contains unknown entries")
+    data_dir.rmdir()
+
+
+def _commit_install_state(
+        owner_sid: str, public: Mapping[str, object],
+        secret: Mapping[str, object], spec: Mapping[str, str]) -> None:
+    previous = _capture_install_records(owner_sid)
+    previous_public = previous.get("public")
+    previous_task_exists, previous_running = _broker_task_state()
+    if previous_task_exists and not isinstance(previous_public, Mapping):
+        raise OSError("broker task exists without trusted public configuration")
+    marker_written = False
+    task_stopped = False
+    task_attempted = False
+    try:
+        data_dir = _program_data_dir()
+        _verify_broker_data_ancestors(require_localops=False)
+        if not data_dir.exists():
+            data_dir.mkdir(parents=True, exist_ok=False)
+            _protect_path(
+                data_dir, owner_sid, directory=True,
+                user_access=ntsecuritycon.FILE_GENERIC_READ
+                | ntsecuritycon.FILE_GENERIC_EXECUTE,
+            )
+        _verify_broker_public_directory(data_dir, owner_sid)
+        _write_install_marker(owner_sid, spec, "in_progress")
+        marker_written = True
+        if previous_task_exists:
+            _stop_broker_task()
+            task_stopped = True
+        _write_json(public_config_path(), public, owner_sid, secret=False)
+        _write_json(secret_config_path(), secret, owner_sid, secret=True)
+        _load_capability_registry(owner_sid, create=True)
+        task_attempted = True
+        _register_task(spec)
+        _clear_install_marker()
+        marker_written = False
+    except Exception as original:
+        rollback_errors = []
+        marker_present = marker_written or install_incomplete_path().exists()
+        if marker_present and task_attempted:
+            try:
+                _stop_broker_task()
+            except Exception as exc:
+                rollback_errors.append(exc)
+        try:
+            _rollback_install_records(previous, owner_sid)
+        except Exception as exc:
+            rollback_errors.append(exc)
+        if task_attempted:
+            try:
+                if previous_task_exists and isinstance(previous_public, Mapping):
+                    old_spec = broker_task_spec(
+                        str(previous_public["executable"]), owner_sid
+                    )
+                    _register_task(old_spec)
+                else:
+                    _delete_broker_task()
+            except Exception as exc:
+                rollback_errors.append(exc)
+        if rollback_errors:
+            try:
+                _write_install_marker(owner_sid, spec, "rollback_failed")
+            except Exception:
+                pass
+            try:
+                _stop_broker_task()
+            except Exception:
+                pass
+            raise OSError("broker install rollback failed") from original
+        if marker_present:
+            _clear_install_marker()
+        _cleanup_new_data_directory(previous, owner_sid)
+        if previous_running and task_stopped:
+            try:
+                _run_broker_task()
+            except Exception:
+                try:
+                    _disable_broker_task()
+                except Exception:
+                    try:
+                        _delete_broker_task()
+                    except Exception:
+                        _write_install_marker(owner_sid, spec, "restart_failed")
+                # Records and the old task definition are already restored.
+                # A failed best-effort restart leaves that trusted task stopped;
+                # disabling it persists the failed-close state across clients.
+                raise OSError(
+                    "previous broker was restored but could not restart"
+                ) from original
+        raise
+
+
 def install(request: Mapping[str, object]) -> dict[str, object]:
     if (not isinstance(request, Mapping)
             or request.get("schema") != BROKER_INSTALL_SCHEMA
             or set(request) != {
                 "schema", "ownerSid", "passwordRecord",
-                "bundleSource", "executableName",
+                "bundleArchive", "bundleSha256", "executableName",
             }):
         raise ValueError("broker install request is invalid")
     if not bool(getattr(sys, "frozen", False)):
         raise ValueError("broker installation requires the packaged Windows build")
     owner_sid = str(request["ownerSid"])
-    source = Path(str(request["bundleSource"])).resolve()
+    archive_path = Path(os.path.abspath(str(request["bundleArchive"])))
+    archive_fingerprint = str(request["bundleSha256"])
+    if (archive_path.name != "bundle.zip"
+            or not re.fullmatch(r"[0-9a-f]{64}", archive_fingerprint)):
+        raise ValueError("broker bundle archive request is invalid")
     executable_name = str(request["executableName"])
-    if source != Path(sys.executable).resolve().parent:
-        raise ValueError("broker bundle source does not match the elevated package")
-    source_executable = source / executable_name
-    if source_executable.resolve() != Path(sys.executable).resolve():
-        raise ValueError("broker executable does not match the elevated package")
-    fingerprint = _sha256(source_executable)
+    elevated_executable = Path(sys.executable).resolve()
+    if executable_name != elevated_executable.name:
+        raise ValueError("broker executable name does not match the elevated package")
+    executable_fingerprint = _sha256(elevated_executable)
     broker_root = _program_files_broker_dir()
     broker_root.mkdir(parents=True, exist_ok=True)
-    target = broker_root / fingerprint[:16]
-    target_executable = target / executable_name
-    if not target.exists():
-        staging = broker_root / (".install-" + uuid.uuid4().hex)
-        try:
-            shutil.copytree(source, staging, symlinks=False)
-            _protect_bundle(staging, owner_sid)
+    staging = broker_root / (".install-" + uuid.uuid4().hex)
+    try:
+        before = _bundle_metadata(archive_path, directory=False)
+        with _open_install_archive(archive_path) as archive_stream:
+            opened = os.fstat(archive_stream.fileno())
+            if _metadata_identity(opened) != _metadata_identity(before):
+                raise OSError("broker bundle archive changed before opening")
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: archive_stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+            after = _bundle_metadata(archive_path, directory=False)
+            if (_metadata_identity(after) != _metadata_identity(before)
+                    or not hmac.compare_digest(
+                        digest.hexdigest(), archive_fingerprint
+                    )):
+                raise OSError("broker bundle archive verification failed")
+            archive_stream.seek(0)
+            _extract_bundle_archive(archive_stream, staging)
+        _protect_bundle(staging, owner_sid)
+        bundle_fingerprint = _bundle_sha256(staging)
+        target = broker_root / bundle_fingerprint[:16]
+        if target.exists():
+            _verify_protected_bundle(target, owner_sid)
+            if _bundle_sha256(target) != bundle_fingerprint:
+                raise OSError("installed broker bundle hash mismatch")
+        else:
             os.replace(staging, target)
-        finally:
-            if staging.exists() and staging.parent == broker_root:
-                shutil.rmtree(staging)
-    if not target_executable.is_file() or _sha256(target_executable) != fingerprint:
+    finally:
+        if staging.exists() and staging.parent == broker_root:
+            shutil.rmtree(staging)
+    target_executable = target / executable_name
+    _verify_protected_bundle(target, owner_sid)
+    if (not target_executable.is_file()
+            or _sha256(target_executable) != executable_fingerprint):
         raise OSError("installed broker executable hash mismatch")
-    _protect_bundle(target, owner_sid)
+    if _bundle_sha256(target) != bundle_fingerprint:
+        raise OSError("installed broker bundle hash mismatch")
     spec = broker_task_spec(str(target_executable), owner_sid)
     pipe_name = broker_pipe_name(owner_sid)
     public = {
@@ -508,28 +1121,14 @@ def install(request: Mapping[str, object]) -> dict[str, object]:
         "workingDirectory": str(target),
         "taskPath": BROKER_TASK_PATH,
         "pipeName": pipe_name,
-        "executableSha256": fingerprint,
+        "executableSha256": executable_fingerprint,
     }
     secret = {
         "schema": BROKER_PUBLIC_SCHEMA,
         "ownerSid": owner_sid,
         "passwordRecord": request["passwordRecord"],
     }
-    data_dir = _program_data_dir()
-    _verify_broker_data_ancestors(require_localops=False)
-    data_created = not data_dir.exists()
-    if data_created:
-        data_dir.mkdir(parents=True, exist_ok=False)
-        _protect_path(
-            data_dir, owner_sid, directory=True,
-            user_access=ntsecuritycon.FILE_GENERIC_READ
-            | ntsecuritycon.FILE_GENERIC_EXECUTE,
-        )
-    _verify_broker_public_directory(data_dir, owner_sid)
-    _write_json(public_config_path(), public, owner_sid, secret=False)
-    _write_json(secret_config_path(), secret, owner_sid, secret=True)
-    _load_capability_registry(owner_sid, create=True)
-    _register_task(spec)
+    _commit_install_state(owner_sid, public, secret, spec)
     return {"ok": True, "taskPath": BROKER_TASK_PATH}
 
 
@@ -1525,8 +2124,20 @@ class _ElevatedBatchTaskManager:
             return run.stop()
 
 
+def _reject_incomplete_install_request(pipe) -> bool:
+    if not _runtime_install_blocked():
+        return False
+    win32file.WriteFile(pipe, encode_message({
+        "ok": False, "code": "BROKER_INSTALL_INCOMPLETE",
+    }))
+    win32file.FlushFileBuffers(pipe)
+    return True
+
+
 def serve() -> int:
     _verify_broker_data_ancestors(require_localops=True)
+    if _runtime_install_blocked():
+        return 3
     expected_owner_sid = _owner_sid(os.getpid())
     _verify_broker_public_directory(
         _program_data_dir(), expected_owner_sid
@@ -1613,6 +2224,8 @@ def serve() -> int:
             client_pid = int(win32pipe.GetNamedPipeClientProcessId(pipe))
             _, raw = win32file.ReadFile(pipe, _MAX_MESSAGE)
             message = decode_message(bytes(raw))
+            if _reject_incomplete_install_request(pipe):
+                return 3
             response = protocol.handle(message, client_pid=client_pid)
             if message.get("action") == "unlock" and not response.get("ok"):
                 failed_unlocks += 1
@@ -1678,6 +2291,14 @@ def _validate_install_paths(request_path: Path, response_path: Path) -> None:
         raise ValueError("broker install paths are outside the fixed transaction root")
 
 
+def _validate_install_archive(request: Mapping[str, object], request_path: Path) -> None:
+    archive = Path(os.path.abspath(str(request.get("bundleArchive") or "")))
+    expected = Path(os.path.abspath(request_path.parent / "bundle.zip"))
+    if archive != expected:
+        raise ValueError("broker bundle archive is outside the install transaction")
+    _bundle_metadata(archive, directory=False)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if args == ["serve"]:
@@ -1693,6 +2314,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not hmac.compare_digest(
                     broker_install_request_digest(request), expected_digest):
                 raise ValueError("broker install request digest mismatch")
+            _validate_install_archive(request, request_path)
             owner_sid = str(request.get("ownerSid") or "")
             result = install(request)
             _write_install_response(response_path, result, owner_sid)

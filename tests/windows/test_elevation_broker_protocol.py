@@ -59,7 +59,8 @@ class PasswordVerifierTests(unittest.TestCase):
             "schema": "localops-elevation-install.v1",
             "ownerSid": "S-1-5-21-1-2-3-1001",
             "passwordRecord": {"verifier": "opaque"},
-            "bundleSource": r"C:\\Local Ops",
+            "bundleArchive": r"C:\\Local Ops\\bundle.zip",
+            "bundleSha256": "a" * 64,
             "executableName": "LocalOps.exe",
         }
 

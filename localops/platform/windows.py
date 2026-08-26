@@ -16,8 +16,10 @@ import threading
 import time
 import uuid
 import webbrowser
+import zipfile
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Literal, Mapping, Sequence
 from xml.etree import ElementTree
 
@@ -60,7 +62,12 @@ from localops.elevation_broker import (
     normalize_scheduled_request,
     verify_broker_task,
 )
-from localops.windows.elevation_broker import public_config_path
+from localops.windows.elevation_broker import (
+    _bundle_entries,
+    _metadata_identity,
+    install_incomplete_path,
+    public_config_path,
+)
 from localops.windows.runner_protocol import (
     PIPE_BUFFER_BYTES,
     ProtocolError,
@@ -110,6 +117,53 @@ from .contracts import (
     StopResult,
     windows_runtime_identity_public,
 )
+
+
+def _write_broker_install_archive(source_root: str, archive_path: str) -> None:
+    root = Path(os.path.abspath(source_root))
+    destination = Path(os.path.abspath(archive_path))
+    with zipfile.ZipFile(
+            destination, "x", compression=zipfile.ZIP_DEFLATED,
+            compresslevel=6) as archive:
+        for kind, candidate, metadata in _bundle_entries(root):
+            relative = candidate.relative_to(root).as_posix()
+            info = zipfile.ZipInfo(
+                relative + ("/" if kind == "D" else ""),
+                date_time=(1980, 1, 1, 0, 0, 0),
+            )
+            if kind == "D":
+                info.compress_type = zipfile.ZIP_STORED
+                info.external_attr = (stat.S_IFDIR | 0o755) << 16 | 0x10
+                archive.writestr(info, b"")
+                continue
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = (stat.S_IFREG | 0o644) << 16
+            with open(candidate, "rb") as source:
+                opened = os.fstat(source.fileno())
+                if _metadata_identity(opened) != _metadata_identity(metadata):
+                    raise OSError("broker bundle file changed before archiving")
+                written = 0
+                with archive.open(info, "w") as output:
+                    while True:
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        output.write(chunk)
+            after = candidate.stat(follow_symlinks=False)
+            if (written != metadata.st_size
+                    or _metadata_identity(after) != _metadata_identity(metadata)):
+                raise OSError("broker bundle file changed while archiving")
+
+
+def _broker_install_marker_present() -> bool:
+    try:
+        os.lstat(os.fspath(install_incomplete_path()))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
 
 
 _SYSTEM_SID = "S-1-5-18"
@@ -1693,6 +1747,8 @@ class WindowsPlatform:
         return digest.hexdigest()
 
     def _broker_public_config(self) -> dict[str, object] | None:
+        if _broker_install_marker_present():
+            raise ValueError("broker installation is incomplete")
         path = os.fspath(public_config_path())
         try:
             with open(path, "r", encoding="utf-8") as stream:
@@ -1723,6 +1779,9 @@ class WindowsPlatform:
     def _broker_exchange(
             self, message: Mapping[str, object], timeout_ms: int = 5000,
     ) -> dict[str, object]:
+        if _broker_install_marker_present():
+            self._elevation_token = None
+            raise ValueError("broker installation is incomplete")
         pipe_name = broker_pipe_name(self._sid)
         deadline = time.monotonic() + max(0.001, timeout_ms / 1000.0)
         transient_errors = {
@@ -1905,13 +1964,19 @@ class WindowsPlatform:
             transaction = os.path.join(root, uuid.uuid4().hex)
             os.mkdir(transaction)
             self.ensure_private_directory(transaction)
+            bundle_archive = os.path.join(transaction, "bundle.zip")
+            _write_broker_install_archive(
+                os.path.dirname(source_executable), bundle_archive
+            )
+            self.ensure_private_file(bundle_archive)
             request_path = os.path.join(transaction, "request.json")
             response_path = os.path.join(transaction, "response.json")
             request = {
                 "schema": BROKER_INSTALL_SCHEMA,
                 "ownerSid": self._sid,
                 "passwordRecord": dict(password_record),
-                "bundleSource": os.path.dirname(source_executable),
+                "bundleArchive": bundle_archive,
+                "bundleSha256": self._file_sha256(bundle_archive),
                 "executableName": os.path.basename(source_executable),
             }
             write_json_atomic(request_path, request, self.ensure_private_file)
@@ -1963,7 +2028,7 @@ class WindowsPlatform:
             if process_handle is not None:
                 win32api.CloseHandle(process_handle)
             if transaction is not None:
-                for name in ("response.json", "request.json"):
+                for name in ("response.json", "request.json", "bundle.zip"):
                     try:
                         os.remove(os.path.join(transaction, name))
                     except FileNotFoundError:

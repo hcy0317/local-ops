@@ -50,6 +50,67 @@ class WindowsPlatformTests(unittest.TestCase):
         # elevated-controller test below opts back into True.
         self.platform.controller_elevated = False
 
+    def test_broker_install_archive_is_complete_and_deterministic(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "source"
+            (source / "_internal" / "static").mkdir(parents=True)
+            (source / "empty").mkdir()
+            (source / "LocalOps.exe").write_bytes(b"executable")
+            (source / "_internal" / "static" / "app.js").write_text(
+                "const version = 1;", encoding="utf-8"
+            )
+            first = Path(root) / "first.zip"
+            second = Path(root) / "second.zip"
+
+            windows_adapter._write_broker_install_archive(
+                str(source), str(first)
+            )
+            windows_adapter._write_broker_install_archive(
+                str(source), str(second)
+            )
+
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            with windows_adapter.zipfile.ZipFile(first, "r") as archive:
+                self.assertEqual(archive.namelist(), [
+                    "_internal/", "_internal/static/",
+                    "_internal/static/app.js", "empty/", "LocalOps.exe",
+                ])
+
+    def test_broker_install_archive_rejects_reparse_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "source"
+            source.mkdir()
+            archive = Path(root) / "bundle.zip"
+            with mock.patch.object(
+                    windows_adapter, "_bundle_entries",
+                    side_effect=OSError("reparse point")):
+                with self.assertRaisesRegex(OSError, "reparse"):
+                    windows_adapter._write_broker_install_archive(
+                        str(source), str(archive)
+                    )
+
+    def test_broker_status_rejects_incomplete_install_marker(self):
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root) / "elevation-install-incomplete.json"
+            marker.write_text("{}", encoding="utf-8")
+            with mock.patch.object(
+                    windows_adapter, "install_incomplete_path",
+                    return_value=marker):
+                with self.assertRaisesRegex(ValueError, "incomplete"):
+                    self.platform._broker_public_config()
+
+    def test_existing_broker_token_is_revoked_before_marker_blocked_exchange(self):
+        self.platform._elevation_token = "existing-token"
+        with mock.patch.object(
+                windows_adapter, "_broker_install_marker_present",
+                return_value=True), mock.patch.object(
+                    windows_adapter.win32pipe, "WaitNamedPipe") as wait_pipe:
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                self.platform._broker_exchange({"action": "status"})
+
+        self.assertIsNone(self.platform._elevation_token)
+        wait_pipe.assert_not_called()
+
     def test_broker_exchange_waits_for_new_task_pipe_to_appear(self):
         missing = windows_adapter.pywintypes.error(
             windows_adapter.winerror.ERROR_FILE_NOT_FOUND,

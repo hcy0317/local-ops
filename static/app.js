@@ -25,6 +25,7 @@ import { configuredPort, actualPorts, portIsOpenable,
   preferredOpenPort } from './js/ports.js';
 import { lifecyclePayload, lifecycleSnapshot, runLifecycleMutation } from './js/lifecycle.js';
 import { buildStateHealthNotice, ConnectionFailureTracker } from './js/connectivity.js';
+import { commitMutationFeedback } from './js/mutation-state.js';
 
 /* ---------------- DOM 引用 ---------------- */
 const banner = $('#banner');
@@ -274,6 +275,16 @@ window.__poll = async () => {
   if (pending) await pending;
   return poll(true);
 };
+window.__commitMutation = mutation => commitMutationFeedback({
+  data: state.data,
+  mutation,
+  commit: data => {
+    state.data = data;
+    state.lastUpdate = new Date();
+    render();
+  },
+  refresh: () => schedulePoll(0),
+});
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     suspendPortDiscovery();

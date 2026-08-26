@@ -15,6 +15,7 @@ import { configuredPort, actualPorts, hasPortMismatch,
 import { elevatedControlGate, lifecyclePayload, lifecycleSnapshot,
   runLifecycleMutation } from './lifecycle.js';
 import { normalizeHostCpuPercent } from './metrics.js';
+import { keepAliveFeedbackPatch } from './mutation-state.js';
 import {
   insertBeforePinnedAddCard,
   PointerSortSession,
@@ -363,7 +364,9 @@ function updateAppCard(card, app) {
   let stTxt = app.running ? '运行中' : (app.port ? '已停止' : '未运行');
   let stFail = false;
   let taskHistoryText = '';
-  if (isScheduled && scheduledState === 'running') {
+  if (app.optimisticPending && lifecycle.status === 'unknown') {
+    stTxt = '状态确认中';
+  } else if (isScheduled && scheduledState === 'running') {
     stTxt = '运行中 · Windows 计划任务';
   } else if (isScheduled && scheduledState === 'ready') {
     stTxt = isTask ? '就绪 · 等待运行' : '计划任务就绪';
@@ -619,7 +622,16 @@ async function toggleKeepAlive(app, button) {
       toast(enabled
         ? (app.running ? '已开启保活' : '已开启保活，正在自动启动')
         : '已关闭保活');
-      await window.__poll();
+      window.__commitMutation({
+        type: 'app-patch',
+        appId: app.id,
+        patch: keepAliveFeedbackPatch(
+          app,
+          result,
+          state.data && state.data.elevationBroker
+            && state.data.elevationBroker.sessionAuthorized === true,
+        ),
+      });
     }
   } finally {
     delete button.dataset.busy;
@@ -839,10 +851,14 @@ function confirmDeleteApp(app) {
         toast(platformPresentation().lifecycleNotice);
         return;
       }
-      const { result, stateIsFresh } = await runLifecycleMutation(
-        () => act(del('/api/apps/' + app.id, lifecyclePayload(intent))),
-        refreshLifecycleState,
-      );
+      const result = await act(del(
+        '/api/apps/' + app.id, lifecyclePayload(intent)
+      ));
+      if (result && result.ok !== false) {
+        window.__commitMutation({ type: 'app-delete', appId: app.id });
+        return;
+      }
+      const stateIsFresh = await refreshLifecycleState(result);
       if (intent.canManage && !isScheduled && !isDocker && !isElevated) {
         offerForceStopAfterTimeout(result, intent, app.id, app.name, stateIsFresh, () => {
           toast('已强制停止，请再次确认删除');

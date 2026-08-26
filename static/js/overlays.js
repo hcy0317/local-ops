@@ -148,7 +148,7 @@ async function submitBrokerPassword() {
       if (!unlocked || unlocked.ok === false) return;
     }
     closeBrokerPassword();
-    await window.__poll();
+    window.__commitMutation({ type: 'broker-unlocked' });
     toast('当前 Local Ops 会话已解锁管理员启动');
   } finally {
     brokerPasswordSubmit.disabled = false;
@@ -1029,12 +1029,12 @@ async function saveApp() {
   refreshEditSaveMode();
   try {
     const app = editingAppId
-      ? (await runLifecycleMutation(
-        () => act(put('/api/apps/' + editingAppId, body)),
-        async app => await refreshLifecycleState(app),
-      )).result
+      ? await act(put('/api/apps/' + editingAppId, body))
       : await act(post('/api/apps', body));
     if (!app || app.ok === false) {
+      if (!wasCreating && isGenerationMismatch(app)) {
+        await refreshLifecycleState(app);
+      }
       if (!wasCreating) {
         const latest = findApp(editingAppId);
         if (latest) {
@@ -1069,28 +1069,30 @@ async function saveApp() {
         const j = await r.json();
         if (!r.ok || (j && j.ok === false)) {
           toast((j && j.error) || '图标上传失败，配置已保存，可直接重试');
-          await window.__poll();
+          window.__commitMutation({ type: 'app-upsert', app });
           return;
         }
+        if (j && j.icon) app.icon = j.icon;
         bumpIconVer(id);
         bumpMutationEpoch();   // 原生 fetch 不经过 req，手动作废在途旧快照
       } catch (e) {
         toast('图标上传失败：' + e.message + '。配置已保存，可直接重试');
-        await window.__poll();
+        window.__commitMutation({ type: 'app-upsert', app });
         return;
       }
     } else if (removeStoredIcon && id) {
       const result = await act(del('/api/apps/' + id + '/icon'));
       if (!result || result.ok === false) {
         toast('配置已保存，但图标清除失败，可直接重试');
-        await window.__poll();
+        window.__commitMutation({ type: 'app-upsert', app });
         return;
       }
       removeStoredIcon = false;
+      app.icon = null;
       bumpIconVer(id);
     }
     closeAppModal();
-    await window.__poll();
+    window.__commitMutation({ type: 'app-upsert', app });
     if (attachSucceeded) toast('已加入启动台并认领正在运行的进程');
     if (body.elevated) {
       const broker = (state.data && state.data.elevationBroker) || {};

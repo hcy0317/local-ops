@@ -453,15 +453,15 @@ test('all lifecycle caller classes route through the shared executable contract'
   assert.equal((app.match(/await runLifecycleMutation\(/g) || []).length, 1);
 
   assert.match(launchpad, /capturedIntent \|\| lifecycleSnapshot/, 'card intent');
-  assert.match(launchpad, /del\('\/api\/apps\/' \+ app\.id, lifecyclePayload\(intent\)\)/,
+  assert.match(launchpad, /del\(\s*'\/api\/apps\/' \+ app\.id, lifecyclePayload\(intent\)\s*\)/,
     'card delete');
   assert.match(launchpad, /'\/api\/apps\/' \+ owner\.appId \+ '\/stop'/,
     'managed port stop');
-  assert.equal((launchpad.match(/await runLifecycleMutation\(/g) || []).length, 4);
+  assert.equal((launchpad.match(/await runLifecycleMutation\(/g) || []).length, 3);
 
   assert.match(overlays, /body\.expectedGeneration = editingAppOriginal\.lifecycle\.expectedGeneration/,
     'edit save');
-  assert.equal((overlays.match(/await runLifecycleMutation\(/g) || []).length, 2);
+  assert.equal((overlays.match(/await runLifecycleMutation\(/g) || []).length, 1);
   assert.match(overlays, /confirmed: true[\s\S]*runConfirmedForceStop|runConfirmedForceStop\([\s\S]*confirmed: true/,
     'second explicit force confirmation');
 

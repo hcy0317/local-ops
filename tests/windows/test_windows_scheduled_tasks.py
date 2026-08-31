@@ -132,6 +132,42 @@ class ScheduledTaskStateTests(unittest.TestCase):
             fake.calls.count(("scheduled_tasks", frozenset({TASK_PATH}))), 1
         )
 
+    def test_unreadable_scheduled_task_is_unknown_instead_of_missing(self):
+        fake = self.fake_platform("running")
+        fake.scheduled = ScheduledTaskSnapshot(
+            ScanStatus.PARTIAL,
+            {TASK_PATH.casefold(): {
+                "path": TASK_PATH,
+                "name": "Memos-Guard",
+                "state": "unknown",
+                "enabled": False,
+                "enginePids": [],
+                "error": "access denied",
+            }},
+            (PlatformIssue(
+                "scheduled_tasks", "task_access_denied",
+                "task is not readable",
+            ),),
+        )
+        cfg = dict(server.Config.DEFAULT)
+        cfg["apps"] = [scheduled_app("service")]
+
+        with mock.patch.object(server, "PLATFORM", fake), \
+                mock.patch.object(server, "build_services", return_value=([], set())), \
+                mock.patch.object(server, "build_watched", return_value=[]):
+            state = server.build_state(cfg, 9600, {})
+
+        app = state["apps"][0]
+        self.assertTrue(state["degraded"])
+        self.assertEqual(app["scheduledTask"]["state"], "unknown")
+        self.assertEqual(app["health"]["status"], "unknown")
+        self.assertTrue(app["health"]["blocking"])
+        self.assertEqual(
+            app["health"]["issues"][0]["kind"],
+            "scheduled-task-unavailable",
+        )
+        self.assertFalse(app["scheduledTaskControlAvailable"])
+
     def test_ready_batch_task_can_be_run_without_becoming_a_managed_job(self):
         fake = self.fake_platform("ready")
         app = scheduled_app("task")

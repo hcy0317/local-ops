@@ -906,6 +906,28 @@ class WindowsPlatform:
         return normalized, folder or "\\", name
 
     @staticmethod
+    def _scheduled_task_query_winerror(exc: BaseException) -> int | None:
+        values = [
+            getattr(exc, "winerror", None),
+            getattr(exc, "hresult", None),
+        ]
+        args = getattr(exc, "args", ())
+        if (len(args) > 2 and isinstance(args[2], tuple)
+                and len(args[2]) > 5):
+            values.append(args[2][5])
+        for value in values:
+            try:
+                code = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 0 < code <= 0xFFFF:
+                return code
+            unsigned = code & 0xFFFFFFFF
+            if unsigned & 0xFFFF0000 == 0x80070000:
+                return unsigned & 0xFFFF
+        return None
+
+    @staticmethod
     def _task_timestamp(value: object) -> int | None:
         if value is None:
             return None
@@ -1310,11 +1332,17 @@ class WindowsPlatform:
                     try:
                         task = service.GetFolder(folder_path).GetTask(name)
                         row = self._scheduled_task_row(task)
-                    except (AttributeError, TypeError, ValueError, pywintypes.error) as exc:
+                    except (AttributeError, TypeError, ValueError,
+                            pywintypes.error, pythoncom.com_error) as exc:
+                        error_code = self._scheduled_task_query_winerror(exc)
+                        missing = error_code in {
+                            winerror.ERROR_FILE_NOT_FOUND,
+                            winerror.ERROR_PATH_NOT_FOUND,
+                        }
                         row = {
                             "path": normalized,
                             "name": name,
-                            "state": "missing",
+                            "state": "missing" if missing else "unknown",
                             "enabled": False,
                             "lastRunAt": None,
                             "nextRunAt": None,
@@ -1325,6 +1353,14 @@ class WindowsPlatform:
                             "enginePids": [],
                             "error": str(exc),
                         }
+                        if not missing:
+                            issues.append(_issue(
+                                "scheduled_tasks",
+                                "task_access_denied" if error_code
+                                == winerror.ERROR_ACCESS_DENIED
+                                else "task_query_failed",
+                                f"{normalized}: {exc}",
+                            ))
                     tasks[normalized.casefold()] = row
             else:
                 pending = [service.GetFolder("\\")]
@@ -1392,13 +1428,24 @@ class WindowsPlatform:
 
     def scheduled_tasks(self, paths: set[str] | None = None) -> ScheduledTaskSnapshot:
         direct = self._scheduled_tasks_direct(paths)
-        if direct.status is not ScanStatus.FAILED:
+        if (direct.status is ScanStatus.OK
+                or direct.status is ScanStatus.PARTIAL and paths is None):
             return direct
-        if (paths is not None and len(paths) == 1
+        if (direct.status is ScanStatus.FAILED
+                and paths is not None and len(paths) == 1
                 and next(iter(paths)).casefold() == BROKER_TASK_PATH.casefold()):
             return self._broker_task_snapshot_cli()
         if self._elevation_token is not None:
-            return self._broker_scheduled_tasks(paths)
+            broker = self._broker_scheduled_tasks(paths)
+            if broker.status is not ScanStatus.FAILED:
+                return broker
+            if direct.status is ScanStatus.PARTIAL:
+                return ScheduledTaskSnapshot(
+                    ScanStatus.PARTIAL,
+                    direct.tasks,
+                    tuple(dict.fromkeys((*direct.issues, *broker.issues))),
+                )
+            return broker
         return direct
 
     @staticmethod
@@ -1846,7 +1893,7 @@ class WindowsPlatform:
             response = self._broker_scheduled_exchange(request)
             tasks_value = response.get("tasks")
             issues_value = response.get("issues") or []
-            if (not response.get("ok") or not isinstance(tasks_value, dict)
+            if (not isinstance(tasks_value, dict)
                     or not isinstance(issues_value, list)):
                 raise ValueError(
                     str(response.get("error") or "broker task query failed")
@@ -1868,6 +1915,16 @@ class WindowsPlatform:
                 for item in issues_value if isinstance(item, Mapping)
             )
             status = ScanStatus(str(response.get("status") or "failed"))
+            if not response.get("ok") and status is not ScanStatus.FAILED:
+                raise ValueError(
+                    str(response.get("error") or "broker task query failed")
+                )
+            if status is ScanStatus.FAILED and not issues:
+                issues = (_issue(
+                    "scheduled_tasks",
+                    str(response.get("code") or "broker_query_failed"),
+                    str(response.get("error") or "broker task query failed"),
+                ),)
             return ScheduledTaskSnapshot(status, tasks, issues)
         except (OSError, TypeError, ValueError, pywintypes.error) as exc:
             return ScheduledTaskSnapshot(ScanStatus.FAILED, issues=(

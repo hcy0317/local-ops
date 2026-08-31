@@ -170,6 +170,95 @@ class WindowsPlatformTests(unittest.TestCase):
         self.assertTrue(stopped.ok)
         self.assertEqual(exchange.call_count, 2)
 
+    def test_scheduled_task_query_isolates_one_access_denied_row(self):
+        service = mock.Mock()
+        folder = mock.Mock()
+        readable = object()
+        service.GetFolder.return_value = folder
+
+        denied = windows_adapter.pythoncom.com_error(
+            -2147352567,
+            "unexpected",
+            (0, None, None, None, 0, -2147024891),
+            None,
+        )
+        missing = windows_adapter.pythoncom.com_error(
+            -2147024894, "not found", None, None
+        )
+
+        def get_task(name):
+            if name == "Protected":
+                raise denied
+            if name == "Missing":
+                raise missing
+            return readable
+
+        folder.GetTask.side_effect = get_task
+        with mock.patch.object(
+                windows_adapter.win32com.client, "Dispatch",
+                return_value=service), mock.patch.object(
+                    self.platform, "_scheduled_task_row",
+                    return_value={
+                        "path": r"\Readable",
+                        "name": "Readable",
+                        "state": "running",
+                        "enabled": True,
+                    }):
+            snapshot = self.platform._scheduled_tasks_direct({
+                r"\Readable", r"\Protected", r"\Missing",
+            })
+
+        self.assertIs(snapshot.status, ScanStatus.PARTIAL)
+        self.assertEqual(snapshot.tasks[r"\readable"]["state"], "running")
+        self.assertEqual(snapshot.tasks[r"\protected"]["state"], "unknown")
+        self.assertEqual(snapshot.tasks[r"\missing"]["state"], "missing")
+        self.assertTrue(any(
+            issue.code == "task_access_denied" for issue in snapshot.issues
+        ))
+
+    def test_partial_scheduler_rows_survive_failed_broker_fallback(self):
+        direct_issue = windows_adapter.PlatformIssue(
+            "scheduled_tasks", "task_access_denied", "protected task"
+        )
+        direct = ScheduledTaskSnapshot(
+            ScanStatus.PARTIAL,
+            {
+                r"\readable": {
+                    "path": r"\Readable", "state": "running", "enabled": True,
+                },
+                r"\protected": {
+                    "path": r"\Protected", "state": "unknown", "enabled": False,
+                },
+            },
+            (direct_issue,),
+        )
+        self.platform._elevation_token = "session-token"
+        with mock.patch.object(
+                self.platform, "_scheduled_tasks_direct",
+                return_value=direct), mock.patch.object(
+                    self.platform, "_broker_scheduled_exchange",
+                    return_value={
+                        "ok": False,
+                        "status": "failed",
+                        "tasks": {},
+                        "issues": [{
+                            "component": "scheduled_tasks",
+                            "code": "broker_access_denied",
+                            "message": "broker could not read protected task",
+                            "degrades": True,
+                        }],
+                    }):
+            snapshot = self.platform.scheduled_tasks({
+                r"\Readable", r"\Protected",
+            })
+
+        self.assertIs(snapshot.status, ScanStatus.PARTIAL)
+        self.assertEqual(snapshot.tasks, direct.tasks)
+        self.assertEqual(
+            {issue.code for issue in snapshot.issues},
+            {"task_access_denied", "broker_access_denied"},
+        )
+
     def test_source_venv_runner_uses_base_process_with_venv_context(self):
         venv_python = r"C:\fixture\.venv\Scripts\python.exe"
         base_python = r"C:\Python312\python.exe"

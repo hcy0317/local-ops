@@ -2108,6 +2108,16 @@ def scheduled_task_health(task):
                 "action": "select-scheduled-task",
             }],
         }
+    if task.get("state") == "unknown":
+        return {
+            "status": "unknown",
+            "blocking": True,
+            "issues": [{
+                "kind": "scheduled-task-unavailable",
+                "title": "Windows 计划任务暂不可读取",
+                "detail": "当前权限无法确认该任务的状态，其他计划任务仍可正常显示。",
+            }],
+        }
     if not task.get("enabled") or task.get("state") == "disabled":
         return {
             "status": "error",
@@ -2188,7 +2198,7 @@ def scheduled_task_app_row(app, task):
         "scheduledTask": task,
         "scheduledTaskPath": scheduled_task_path(app),
         "scheduledTaskControlAvailable": (
-            state != "missing"
+            state not in ("missing", "unknown")
             and bool(getattr(
                 PLATFORM.capabilities, "toggle_scheduled_tasks", False
             ))

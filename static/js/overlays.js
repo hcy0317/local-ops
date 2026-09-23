@@ -184,7 +184,11 @@ export function confirmKill(svc) {
   });
 }
 
-export async function refreshLifecycleState(result) {
+export async function refreshLifecycleState(result, { preferStream = false } = {}) {
+  if (preferStream && window.__streamLive && window.__streamLive()) {
+    /* 成功的写操作会让服务端强制下发权威快照，无需再拉一次全量状态。 */
+    return true;
+  }
   const stateIsFresh = window.__poll ? await window.__poll() === true : false;
   if (isGenerationMismatch(result)) {
     toast('应用状态已变化，本次操作未执行；已刷新最新状态');

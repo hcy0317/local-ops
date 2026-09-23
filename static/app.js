@@ -26,6 +26,8 @@ import { configuredPort, actualPorts, portIsOpenable,
 import { lifecyclePayload, lifecycleSnapshot, runLifecycleMutation } from './js/lifecycle.js';
 import { buildStateHealthNotice, ConnectionFailureTracker } from './js/connectivity.js';
 import { commitMutationFeedback } from './js/mutation-state.js';
+import { decodeStateEvent, nextPollDelay, stateStreamUrl,
+  streamIsLive, streamIsSilent } from './js/refresh.js';
 
 /* ---------------- DOM 引用 ---------------- */
 const banner = $('#banner');
@@ -148,7 +150,6 @@ railBtns.forEach(b => b.addEventListener('click', () => switchView(b.dataset.vie
 /* ============================================================
    轮询
    ============================================================ */
-const POLL_INTERVAL_MS = 2000;
 const POLL_TIMEOUT_MS = 7000;
 const HEALTH_PROBE_TIMEOUT_MS = 2000;
 let pollPromise = null;
@@ -157,6 +158,13 @@ let pollTimer = null;
 let restartDeadlineTimer = null;
 const connectionFailures = new ConnectionFailureTracker(2);
 let stateRefreshDelayed = false;
+let stateStream = null;
+let stateStreamOpen = false;
+let streamConnectedAt = 0;
+let streamLastEventAt = 0;
+let streamRetryTimer = null;
+let streamRetryDelayMs = 0;
+let appliedStateVersion = 0;
 
 async function controlPlaneReachable() {
   const controller = new AbortController();
@@ -203,32 +211,7 @@ function poll(force = false) {
         schedulePoll(0);
         return false;
       }
-      reconcilePendingUiTheme(data);
-      if (state.restartingFrom) {
-        suspendPortDiscovery();
-        resetFeedBaseline();
-      }
-      observePortDiscovery(data);
-      notifyTaskCompletions(state.data, data);
-      state.data = data;
-      state.lastUpdate = new Date();
-      connectionFailures.recordSuccess();
-      stateRefreshDelayed = false;
-      notifyConfigMigration(data);
-      const restartCompleted = state.restartingFrom && data.consolePid
-        && data.consolePid !== state.restartingFrom;
-      if (restartCompleted) {
-        clearTimeout(restartDeadlineTimer);
-        restartDeadlineTimer = null;
-        state.restartingFrom = null;
-        setConnected(true);
-        toast('总控台已重新启动');
-      } else if (!state.restartingFrom && !state.stopping) {
-        setConnected(true);
-      }
-      render();
-      promptForElevationSession(data);
-      return true;
+      return applySnapshot(data);
     } catch (e) {
       suspendPortDiscovery();
       resetFeedBaseline();
@@ -259,14 +242,153 @@ function poll(force = false) {
   return pollPromise;
 }
 
-function schedulePoll(delay = POLL_INTERVAL_MS) {
+/* 一份权威快照的落库：轮询与事件推送共用同一条路径。 */
+function applySnapshot(data) {
+  reconcilePendingUiTheme(data);
+  if (state.restartingFrom) {
+    suspendPortDiscovery();
+    resetFeedBaseline();
+  }
+  observePortDiscovery(data);
+  notifyTaskCompletions(state.data, data);
+  state.data = data;
+  state.lastUpdate = new Date();
+  connectionFailures.recordSuccess();
+  stateRefreshDelayed = false;
+  notifyConfigMigration(data);
+  const restartCompleted = state.restartingFrom && data.consolePid
+    && data.consolePid !== state.restartingFrom;
+  if (restartCompleted) {
+    clearTimeout(restartDeadlineTimer);
+    restartDeadlineTimer = null;
+    state.restartingFrom = null;
+    setConnected(true);
+    toast('总控台已重新启动');
+  } else if (!state.restartingFrom && !state.stopping) {
+    setConnected(true);
+  }
+  render();
+  promptForElevationSession(data);
+  return true;
+}
+
+function streamSilent() {
+  return streamIsSilent({
+    now: Date.now(),
+    lastEventAt: streamLastEventAt,
+    connectedAt: streamConnectedAt,
+  });
+}
+
+/* 推送可用时不再安排固定频率轮询；轮询只在推送不可用时接管。 */
+function streamLive() {
+  return streamIsLive({
+    available: !!stateStream,
+    readyState: stateStream && stateStream.readyState,
+    opened: stateStreamOpen,
+    silent: streamSilent(),
+  });
+}
+
+function schedulePoll(delay) {
   clearTimeout(pollTimer);
   pollTimer = null;
   if (document.hidden) return;
+  const live = streamLive();
+  if (!live && stateStream && streamSilent()) {
+    /* 长连接静默：先退回轮询，再按退避重新建立推送通道。 */
+    closeStateStream();
+    scheduleStreamRetry();
+  }
+  const wait = delay === undefined ? nextPollDelay({ streamLive: live }) : delay;
+  if (wait === null) return;
   pollTimer = setTimeout(async () => {
     await poll();
     schedulePoll();
-  }, delay);
+  }, wait);
+}
+
+function closeStateStream() {
+  const source = stateStream;
+  stateStream = null;
+  stateStreamOpen = false;
+  streamLastEventAt = 0;
+  if (!source) return;
+  source.onerror = null;
+  try {
+    source.close();
+  } catch (error) {
+    /* 已经关闭的连接无需处理 */
+  }
+}
+
+function scheduleStreamRetry() {
+  clearTimeout(streamRetryTimer);
+  streamRetryDelayMs = Math.min(
+    streamRetryDelayMs ? streamRetryDelayMs * 2 : 5000, 60000);
+  streamRetryTimer = setTimeout(() => {
+    streamRetryTimer = null;
+    openStateStream(!document.hidden);
+  }, streamRetryDelayMs);
+}
+
+/* 长连接即“订阅状态变更”：服务端在订阅时立刻重算一份快照。 */
+function openStateStream(visible = !document.hidden) {
+  if (typeof EventSource !== 'function') return;
+  clearTimeout(streamRetryTimer);
+  streamRetryTimer = null;
+  closeStateStream();
+  /* 总控台重启后服务端版本会从头开始，重连时重新对齐。 */
+  appliedStateVersion = 0;
+  let source;
+  try {
+    source = new EventSource(stateStreamUrl(visible));
+  } catch (error) {
+    scheduleStreamRetry();
+    return;
+  }
+  stateStream = source;
+  stateStreamOpen = false;
+  streamConnectedAt = Date.now();
+  source.addEventListener('open', () => {
+    if (stateStream !== source) return;
+    /* EventSource 会在连接轮换后自动重连；服务端版本也可能随重启归零，
+       因此每次握手成功都重新对齐版本，避免后续事件被误判为旧帧。 */
+    appliedStateVersion = 0;
+    stateStreamOpen = true;
+    streamRetryDelayMs = 0;
+    streamConnectedAt = Date.now();
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  });
+  source.addEventListener('state', event => {
+    if (stateStream !== source) return;
+    streamLastEventAt = Date.now();
+    const decoded = decodeStateEvent(
+      event.data, event.lastEventId, appliedStateVersion);
+    if (!decoded) return;
+    appliedStateVersion = decoded.version;
+    applySnapshot(decoded.state);
+  });
+  source.addEventListener('heartbeat', () => {
+    if (stateStream !== source) return;
+    /* 心跳证明连接仍可用；只有真正半死的连接才退回轮询。 */
+    streamLastEventAt = Date.now();
+  });
+  source.onerror = () => {
+    if (stateStream !== source) return;
+    if (source.readyState === 0) {
+      /* EventSource 会在 CONNECTING 状态自动重连；在真正 open 前继续
+         保留轮询兜底，避免持续重连时页面完全停止刷新。 */
+      stateStreamOpen = false;
+      schedulePoll(0);
+      return;
+    }
+    /* 服务端收尾、会话失效或代理不可用：退回轮询并退避重连。 */
+    closeStateStream();
+    schedulePoll(0);
+    scheduleStreamRetry();
+  };
 }
 
 /* 写操作后的调用方必须拿到一份真正晚于在途旧请求的新快照。 */
@@ -275,6 +397,14 @@ window.__poll = async () => {
   if (pending) await pending;
   return poll(true);
 };
+/* 其他模块据此判断当前是否由事件推送驱动，避免多余补轮询。 */
+window.__streamLive = streamLive;
+function refreshAfterMutation() {
+  /* 写操作会触发服务端强制下发一帧；推送可用时不再补一次全量快照。 */
+  if (streamLive()) return true;
+  schedulePoll(0);
+  return true;
+}
 window.__commitMutation = mutation => commitMutationFeedback({
   data: state.data,
   mutation,
@@ -283,7 +413,7 @@ window.__commitMutation = mutation => commitMutationFeedback({
     state.lastUpdate = new Date();
     render();
   },
-  refresh: () => schedulePoll(0),
+  refresh: refreshAfterMutation,
 });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
@@ -292,6 +422,14 @@ document.addEventListener('visibilitychange', () => {
     clearTimeout(pollTimer);
     pollTimer = null;
     if (pollController) pollController.abort();
+    /* 后台保留低频订阅，切回来时数据最多只落后一个巡检周期。 */
+    openStateStream(false);
+    return;
+  }
+  /* 回到前台立刻重订阅：服务端马上重算并推送，页面不再等下一轮轮询。 */
+  if (typeof EventSource === 'function') {
+    openStateStream(true);
+    schedulePoll();
     return;
   }
   poll(true).finally(() => schedulePoll());
@@ -769,4 +907,7 @@ try {
 } catch (e) {
   setConnected(false, e.message);
 }
-poll(true).finally(() => schedulePoll());
+openStateStream(!document.hidden);
+poll(true).finally(() => {
+  schedulePoll();
+});

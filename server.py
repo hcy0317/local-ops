@@ -72,6 +72,11 @@ from localops.elevation_broker import (
     new_password_record,
     normalize_elevated_task_command_spec,
 )
+from localops.state_events import (
+    HEARTBEAT_SEC as STATE_HEARTBEAT_SEC,
+    STREAM_MAX_SEC as STATE_STREAM_MAX_SEC,
+    StateBroadcaster,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_PATH = os.path.join(BASE_DIR, "VERSION")
@@ -1554,7 +1559,10 @@ _ORIGIN_MULTIPLEXERS = {"tmux": "tmux", "screen": "screen"}
 
 def origin_snapshot(pids=None):
     """Return {pid: (ppid, args)} for origin attribution."""
-    snapshot = PLATFORM.process_parents(None if pids is None else set(pids))
+    snapshot = (
+        PLATFORM.process_parents(None)
+        if pids is None else _cached_origin_process_snapshot(pids)
+    )
     _record_platform_issues(snapshot.status, snapshot.issues)
     return {
         pid: (int(info.get("ppid", 0)), str(info.get("args") or ""))
@@ -2064,22 +2072,172 @@ def build_program_process_snapshot(cfg, broker_status=None):
     names = sorted(set(executables), key=str.casefold)
     if PLATFORM.name != "windows" or not names:
         return {}
-    snapshot = PLATFORM.processes_matching_keywords(names)
+    return _cached_program_process_snapshot(cfg, names, broker_status)
+
+
+_PLATFORM_SNAPSHOT_CACHE_TTL = 15.0
+_platform_snapshot_cache_lock = threading.Lock()
+_platform_snapshot_cache_generation = 0
+_scheduled_task_snapshot_cache = {}
+_origin_process_snapshot_cache = {}
+_program_process_snapshot_cache = {}
+_docker_snapshot_cache = {
+    "owner": None,
+    "token": None,
+    "mono": 0.0,
+    "snapshot": None,
+}
+
+
+def _snapshot_method_token(owner, name):
+    """Return a stable identity for a platform method without calling it."""
+    method = getattr(owner, name)
+    return getattr(method, "__func__", method)
+
+
+def clear_platform_snapshot_cache(component):
+    """Drop slow platform-derived caches after an exact external mutation."""
+    global _platform_snapshot_cache_generation
+    with _platform_snapshot_cache_lock:
+        _platform_snapshot_cache_generation += 1
+        if component in ("all", "scheduled"):
+            _scheduled_task_snapshot_cache.clear()
+        if component in ("all", "programs"):
+            _origin_process_snapshot_cache.clear()
+            _program_process_snapshot_cache.clear()
+        if component in ("all", "docker"):
+            _docker_snapshot_cache.update({
+                "owner": None,
+                "token": None,
+                "mono": 0.0,
+                "snapshot": None,
+            })
+
+
+def clear_platform_snapshot_caches():
+    clear_platform_snapshot_cache("all")
+
+
+def _cached_scheduled_task_snapshot(paths):
+    owner = PLATFORM
+    token = _snapshot_method_token(owner, "scheduled_tasks")
+    key = tuple(sorted(path.casefold() for path in paths))
+    now = time.monotonic()
+    with _platform_snapshot_cache_lock:
+        entry = _scheduled_task_snapshot_cache.get(key)
+        if (entry is not None and entry[0] is owner and entry[1] is token
+                and now - entry[2] < _PLATFORM_SNAPSHOT_CACHE_TTL):
+            return entry[3]
+        generation = _platform_snapshot_cache_generation
+    snapshot = owner.scheduled_tasks(paths)
+    with _platform_snapshot_cache_lock:
+        if generation == _platform_snapshot_cache_generation:
+            _scheduled_task_snapshot_cache[key] = (
+                owner, token, time.monotonic(), snapshot,
+            )
+    return snapshot
+
+
+def _cached_docker_snapshot():
+    owner = DOCKER
+    token = _snapshot_method_token(owner, "discover")
+    now = time.monotonic()
+    with _platform_snapshot_cache_lock:
+        entry = _docker_snapshot_cache
+        if (entry["owner"] is owner and entry["token"] is token
+                and now - entry["mono"] < _PLATFORM_SNAPSHOT_CACHE_TTL):
+            return entry["snapshot"]
+        generation = _platform_snapshot_cache_generation
+    snapshot = owner.discover()
+    with _platform_snapshot_cache_lock:
+        if generation == _platform_snapshot_cache_generation:
+            _docker_snapshot_cache.update({
+                "owner": owner,
+                "token": token,
+                "mono": time.monotonic(),
+                "snapshot": snapshot,
+            })
+    return snapshot
+
+
+def _cached_origin_process_snapshot(pids):
+    owner = PLATFORM
+    token = _snapshot_method_token(owner, "process_parents")
+    key = tuple(sorted(set(pids)))
+    now = time.monotonic()
+    with _platform_snapshot_cache_lock:
+        entry = _origin_process_snapshot_cache.get(key)
+        if (entry is not None and entry[0] is owner and entry[1] is token
+                and now - entry[2] < _PLATFORM_SNAPSHOT_CACHE_TTL):
+            return entry[3]
+        generation = _platform_snapshot_cache_generation
+    snapshot = owner.process_parents(set(key))
+    if snapshot.status is not ScanStatus.FAILED:
+        with _platform_snapshot_cache_lock:
+            if generation == _platform_snapshot_cache_generation:
+                _origin_process_snapshot_cache[key] = (
+                    owner, token, time.monotonic(), snapshot,
+                )
+    return snapshot
+
+
+def _cached_program_process_snapshot(cfg, names, broker_status):
+    owner = PLATFORM
+    token = _snapshot_method_token(owner, "processes_matching_keywords")
+    elevated_apps = [
+        app for app in (cfg.get("apps") or [])
+        if elevated_favorite(app)
+    ]
+    key = (
+        tuple(names),
+        tuple(
+            (
+                app.get("id"),
+                json.dumps(
+                    app.get("commandSpec"), sort_keys=True,
+                    ensure_ascii=False, default=str,
+                ),
+                app.get("cwd"),
+            )
+            for app in elevated_apps
+        ),
+        bool(getattr(broker_status, "unlocked", False)),
+        bool(getattr(broker_status, "stop_supported", False)),
+    )
+    now = time.monotonic()
+    with _platform_snapshot_cache_lock:
+        entry = _program_process_snapshot_cache.get(key)
+        if (entry is not None and entry[0] is owner and entry[1] is token
+                and now - entry[2] < _PLATFORM_SNAPSHOT_CACHE_TTL):
+            _record_platform_issues(
+                ScanStatus.PARTIAL if entry[4] else ScanStatus.OK, entry[4],
+            )
+            return dict(entry[3])
+        generation = _platform_snapshot_cache_generation
+
+    snapshot = owner.processes_matching_keywords(names)
     _record_platform_issues(snapshot.status, snapshot.issues)
     processes = dict(snapshot.processes)
+    issues = list(snapshot.issues)
     if (bool(getattr(broker_status, "unlocked", False))
             and bool(getattr(broker_status, "stop_supported", False))):
-        for app in cfg.get("apps") or []:
-            if not elevated_favorite(app):
-                continue
+        for app in elevated_apps:
             try:
                 spec = normalize_command_spec(app.get("commandSpec"))
             except CommandSpecError:
                 continue
-            observed = PLATFORM.observe_elevated(spec, app.get("cwd"))
+            observed = owner.observe_elevated(spec, app.get("cwd"))
             _record_platform_issues(observed.status, observed.issues)
+            issues.extend(observed.issues)
             if observed.status is not ScanStatus.FAILED:
                 processes.update(observed.processes)
+    if snapshot.status is not ScanStatus.FAILED:
+        with _platform_snapshot_cache_lock:
+            if generation == _platform_snapshot_cache_generation:
+                _program_process_snapshot_cache[key] = (
+                    owner, token, time.monotonic(), dict(processes),
+                    tuple(issues),
+                )
     return processes
 
 
@@ -2091,7 +2249,7 @@ def build_scheduled_task_index(cfg):
     }
     if not paths:
         return {}
-    snapshot = PLATFORM.scheduled_tasks(paths)
+    snapshot = _cached_scheduled_task_snapshot(paths)
     _record_platform_issues(snapshot.status, snapshot.issues)
     return snapshot.tasks
 
@@ -2583,7 +2741,7 @@ def docker_resource(app):
 def build_docker_snapshot(cfg):
     if not any(docker_resource(app) for app in (cfg.get("apps") or [])):
         return None
-    return DOCKER.discover()
+    return _cached_docker_snapshot()
 
 
 def docker_app_row(app, snapshot):
@@ -3064,19 +3222,22 @@ def build_state(cfg, console_port, config_health=None):
 
 
 # ---------------------------------------------------------------- 状态快照缓存
-# 每次快照要跑约十余个 ps/lsof 子进程。TTL 略大于前端 2s 轮询周期：
-# 单标签页约每 2-3 轮重建一次，多标签页请求通过独立 build lock 合并。
-# cache lock 只保护元数据；配置/进程变更时 invalidate 立即失效。
+# 每次快照要跑多类平台观察；缓存用于合并长连接校准与并发请求，
+# 慢查询另有短缓存。配置/进程变更时 invalidate 立即失效。
+# cache lock 只保护元数据；完整构建由独立 build lock 串行合并。
 STATE_CACHE_TTL = 2.2  # 秒
 _state_cache_lock = threading.Lock()
 _state_build_lock = threading.Lock()
 _state_cache = {"mono": 0.0, "state": None, "epoch": 0}
+# 前端长连接订阅同一个广播器：只在快照真的变化时推送，页面不按固定频率轮询。
+STATE_BROADCASTER = StateBroadcaster(logger=LOG)
 
 
 def invalidate_state_cache():
     with _state_cache_lock:
         _state_cache["state"] = None
         _state_cache["epoch"] = int(_state_cache.get("epoch", 0)) + 1
+    STATE_BROADCASTER.notify()
 
 
 def get_state_snapshot(cfg, console_port):
@@ -4269,21 +4430,30 @@ class KeepAliveSupervisor:
     def _start_app(self, app):
         if elevated_favorite(app):
             grant = app.get("keepAliveGrant") or {}
-            return PLATFORM.keep_alive_grant_use(
+            result = PLATFORM.keep_alive_grant_use(
                 grant.get("grantId"), app["id"], grant.get("bindingDigest"),
                 "launch",
                 self.status(app["id"]).get("leaseId"),
             )
-        if docker_resource(app):
-            return control_docker_app(DOCKER, app, True)
-        if scheduled_task_path(app):
+            component = "programs"
+        elif docker_resource(app):
+            result = control_docker_app(DOCKER, app, True)
+            component = "docker"
+        elif scheduled_task_path(app):
             grant = app.get("keepAliveGrant") or {}
-            return PLATFORM.keep_alive_grant_use(
+            result = PLATFORM.keep_alive_grant_use(
                 grant.get("grantId"), app["id"], grant.get("bindingDigest"),
                 "run",
                 self.status(app["id"]).get("leaseId"),
             )
-        return self._start_managed(app)
+            component = "scheduled"
+        else:
+            result = self._start_managed(app)
+            component = None
+        if component is not None and result.get("ok"):
+            clear_platform_snapshot_cache(component)
+            invalidate_state_cache()
+        return result
 
     def _record_failure(self, app_id, entry, error, now):
         attempts = int(entry.get("attempts") or 0) + 1
@@ -6071,6 +6241,24 @@ class ConsoleServer(ThreadingHTTPServer):
         self._console_action = None
         self._console_helper_pid = None
         self.keep_alive_supervisor = None
+        # 长连接广播复用同一份快照缓存；没有订阅者时不构建任何快照。
+        STATE_BROADCASTER.bind(
+            self.state_snapshot, self.keep_alive_fingerprint
+        )
+
+    def state_snapshot(self):
+        return get_state_snapshot(self.cfg, self.console_port)
+
+    def keep_alive_fingerprint(self):
+        """保活状态按会话投影，不参与共享快照；广播时单独作为变更信号。"""
+        supervisor = self.keep_alive_supervisor
+        if supervisor is None:
+            return None
+        apps = self.cfg.snapshot().get("apps") or []
+        return json.dumps(
+            [supervisor.status(app.get("id")) for app in apps],
+            ensure_ascii=False, sort_keys=True, default=str,
+        )
 
     def _prune_control_sessions(self, now):
         self._browser_bootstraps = {
@@ -6454,16 +6642,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
-        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
-        self.send_header(
-            "Content-Security-Policy",
-            "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
-            "form-action 'self'; connect-src 'self'; img-src 'self' data: blob:; "
-            "font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'")
+        self.send_security_headers()
         session_cookie = session_cookie or getattr(
             self, "_pending_session_cookie", None
         )
@@ -6480,6 +6659,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+
+    def send_security_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
+            "form-action 'self'; connect-src 'self'; img-src 'self' data: blob:; "
+            "font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'")
 
     def send_json(self, obj, status=200, session_cookie=None):
         self._send(json.dumps(obj, ensure_ascii=False).encode("utf-8"),
@@ -6611,6 +6802,9 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 self.send_json(self._project_state_authorization(state))
                 return
+            if path == "/api/events":
+                self.handle_state_events(parsed.query)
+                return
             if path == "/api/windows/scheduled-tasks":
                 self.handle_scheduled_tasks_list(parsed.query)
                 return
@@ -6635,6 +6829,57 @@ class Handler(BaseHTTPRequestHandler):
             pass
         except Exception as e:
             self._handle_request_error("GET", e)
+
+    def handle_state_events(self, query):
+        """状态变更长连接（SSE）：页面按事件刷新，不再按固定频率轮询。
+
+        连接有明确生命期：到点主动结束，浏览器 EventSource 会自动重连并
+        重新校验会话，一次授权不会换到永不过期的推送。
+        """
+        params = urllib.parse.parse_qs(query or "")
+        visible = (params.get("visible") or ["1"])[0] != "0"
+        subscription = STATE_BROADCASTER.subscribe(visible=visible)
+        try:
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_security_headers()
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.wfile.write(b"retry: 3000\n\n")
+            self.wfile.flush()
+            deadline = time.monotonic() + STATE_STREAM_MAX_SEC
+            while time.monotonic() < deadline:
+                # 只有页面可见时才续期控制会话：后台标签页不会无限延长授权。
+                if (subscription.visible
+                        and self.control_auth_kind == "browser"
+                        and self.server.authenticate_browser_session(
+                            self.control_session_id) is None):
+                    break
+                item = STATE_BROADCASTER.wait(
+                    subscription, timeout=STATE_HEARTBEAT_SEC
+                )
+                if subscription.closed:
+                    break
+                if item is None:
+                    self.wfile.write(b"event: heartbeat\ndata: {}\n\n")
+                    self.wfile.flush()
+                    continue
+                version, state = item
+                payload = json.dumps({
+                    "version": version,
+                    "state": self._project_state_authorization(state),
+                }, ensure_ascii=False).encode("utf-8")
+                self.wfile.write(
+                    b"id: " + str(version).encode("ascii") +
+                    b"\nevent: state\ndata: " + payload + b"\n\n"
+                )
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            subscription.close()
 
     def serve_static(self, path):
         rel = urllib.parse.unquote(path).lstrip("/") or "index.html"
@@ -7411,6 +7656,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             result = launch_elevated_task_app(PLATFORM, app)
             if result.get("ok"):
+                clear_platform_snapshot_cache("programs")
                 invalidate_state_cache()
             self.send_json(result, 200 if result.get("ok") else 409)
             return
@@ -7422,6 +7668,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             result = launch_elevated_program_app(PLATFORM, app)
             if result.get("ok"):
+                clear_platform_snapshot_cache("programs")
                 invalidate_state_cache()
             self.send_json(result, 200 if result.get("ok") else 409)
             return
@@ -7431,6 +7678,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             result = control_docker_app(DOCKER, app, True)
             if result.get("ok"):
+                clear_platform_snapshot_cache("docker")
                 invalidate_state_cache()
             self.send_json(result, 200 if result.get("ok") else 409)
             return
@@ -7449,6 +7697,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             result = start_scheduled_task_app(PLATFORM, app)
             if result.get("ok"):
+                clear_platform_snapshot_cache("scheduled")
                 invalidate_state_cache()
             self.send_json(result, 200 if result.get("ok") else 409)
             return
@@ -7571,6 +7820,7 @@ class Handler(BaseHTTPRequestHandler):
                         target["lastExit"] = last_exit
 
                 self.server.cfg.update(op)
+                clear_platform_snapshot_cache("programs")
                 invalidate_state_cache()
             self.send_json(result, 200 if result.get("ok") else 409)
             return
@@ -7596,6 +7846,7 @@ class Handler(BaseHTTPRequestHandler):
                 PLATFORM, app, expected_processes, force=force
             )
             if result.get("ok"):
+                clear_platform_snapshot_cache("programs")
                 invalidate_state_cache()
             self.send_json(result, 200 if result.get("ok") else 409)
             return
@@ -7616,6 +7867,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             result = control_docker_app(DOCKER, app, False)
             if result.get("ok"):
+                clear_platform_snapshot_cache("docker")
                 invalidate_state_cache()
             self.send_json(result, 200 if result.get("ok") else 409)
             return
@@ -7640,6 +7892,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             result = stop_scheduled_task_app(PLATFORM, app)
             if result.get("ok"):
+                clear_platform_snapshot_cache("scheduled")
                 invalidate_state_cache()
             self.send_json(result, 200 if result.get("ok") else 409)
             return
@@ -7699,6 +7952,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         result = set_scheduled_task_enabled_app(PLATFORM, app, enabled)
         if result.get("ok"):
+            clear_platform_snapshot_cache("scheduled")
             invalidate_state_cache()
         self.send_json(result, 200 if result.get("ok") else 409)
 

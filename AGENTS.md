@@ -8,10 +8,11 @@
 - `localops/platform/` — macOS/Windows 原生边界；Windows 运行依赖只允许从 `requirements-windows.txt` 安装
 - `localops/windows/` — Windows runner、Job Object 和 HMAC/receipt 协议；runner 是每个 Job 的唯一长期句柄持有者，不写主配置
 - `localops/docker_resources.py` — Docker CLI 只读发现与精确资源控制；Compose 身份为 project/workingDir/configFiles，单容器身份为完整 64 位 ID，只允许 start/stop
+- `localops/state_events.py` — 状态快照广播器；无订阅者时不构建，可见页面按变更推送、后台订阅降频，写操作可强制下发一帧供前端对账
 - `localops/elevation_broker.py` / `localops/windows/elevation_broker.py` — Windows 管理员代理的密码、会话、固定任务与 Named Pipe 协议；代理只能由冻结 onedir 经一次 UAC 安装，负责受保护程序的精确观察/停止，并用独立 kill-on-close Job 承载一次性管理员批处理
 - `localops/windows/packaged_entry.py` — PyInstaller windowed 入口；同一冻结 executable 同时分派 console 与 runner，并在无标准流时绑定私有 `console.log`
 - `tools/build_windows.py` / `requirements-build-windows.txt` — Python 3.12、PyInstaller onedir/windowed/x64 的确定性 unsigned zip 构建、sidecar/manifest 生成与内容审计；构建依赖不进入源码运行时依赖
-- `static/index.html` / `static/app.js`（入口）/ `static/js/{core,launchpad,lifecycle,services,overlays,ports,widgets}.js`（原生 ES Modules，无构建）/ `static/icons.js` — 前端（原生，禁框架/CDN/构建）；`core.js` 承载工具/API/浮层/状态/主题注册，`lifecycle.js` 冻结 generation 意图并执行 fail-closed 状态判断，`launchpad.js` 卡片+拖拽+诊断+启动台 KPI/分区过滤，`services.js` 表格+监控 KPI 火花线，`overlays.js` 模态+抽屉，`ports.js` 端口归一化纯函数，`widgets.js` 右侧信息栏（实时动态/告警、TOP5、小贴士、快捷操作）与导航轨状态；模块间用 `window.__poll` 共享轮询入口
+- `static/index.html` / `static/app.js`（入口）/ `static/js/{core,refresh,launchpad,lifecycle,services,overlays,ports,widgets}.js`（原生 ES Modules，无构建）/ `static/icons.js` — 前端（原生，禁框架/CDN/构建）；`core.js` 承载工具/API/浮层/状态/主题注册，`refresh.js` 统一 SSE 解码、静默与轮询兜底策略，`lifecycle.js` 冻结 generation 意图并执行 fail-closed 状态判断，`launchpad.js` 卡片+拖拽+诊断+启动台 KPI/分区过滤，`services.js` 表格+监控 KPI 火花线，`overlays.js` 模态+抽屉，`ports.js` 端口归一化纯函数，`widgets.js` 右侧信息栏（实时动态/告警、TOP5、小贴士、快捷操作）与导航轨状态
 - 布局 v2：左侧 `.rail` 图标导航轨（启动台/服务监控视图切换 + 日志中心/设置中心弹层入口）+ 顶栏 + 内容/右侧信息栏双栏网格（≤1280px 侧栏下沉到底部、≤900px 导航轨隐藏）；结构样式集中在 `static/base.css` 末尾「布局 v2」段（主题令牌驱动），主题包负责视觉皮肤
 - `static/themes/` — **单一主题**：当前仅内置 `ops`（指挥台，`DEFAULT_UI_THEME` 常量指定并在清单中固定排首位）。`{id}.css` 整包样式 + `{id}.json` 清单（`id/name/author/desc/colors[]`）的注册机制保留：`GET /api/state` 返回 `themes` 与 `uiTheme`；`POST /api/ui/theme {theme}` 校验 id 后落盘。产品不提供主题选择界面（已随多主题一并移除），深浅色切换仍保留。
 - `static/fonts/GeistMono-Variable.woff2` — vendored 数据/代码字体；中文与正文使用 macOS 系统字体栈；`static/icons/*.svg` — Lucide 图标源文件（vendored）；`tools/gen_icons.py` — 由 svg 重新生成 `icons.js`（勿手改 icons.js）
@@ -29,7 +30,7 @@
 
 ## API 契约（全部 JSON；icon 上传为原始字节）
 
-### `GET /api/state` — 前端唯一轮询接口
+### `GET /api/state` — 前端权威快照接口（推送不可用时轮询兜底）
 ```json
 {
   "services": [{
@@ -63,6 +64,7 @@
   "degraded": false, "degradedReasons": []
 }
 ```
+- `GET /api/events?visible=1|0` — 前端状态事件流（SSE，依赖受保护的浏览器会话或 CLI bearer）；可见订阅在订阅时立即下发缓存快照并持续监听变更，后台订阅降频；心跳只保活连接，不参与状态版本推进
 - `GET /api/health` — 不运行 `ps/lsof` 的轻量健康检查，返回 `status/version/schemaVersion/degraded/issues/config`
 - `group`: `"mine"` | `"background"`；`icon`/`emoji`/`port`/`cwd`/`project`/`appId`/`appName`/`lastExit` 可为 `null`
 - `lastExit`：最近一次退出结果。任务状态为 `succeeded`（exit 0）/`canceled`（脚本主动 exit 130）/`failed`（其他自然退出）/`stopped`（总控台中止，code=null）；旧数据可能只有 `code/at`，API 输出时会兼容推导但不改写磁盘。批处理启动时保留上一次完成历史，自然退出或中止后覆盖
@@ -165,14 +167,14 @@
 
 ## 前端要求
 
-- 中文 UI，单页两视图（侧边导航：启动台 / 服务监控），每 2s 轮询 `/api/state`
+- 中文 UI，单页两视图（侧边导航：启动台 / 服务监控）；状态由 `/api/events` 事件驱动，后台降频订阅，回到前台立即重订阅；仅事件流不可用或静默时才按 2s 轮询 `/api/state`
 - 启动台按服务/程序收藏/批处理任务三区渲染；Docker 资源从 daemon 发现后收藏，管理员程序用 EXE 选择器和逐行参数输入，不接受 shell 文本
 - Windows 管理员启动首次安装提示一次 UAC；以后每个 Local Ops 进程只输入一次密码。程序和批处理任务均可选择管理员代理；批处理必须先通过“选择脚本”生成结构化命令。锁定时卡片主按钮打开密码弹层，解锁后本进程内管理员程序与任务可直接启动
 - 添加服务时选择工作区文件夹后自动调用项目识别并展示候选命令；用户点选候选后再填入命令/端口。原有“选择脚本”与手动填写入口必须保留
 - 编辑运行中服务时，表单内立即显示“停止服务”；停止操作不得关闭编辑面板或清除已经填写的内容，停止后恢复普通“保存”
 - 批处理运行中显示实时耗时和「中止」入口；结束后明确显示成功/取消/失败/中止、距今时间与耗时。失败时突出日志入口；首次加载已有历史不重复提醒
 - 停止状态下配置健康有阻断问题时，卡片显示第一项原因、禁用运行/启动并开放「配置与运行诊断」；运行中的停止/中止入口不得被健康问题禁用
-- 服务监控只在当前页面会话连续轮询期间提醒新出现的、未管理的 mine 端口；首次加载、断线/后台/降级/重启恢复时静默建立基线。发现栏提供「加入启动台」「忽略并隐藏」「暂时关闭」
+- 服务监控只在当前页面会话连续订阅状态期间提醒新出现的、未管理的 mine 端口；首次加载、断线/后台/降级/重启恢复时静默建立基线。发现栏提供「加入启动台」「忽略并隐藏」「暂时关闭」
 - 从服务监控或新端口发现点击「加入启动台」时，项目识别完成前不得保存；创建请求必须携带 `attachPid`，由后端原子完成卡片创建与来源 PID 认领，失败时不留下“已创建但未认领”的半成品卡片；成功后卡片直接显示运行中
 - DOM 按 key 原地更新，禁整列表重绘闪烁；fetch 失败显示断连横幅
 - 深浅色跟随系统 + 手动切换（localStorage `console-theme`）；**单一 UI 主题 Ops 指挥台**（ops.css：深空蓝黑/雾灰双色 + 柔和圆角细边 + 蓝色强调，配合布局 v2 的导航轨/KPI 图标卡/实时动态侧栏；`#themeCss` 整包加载机制保留）；字体 = macOS 系统字体栈 + Geist Mono（数据/代码）；顶栏品牌图标 = `static/assets/brand-mark.png`；UI 零 emoji

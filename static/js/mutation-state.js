@@ -184,3 +184,26 @@ export function keepAliveFeedbackPatch(app, result, sessionAuthorized = false) {
     },
   };
 }
+
+/* 启动接口成功即已经拿到运行身份：卡片先落到“启动中”，
+   权威快照到达后由正常对账覆盖，不再等下一轮轮询才变色。 */
+export function optimisticStartPatch(app, result) {
+  if (!result || result.ok === false) return null;
+  const patch = {
+    optimisticPending: true,
+    lifecycleStatus: 'starting',
+    running: true,
+  };
+  if (Number.isInteger(result.pid) && result.pid > 0) {
+    patch.pid = result.pid;
+  }
+  const generation = typeof result.generationId === 'string'
+    ? result.generationId : '';
+  if (generation) {
+    patch.runtimeIdentity = {
+      ...((app && app.runtimeIdentity) || {}),
+      generationId: generation,
+    };
+  }
+  return patch;
+}

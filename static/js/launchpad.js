@@ -15,7 +15,7 @@ import { configuredPort, actualPorts, hasPortMismatch,
 import { elevatedControlGate, lifecyclePayload, lifecycleSnapshot,
   runLifecycleMutation } from './lifecycle.js';
 import { normalizeHostCpuPercent } from './metrics.js';
-import { keepAliveFeedbackPatch } from './mutation-state.js';
+import { keepAliveFeedbackPatch, optimisticStartPatch } from './mutation-state.js';
 import {
   insertBeforePinnedAddCard,
   PointerSortSession,
@@ -664,6 +664,27 @@ async function setScheduledTaskEnabled(app, button) {
   }
 }
 
+/* 启动接口成功即已拿到运行身份：先本地落一版“启动中”，
+   不让卡片等到下一轮状态刷新才变色。 */
+function applyStartFeedback(id, starting, result) {
+  if (!starting || !result || result.ok === false) return;
+  if (!window.__commitMutation) return;
+  const current = findApp(id);
+  /* 权威事件可能先于响应到达；只在乐观态仍待对账时补充运行身份，
+     不能让较晚的响应把已经确认的运行状态退回“启动中”。 */
+  if (!current || !current.optimisticPending) return;
+  const patch = optimisticStartPatch(current, result);
+  if (!patch) return;
+  window.__commitMutation({ type: 'app-patch', appId: id, patch });
+}
+
+function applyStartIntent(id, starting) {
+  if (!starting || !window.__commitMutation) return;
+  const patch = optimisticStartPatch(findApp(id), { ok: true });
+  if (!patch) return;
+  window.__commitMutation({ type: 'app-patch', appId: id, patch });
+}
+
 async function toggleApp(id, button, capturedIntent, confirmed = false) {
   const app = findApp(id);
   if (!app) return;
@@ -737,13 +758,19 @@ async function toggleApp(id, button, capturedIntent, confirmed = false) {
   toast(starting
     ? (isTask ? '正在运行 ' : '正在启动 ') + targetName + '…'
     : (isTask ? '正在中止 ' : '正在停止 ') + targetName + '…');
+  applyStartIntent(id, starting);
   try {
     const { result, stateIsFresh } = await runLifecycleMutation(
       () => act(post(
         '/api/apps/' + id + '/' + (starting ? 'start' : 'stop'),
         lifecyclePayload(intent, starting ? {} : { force: false }),
       )),
-      refreshLifecycleState,
+      async result => {
+        applyStartFeedback(id, starting, result);
+        return refreshLifecycleState(result, {
+          preferStream: starting && !!result && result.ok !== false,
+        });
+      },
     );
     if (result && result.ok !== false) {
       if (starting) {
@@ -752,7 +779,8 @@ async function toggleApp(id, button, capturedIntent, confirmed = false) {
           : isTask
             ? targetName + '已开始运行'
             : '启动命令已执行，正在等待' + (app.port ? ' :' + app.port : '服务'));
-        if (!isElevated) {
+        /* 事件推送可用时服务端会主动送达新状态，无需盲等补轮询。 */
+        if (!isElevated && !(window.__streamLive && window.__streamLive())) {
           setTimeout(window.__poll, 700);
           setTimeout(window.__poll, 1800);
         }

@@ -13,6 +13,7 @@ import urllib.parse
 from unittest import mock
 
 import server
+from localops.platform.contracts import PlatformIssue, ProcessSnapshot
 
 
 class HttpHarness:
@@ -27,6 +28,7 @@ class HttpHarness:
         self.port = self.httpd.server_address[1]
         self.authenticate_by_default = True
         server.invalidate_state_cache()  # 每个用例从空缓存开始，避免跨用例污染
+        server.clear_platform_snapshot_caches()
         self.thread = threading.Thread(
             target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
@@ -1161,6 +1163,236 @@ class StateCacheTests(unittest.TestCase):
                 cfg.update(lambda d: d.__setitem__("uiTheme", "custom"))
                 server.get_state_snapshot(cfg, 9600)
                 self.assertEqual(len(calls), 2)
+
+
+class PlatformSnapshotCacheTests(unittest.TestCase):
+    """计划任务与 Docker 的慢查询短缓存：常规轮次复用，精确操作后失效。"""
+
+    def setUp(self):
+        server.clear_platform_snapshot_caches()
+
+    def tearDown(self):
+        server.clear_platform_snapshot_caches()
+
+    def test_scheduled_task_snapshot_is_reused_and_explicitly_cleared(self):
+        snapshot = mock.Mock(
+            status=server.ScanStatus.OK,
+            issues=(),
+            tasks={r"\Task": {"state": "ready"}},
+        )
+        platform = mock.Mock()
+        platform.scheduled_tasks.return_value = snapshot
+        cfg = {
+            "apps": [{
+                "id": "task1",
+                "scheduledTaskPath": r"\Task",
+            }],
+        }
+
+        with mock.patch.object(server, "PLATFORM", platform):
+            first = server.build_scheduled_task_index(cfg)
+            second = server.build_scheduled_task_index(cfg)
+            server.clear_platform_snapshot_caches()
+            third = server.build_scheduled_task_index(cfg)
+
+        self.assertIs(first, snapshot.tasks)
+        self.assertIs(second, first)
+        self.assertIs(third, first)
+        self.assertEqual(platform.scheduled_tasks.call_count, 2)
+
+    def test_docker_snapshot_is_reused_and_explicitly_cleared(self):
+        snapshot = mock.Mock()
+        docker = mock.Mock()
+        docker.discover.return_value = snapshot
+        cfg = {
+            "apps": [{
+                "id": "docker1",
+                "dockerResource": {
+                    "kind": "container",
+                    "containerId": "a" * 64,
+                },
+            }],
+        }
+
+        with mock.patch.object(server, "DOCKER", docker):
+            first = server.build_docker_snapshot(cfg)
+            second = server.build_docker_snapshot(cfg)
+            server.clear_platform_snapshot_caches()
+            third = server.build_docker_snapshot(cfg)
+
+        self.assertIs(first, snapshot)
+        self.assertIs(second, first)
+        self.assertIs(third, first)
+        self.assertEqual(docker.discover.call_count, 2)
+
+    def test_origin_parent_snapshot_is_reused_and_explicitly_cleared(self):
+        snapshot = ProcessSnapshot(
+            server.ScanStatus.OK,
+            processes={
+                10: {"ppid": 1, "args": "worker"},
+                11: {"ppid": 10, "args": "server"},
+            },
+        )
+        platform = mock.Mock()
+        platform.process_parents.return_value = snapshot
+
+        with mock.patch.object(server, "PLATFORM", platform):
+            first = server.origin_snapshot({10, 11})
+            second = server.origin_snapshot({11, 10})
+            server.clear_platform_snapshot_caches()
+            third = server.origin_snapshot({10, 11})
+
+        self.assertEqual(first, second)
+        self.assertEqual(third, first)
+        self.assertEqual(platform.process_parents.call_count, 2)
+
+    def test_program_process_snapshot_is_reused_and_explicitly_cleared(self):
+        snapshot = ProcessSnapshot(
+            server.ScanStatus.PARTIAL,
+            processes={42: {"pid": 42, "comm": "tool.exe"}},
+            issues=(PlatformIssue(
+                "processes", "access_denied", "protected", degrades=False,
+            ),),
+        )
+        platform = mock.Mock()
+        platform.processes_matching_keywords.return_value = snapshot
+        cfg = {"apps": []}
+
+        with mock.patch.object(server, "PLATFORM", platform):
+            first = server._cached_program_process_snapshot(cfg, ["tool.exe"], None)
+            second = server._cached_program_process_snapshot(cfg, ["tool.exe"], None)
+            server.clear_platform_snapshot_caches()
+            third = server._cached_program_process_snapshot(cfg, ["tool.exe"], None)
+
+        self.assertEqual(first, second)
+        self.assertEqual(third, first)
+        self.assertEqual(platform.processes_matching_keywords.call_count, 2)
+
+
+class StateEventStreamTests(unittest.TestCase):
+    """状态推送长连接：认证、帧格式与下发快照。"""
+
+    def setUp(self):
+        self.h = HttpHarness()
+
+    def tearDown(self):
+        self.h.close()
+
+    def _connect(self, path, headers=None):
+        conn = http.client.HTTPConnection(server.HOST, self.h.port, timeout=6)
+        request_headers = dict(headers or {})
+        if "Authorization" not in request_headers:
+            request_headers["Authorization"] = "Bearer " + self.h.httpd.cli_token
+        conn.request("GET", path, headers=request_headers)
+        return conn, conn.getresponse()
+
+    def _read_event(self, response):
+        """跳过 retry/心跳前导块，返回第一条带 data 的事件帧。"""
+        while True:
+            lines = []
+            while True:
+                line = response.readline().decode("utf-8")
+                if not line:
+                    return lines
+                line = line.rstrip("\n")
+                if not line:
+                    break
+                lines.append(line)
+                if len(lines) > 40:
+                    break
+            if any(item.startswith("data: ") for item in lines):
+                return lines
+            if not lines and not response.isclosed():
+                continue
+
+    def test_state_stream_pushes_full_snapshot(self):
+        conn, response = self._connect("/api/events?visible=1")
+        try:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(
+                response.getheader("Content-Type"),
+                "text/event-stream; charset=utf-8",
+            )
+            self.assertEqual(response.getheader("Cache-Control"), "no-store")
+            lines = self._read_event(response)
+            self.assertIn("event: state", lines)
+            data_line = next(line for line in lines if line.startswith("data: "))
+            payload = json.loads(data_line[len("data: "):])
+            self.assertIn("services", payload["state"])
+            self.assertIn("apps", payload["state"])
+            self.assertIsInstance(payload["version"], int)
+        finally:
+            conn.close()
+
+    def test_state_stream_requires_control_session(self):
+        conn, response = self._connect(
+            "/api/events", headers={"Authorization": ""})
+        try:
+            self.assertEqual(response.status, 403)
+            response.read()
+        finally:
+            conn.close()
+
+    def _session_cookie(self):
+        origin = "http://127.0.0.1:%d" % self.h.port
+        token = self.h.httpd.issue_browser_bootstrap()
+        status, body, headers = self.h.request(
+            "POST", "/api/session/bootstrap", json.dumps({"token": token}), {
+                "Content-Type": "application/json",
+                "Origin": origin,
+                "Sec-Fetch-Site": "same-origin",
+            })
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        return headers["Set-Cookie"].split(";", 1)[0]
+
+    def test_browser_session_stream_ends_when_session_is_gone(self):
+        origin = "http://127.0.0.1:%d" % self.h.port
+        cookie = self._session_cookie()
+        conn, response = self._connect("/api/events?visible=1", headers={
+            "Cookie": cookie,
+            "Origin": origin,
+            "Sec-Fetch-Site": "same-origin",
+        })
+        try:
+            self.assertEqual(response.status, 200)
+            self.assertTrue(self._read_event(response))
+            self.h.httpd._control_sessions.clear()
+            server.invalidate_state_cache()
+            while response.readline():
+                pass
+            self.assertTrue(response.isclosed() or response.read() == b"")
+        finally:
+            conn.close()
+
+    def test_invalidated_state_is_pushed_to_subscribers(self):
+        builds = []
+
+        def snapshot(*args, **kwargs):
+            builds.append(len(builds) + 1)
+            return {"services": [], "apps": [], "build": builds[-1]}
+
+        with mock.patch.object(server, "build_state", side_effect=snapshot):
+            conn, response = self._connect("/api/events?visible=1")
+            try:
+                self.assertEqual(response.status, 200)
+                first = self._read_event(response)
+                version = int(next(
+                    line for line in first if line.startswith("id: ")
+                )[len("id: "):])
+                first_state = json.loads(next(
+                    line for line in first if line.startswith("data: ")
+                )[len("data: "):])["state"]
+                server.invalidate_state_cache()
+                second = self._read_event(response)
+                data_line = next(
+                    line for line in second if line.startswith("data: "))
+                payload = json.loads(data_line[len("data: "):])
+                self.assertGreater(payload["version"], version)
+                self.assertNotEqual(payload["state"], first_state)
+                self.assertIn("build", payload["state"])
+            finally:
+                conn.close()
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import {
   commitMutationFeedback,
   keepAliveFeedbackPatch,
+  optimisticStartPatch,
   reconcileMutationState,
 } from '../../static/js/mutation-state.js';
 import {
@@ -334,4 +335,55 @@ test('successful card mutations commit locally instead of awaiting a cold poll',
   assert.match(launchpad, /type: 'app-patch',[\s\S]*keepAliveFeedbackPatch/);
   assert.match(launchpad, /type: 'app-delete', appId: app\.id/);
   assert.match(launchpad, /app\.optimisticPending && lifecycle\.status === 'unknown'/);
+});
+
+test('启动成功后立即用接口返回的运行身份更新卡片', () => {
+  const app = { id: 'svc', runtimeIdentity: { generationId: 'old' }, pid: 1 };
+  const patch = optimisticStartPatch(app, {
+    ok: true,
+    pid: 4321,
+    generationId: 'new-generation',
+  });
+
+  assert.deepEqual(patch, {
+    optimisticPending: true,
+    lifecycleStatus: 'starting',
+    running: true,
+    pid: 4321,
+    runtimeIdentity: { generationId: 'new-generation' },
+  });
+  assert.equal(optimisticStartPatch(app, { ok: false, error: '失败' }), null);
+  assert.equal(optimisticStartPatch(app, null), null);
+});
+
+test('启动反馈只补接口给出的字段，缺失运行身份时不伪造代次', () => {
+  const app = { id: 'svc', runtimeIdentity: { generationId: 'keep' }, pid: 7 };
+  const patch = optimisticStartPatch(app, { ok: true });
+
+  assert.equal(patch.running, true);
+  assert.equal(patch.lifecycleStatus, 'starting');
+  assert.equal('pid' in patch, false);
+  assert.equal('runtimeIdentity' in patch, false);
+});
+
+test('启动反馈的卡片状态由权威快照覆盖', () => {
+  const data = { apps: [{ id: 'svc', name: '服务', running: false }] };
+  const patched = reconcileMutationState(data, {
+    type: 'app-patch',
+    appId: 'svc',
+    patch: optimisticStartPatch(
+      data.apps[0], { ok: true, pid: 99, generationId: 'g1' }),
+  });
+
+  assert.equal(patched.apps[0].running, true);
+  assert.equal(patched.apps[0].lifecycleStatus, 'starting');
+  assert.equal(patched.apps[0].optimisticPending, true);
+
+  const app = readFileSync(
+    new URL('../../static/app.js', import.meta.url), 'utf8');
+  /* 推送与轮询都必须走同一条权威落库路径，乐观状态才会被覆盖。 */
+  assert.match(app, /source\.addEventListener\('state'[\s\S]*applySnapshot\(decoded\.state\)/);
+  assert.match(app, /source\.addEventListener\('heartbeat'[\s\S]*streamLastEventAt = Date\.now\(\)/);
+  assert.match(app, /return applySnapshot\(data\)/);
+  assert.match(app, /function refreshAfterMutation\(\)[\s\S]*if \(streamLive\(\)\) return true/);
 });

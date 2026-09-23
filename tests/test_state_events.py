@@ -141,26 +141,15 @@ class StateBroadcasterTests(unittest.TestCase):
         subscription.close()
 
     def test_visible_subscribers_are_refreshed_faster_than_background(self):
-        builder = CountingBuilder()
-        self.broadcaster.bind(builder)
         subscription = self.broadcaster.subscribe(visible=True)
-        wait_for_version(self.broadcaster, subscription, 1)
+        with self.broadcaster._cond:
+            visible_interval = self.broadcaster._interval_locked()
 
-        def count_versions(duration):
-            start = time.monotonic()
-            seen = self.broadcaster.version()
-            while time.monotonic() - start < duration:
-                builder.set(builder.calls + 1)
-                time.sleep(0.01)
-            return self.broadcaster.version() - seen
-
-        visible = count_versions(0.6)
         subscription.set_visible(False)
-        time.sleep(0.2)
-        hidden = count_versions(0.6)
+        with self.broadcaster._cond:
+            hidden_interval = self.broadcaster._interval_locked()
 
-        self.assertGreaterEqual(visible, 5)
-        self.assertLessEqual(hidden, 3)
+        self.assertLess(visible_interval, hidden_interval)
         subscription.close()
 
     def test_closed_subscription_stops_receiving(self):

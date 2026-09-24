@@ -922,7 +922,50 @@
   .tbl:not(.tbl-watch) .tr > .c-cwd { display: none; }
 }
 @media (max-width: 900px) {
-  .rail { display: none; }
+  .rail {
+    position: fixed;
+    top: auto;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 120;
+    width: 100%;
+    flex-direction: row;
+    border-top: 1px solid var(--line-2);
+    border-right: 0;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .rail::after { display: none; }
+  .rail-nav {
+    flex: 1;
+    flex-direction: row;
+    justify-content: space-around;
+    gap: 0;
+    padding: 6px 8px;
+  }
+  .rail-btn {
+    flex: 1 1 0;
+    min-width: 0;
+    gap: 3px;
+    padding: 7px 4px 6px;
+    font-size: 9.5px;
+  }
+  .rail-btn::before {
+    inset: auto auto 0 50%;
+    width: 42px;
+    height: 2px;
+    transform: translateX(-50%) scaleX(0);
+  }
+  .rail-btn.active {
+    box-shadow: none;
+  }
+  .rail-btn.active::before {
+    transform: translateX(-50%) scaleX(1);
+  }
+  .rail-foot { display: none; }
+  .banner.show ~ .shell > .rail { padding-top: 0; }
   .shell-col { height: auto; min-height: 100vh; }
+  .main-inner { padding-bottom: calc(76px + env(safe-area-inset-bottom)); }
+  .toast { bottom: calc(76px + env(safe-area-inset-bottom)); }
   .quick-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

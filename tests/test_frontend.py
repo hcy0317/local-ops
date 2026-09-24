@@ -758,6 +758,28 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("const tab = $('#rail-services')", widgets)
         self.assertNotIn("const tab = $('#tab-services')", widgets)
 
+    def test_mobile_rail_keeps_primary_view_switcher_reachable(self):
+        base = (ROOT / "static/base.css").read_text(encoding="utf-8")
+        mobile = base[base.rindex("@media (max-width: 900px)"):]
+
+        self.assertNotIn(".rail { display: none; }", mobile)
+        self.assertRegex(
+            mobile,
+            r"\.rail\s*\{[^}]*position:\s*fixed;[^}]*bottom:\s*0;",
+        )
+        self.assertRegex(
+            mobile,
+            r"\.rail-nav\s*\{[^}]*flex-direction:\s*row;",
+        )
+        self.assertRegex(
+            mobile,
+            r"\.rail-foot\s*\{\s*display:\s*none;",
+        )
+        self.assertIn(
+            "padding-bottom: calc(76px + env(safe-area-inset-bottom))",
+            mobile,
+        )
+
     def test_command_search_and_quick_actions_share_one_width_track(self):
         ops = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
         base = (ROOT / "static/base.css").read_text(encoding="utf-8")

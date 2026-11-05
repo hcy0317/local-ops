@@ -236,6 +236,9 @@ kbd {
 .console-port { font-family: var(--font-mono); font-size: 10px; font-weight: 700; color: var(--accent); }
 .console-control.danger:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
 .console-control.needs-activation { border-style: dashed; }
+.broker-control[hidden] { display: none; }
+.broker-control { border-color: var(--accent); color: var(--accent); white-space: nowrap; }
+.broker-control.authorized:disabled { opacity: 1; color: var(--ink-3); border-color: var(--line); }
 .console-control.restarting .ic { animation: spin 1s steps(8) infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 

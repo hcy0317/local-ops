@@ -52,6 +52,27 @@ const sideSvc = $('#sideSvc');
 
 let firstRender = true;          // 首屏渲染（stagger 入场）
 let brokerPromptedConsolePid = null;
+let brokerPromptTimer = null;
+const brokerSessionBtn = $('#brokerSessionBtn');
+const brokerSessionLabel = $('#brokerSessionLabel');
+$('#brokerSessionIcon').appendChild(icon('lock', 14));
+brokerSessionBtn.addEventListener('click', () => {
+  openBrokerPassword();
+  brokerPromptedConsolePid = Number(state.data && state.data.consolePid);
+});
+
+function renderBrokerSession() {
+  const broker = (state.data && state.data.elevationBroker) || {};
+  brokerSessionBtn.hidden = currentPlatform() !== 'windows'
+    || !hasCapability('manage_elevation_broker');
+  const authorized = broker.sessionAuthorized === true;
+  setText(brokerSessionLabel, authorized ? '管理员已授权'
+    : !broker.installed || !broker.verified ? '安装管理员代理' : '解锁管理员');
+  brokerSessionBtn.disabled = authorized;
+  brokerSessionBtn.classList.toggle('authorized', authorized);
+  brokerSessionBtn.title = authorized
+    ? '当前浏览器会话已授权管理员操作' : '输入密码，授权当前浏览器会话的管理员操作';
+}
 let migrationNotifiedConsolePid = null;
 
 function notifyConfigMigration(data) {
@@ -65,6 +86,8 @@ function notifyConfigMigration(data) {
 }
 
 function promptForElevationSession(data) {
+  clearTimeout(brokerPromptTimer);
+  brokerPromptTimer = null;
   const broker = data && data.elevationBroker;
   const consolePid = Number(data && data.consolePid);
   const hasElevatedFavorite = Array.isArray(data && data.apps)
@@ -73,10 +96,13 @@ function promptForElevationSession(data) {
       && broker.installed && broker.verified && !broker.sessionAuthorized
       && hasElevatedFavorite && Number.isInteger(consolePid) && consolePid > 0
       && brokerPromptedConsolePid !== consolePid) {
+    // 其他弹层或后台页面只延后提示，不消耗本进程的一次提示机会。
+    if (activeLayer() || document.hidden) {
+      brokerPromptTimer = setTimeout(() => promptForElevationSession(state.data), 500);
+      return;
+    }
+    openBrokerPassword();
     brokerPromptedConsolePid = consolePid;
-    queueMicrotask(() => {
-      if (!activeLayer()) openBrokerPassword();
-    });
   }
 }
 
@@ -470,6 +496,7 @@ function consoleLifecycleSupported() {
 }
 function render() {
   if (!state.data) return;
+  renderBrokerSession();
   const consolePid = Number(state.data.consolePid);
   const lifecycleSupported = consoleLifecycleSupported();
   const restartSupported = lifecycleSupported &&

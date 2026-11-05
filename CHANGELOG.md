@@ -10,6 +10,8 @@
 
 ### Added
 
+- 启动台卡片增加可选 `openUrl` 和明确的“打开页面”按钮：支持服务、程序与外部资源的 HTTP(S) 地址，完整保留路径、查询和 hash；打开/复制优先使用自定义网址，运行中可直接保存，留空保持原有本地端口语义。
+
 - 增加可选的 Tailscale Serve 身份代理会话：回环 Caddy 网关以 Tailscale 用户头和受保护代理 bearer 双重证明身份，只读 `/api/state` 首请求可换取 Secure/HttpOnly/SameSite 浏览器会话；写请求和管理员能力仍分别要求会话与二次密码解锁。
 - 增加 Windows Phase 5 本地打包候选：Python 3.12 + PyInstaller onedir/windowed/x64 unsigned zip、确定性 checksum/manifest sidecars、包内容/版本/依赖/许可/敏感数据审计，以及只操作隔离夹具的最终 package smoke。
 - 增加冻结 windowed 入口；在无标准流时把诊断写入受保护的 Local AppData console log，并由同一 executable 分派 HTTP console 与 per-generation runner。

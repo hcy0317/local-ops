@@ -14,6 +14,7 @@ from unittest import mock
 
 import server
 from localops.platform.contracts import PlatformIssue, ProcessSnapshot
+from localops.platform.fake import FakePlatform
 
 
 class HttpHarness:
@@ -455,6 +456,75 @@ class DeliveryMetadataTests(unittest.TestCase):
         self.assertEqual(headers.get("Content-Type"), "image/x-icon")
         self.assertIsInstance(body, bytes)
         self.assertGreater(len(body), 100)
+
+
+class AppUrlConfigurationTests(unittest.TestCase):
+    def setUp(self):
+        self.h = HttpHarness()
+        self.headers = {"Content-Type": "application/json"}
+
+    def tearDown(self):
+        self.h.close()
+
+    def test_invalid_custom_urls_are_rejected_without_writing(self):
+        for value in (123, "javascript:alert(1)", "file:///C:/demo", "//example.com",
+                      "https://", "https://user:pass@example.com", "https://example.com:70000",
+                      "https://exam\nple.com", "https://example.com\\path"):
+            with self.subTest(value=value):
+                status, body, _ = self.h.request(
+                    "POST", "/api/apps", json.dumps({
+                        "name": "Invalid link", "command": "demo.exe", "openUrl": value,
+                    }), self.headers)
+                self.assertEqual(status, 400)
+                self.assertFalse(body["ok"])
+        self.assertEqual(self.h.cfg.snapshot()["apps"], [])
+
+    def test_running_app_url_can_change_without_stopping_its_process(self):
+        status, app, _ = self.h.request("POST", "/api/apps", json.dumps({
+            "name": "Running service", "command": "demo.exe",
+        }), self.headers)
+        self.assertEqual(status, 200)
+        url = "https://service.example/dashboard#/"
+        with mock.patch.object(server.PLATFORM, "name", "macos"), \
+                mock.patch.object(server, "app_alive_sign", return_value=True), \
+                mock.patch.object(server, "stop_app_for_update") as stop:
+            status, updated, _ = self.h.request(
+                "PUT", "/api/apps/" + app["id"], json.dumps({"openUrl": url}), self.headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["openUrl"], url)
+        stop.assert_not_called()
+
+    def test_custom_url_roundtrip_for_services_and_programs(self):
+        url = "https://bill.example.ts.net/desktop.html#/"
+        for kind in ("service", "program"):
+            with self.subTest(kind=kind):
+                status, app, _ = self.h.request(
+                    "POST", "/api/apps", json.dumps({
+                        "name": "Bill Analyser", "command": "demo.exe",
+                        "kind": kind, "openUrl": "  " + url + "  ",
+                    }), self.headers)
+                self.assertEqual(status, 200)
+                self.assertEqual(app.get("openUrl"), url)
+                with mock.patch.object(server, "PLATFORM", FakePlatform()):
+                    status, state, _ = self.h.request("GET", "/api/state")
+                self.assertEqual(status, 200)
+                row = next(row for row in state["apps"] if row["id"] == app["id"])
+                self.assertEqual(row.get("openUrl"), url)
+                reloaded = server.Config(self.h.config_path).snapshot()
+                self.assertEqual(server.find_app(reloaded, app["id"])["openUrl"], url)
+                replacement = "https://bill.example.ts.net/reports?year=2026#/month"
+                status, updated, _ = self.h.request(
+                    "PUT", "/api/apps/" + app["id"], json.dumps({
+                        "openUrl": replacement, "expectedGeneration": None,
+                    }), self.headers)
+                self.assertEqual(status, 200)
+                self.assertEqual(updated["openUrl"], replacement)
+                status, cleared, _ = self.h.request(
+                    "PUT", "/api/apps/" + app["id"], json.dumps({
+                        "openUrl": "", "expectedGeneration": None,
+                    }), self.headers)
+                self.assertEqual(status, 200)
+                self.assertIsNone(cleared["openUrl"])
 
 
 class AppConfigurationTests(unittest.TestCase):

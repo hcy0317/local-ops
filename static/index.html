@@ -503,6 +503,12 @@
       <input id="fPort" type="number" min="1" max="65535" step="1" inputmode="numeric"
         placeholder="可选，用于状态检测与快速打开">
     </div>
+    <div class="field" id="openUrlField">
+      <label for="fOpenUrl">打开网址</label>
+      <input id="fOpenUrl" type="url" maxlength="4096" autocomplete="off" spellcheck="false"
+        placeholder="可选，如：https://example.ts.net/desktop.html#/" aria-describedby="openUrlHint">
+      <p class="hint" id="openUrlHint">填写后可从卡片直接打开或复制此地址，支持路径和 # 路由；留空时使用本地端口。</p>
+    </div>
     <details class="appearance-details" id="appearanceDetails">
       <summary>
         <span class="appearance-summary-main">

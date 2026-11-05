@@ -10,10 +10,13 @@ import { lifecyclePayload, lifecycleSnapshot, sameLifecycleGeneration,
   isGenerationMismatch, isStopTimeout, runLifecycleMutation,
   runConfirmedForceStop } from './lifecycle.js';
 
+import { normalizeOpenUrl } from './ports.js';
+
 /* ---------------- DOM 引用 ---------------- */
 const appModalMask = $('#appModalMask'), appModal = $('#appModal'), appModalTitle = $('#appModalTitle');
 const fName = $('#fName'), fCmd = $('#fCmd'), fCwd = $('#fCwd'), fPort = $('#fPort');
 const kindRow = $('#kindRow'), portField = $('#portField'), fCmdLabel = $('#fCmdLabel');
+const fOpenUrl = $('#fOpenUrl');
 const scheduledTaskField = $('#scheduledTaskField');
 const fScheduledTaskPath = $('#fScheduledTaskPath');
 const btnRefreshScheduledTasks = $('#btnRefreshScheduledTasks');
@@ -733,6 +736,7 @@ export function openAppModal(app, presetKind, focusAction = '') {
   fCmd.value = (app && app.command) || '';
   fCwd.value = (app && app.cwd) || '';
   fPort.value = app && app.port != null ? app.port : '';
+  fOpenUrl.value = (app && app.openUrl) || '';
   const programArgs = app && app.commandSpec && app.commandSpec.mode === 'direct'
     && Array.isArray(app.commandSpec.args) ? app.commandSpec.args : [];
   fProgramArgs.value = programArgs.join('\n');
@@ -744,7 +748,7 @@ export function openAppModal(app, presetKind, focusAction = '') {
   dockerResourceField.hidden = !hasCapability('monitor_docker');
   renderScheduledTaskOptions((app && app.scheduledTaskPath) || '');
   renderDockerResourceOptions((app && app.dockerResource) || null);
-  [fName, fCmd, fCwd, fPort].forEach(clearFieldError);
+  [fName, fCmd, fCwd, fPort, fOpenUrl].forEach(clearFieldError);
   setModalKind(initialKind);
   syncScheduledTaskMode();
   appearanceDetails.open = !!(app && (app.icon || app.glyph));
@@ -1006,9 +1010,14 @@ async function saveApp() {
   }
   const port = modalKind !== 'service' || externalResourceMode() ? null : readPortValue();
   if (Number.isNaN(port)) return fieldError(fPort, '端口必须是 1–65535 之间的整数');
+  const openUrl = normalizeOpenUrl(fOpenUrl.value);
+  if (fOpenUrl.value.trim() && !openUrl) {
+    return fieldError(fOpenUrl, '请填写完整的 http:// 或 https:// 地址，且不能包含账号密码');
+  }
   const body = {
     name,
     command,
+    openUrl: openUrl || null,
     cwd: fCwd.value.trim() || null,
     port,
     glyph: selectedGlyph || null,
@@ -1189,7 +1198,7 @@ export function initAppModal({ onAddService, onAddTask, onAddProgram }) {
     invalidateCommandCompatibility();
     resetDetection(true);
   });
-  [fName, fCwd, fPort].forEach(input =>
+  [fName, fCwd, fPort, fOpenUrl].forEach(input =>
     input.addEventListener('input', () => {
       clearFieldError(input);
       refreshEditSaveMode();
@@ -1251,7 +1260,7 @@ export function initAppModal({ onAddService, onAddTask, onAddProgram }) {
   });
   fName.addEventListener('input', renderIconPreview);
   /* 非 textarea 字段回车直接保存 */
-  [fName, fCwd, fPort].forEach(inp =>
+  [fName, fCwd, fPort, fOpenUrl].forEach(inp =>
     inp.addEventListener('keydown', e => { if (e.key === 'Enter') saveApp(); }));
 }
 

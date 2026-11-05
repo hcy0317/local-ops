@@ -497,13 +497,23 @@ a.icon-btn { text-decoration: none; }
 }
 .st-text.fail { color: var(--red); font-weight: 700; }
 .st-port {
+  display: inline-flex; align-items: center; gap: 3.5px;
+  line-height: 1.4; vertical-align: middle;
   font-family: var(--font-mono); font-size: 10px; font-weight: 700;
   padding: 1px 7px; border-radius: 5px;
   border: 1px solid var(--line-2); color: var(--ink-2);
   background: var(--card);
   transition: all 0.12s ease;
 }
-.st-port.clickable { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line-2)); cursor: pointer; }
+.st-port.clickable {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line-2));
+  background: color-mix(in srgb, var(--accent) 8%, var(--card));
+  cursor: pointer;
+}
+.st-port-icon { flex: none; transition: transform 0.12s ease; }
+.st-port.clickable:hover .st-port-icon { transform: translate(1px, -1px); }
+.st-port-act { font-family: var(--font-system, sans-serif); font-size: 9.5px; }
 .st-port.clickable:hover { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .st-port.diagnostic { color: var(--red); border-color: color-mix(in srgb, var(--red) 50%, var(--line-2)); cursor: pointer; }
 .st-port.diagnostic:hover { background: var(--red); border-color: var(--red); color: #fff; }
@@ -547,15 +557,16 @@ a.icon-btn { text-decoration: none; }
 .status-dot.danger { background: var(--red); }
 
 /* 卡片操作行（副操作常显，不靠悬浮揭示） */
-.app-actions { display: flex; align-items: center; gap: 8px; margin-top: 2px; }
+.app-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 2px; }
 .app-sub-actions {
-  display: flex; align-items: center; gap: 4px; margin-left: auto;
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end;
+  gap: 3.5px; margin-left: auto; max-width: 100%;
 }
 
 .ibtn {
   position: relative;
   display: inline-flex; align-items: center; justify-content: center;
-  width: 28px; height: 28px;
+  width: 27px; height: 27px; flex: none;
   border: 1px solid var(--line); border-radius: var(--control-radius);
   background: var(--card); color: var(--ink-3);
   transition: all 0.12s ease;
@@ -563,6 +574,14 @@ a.icon-btn { text-decoration: none; }
 .ibtn:hover { color: var(--ink); border-color: var(--line-2); }
 .ibtn.danger:hover { color: var(--red); border-color: var(--red); }
 .ibtn.active { color: var(--on-accent); background: var(--accent); border-color: var(--accent); }
+.ibtn.open {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line-2));
+  background: color-mix(in srgb, var(--accent) 10%, var(--card));
+}
+.ibtn.open:hover { color: var(--on-accent); border-color: var(--accent); background: var(--accent); }
+.ibtn.open svg { transition: transform 0.12s ease; }
+.ibtn.open:hover svg { transform: translate(1px, -1px); }
 .ibtn.attention { color: var(--red); }
 .ibtn.attention::after {
   content: ''; position: absolute; top: 2px; right: 2px;
@@ -591,7 +610,7 @@ a.icon-btn { text-decoration: none; }
   background: color-mix(in srgb, var(--red) 9%, var(--card));
 }
 
-.app-primary { min-width: 92px; }
+.app-primary { min-width: 78px; padding: 0 12px; }
 
 /* 添加卡片 */
 .add-card {

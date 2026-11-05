@@ -1,4 +1,36 @@
 'use strict';
+
+/* 后端根据真实 bind address 返回 openHost；旧后端缺字段时保持原行为。 */
+export function localServiceUrl(item, port) {
+  const value = Number(port);
+  if (!Number.isInteger(value) || value <= 0 || value > 65535) return '';
+  let host = item && item.openHosts && item.openHosts[String(value)];
+  if (!host && item) host = item.openHost;
+  host = host === 'localhost' ? 'localhost' : '127.0.0.1';
+  return 'http://' + host + ':' + value;
+}
+
+/* 自定义网址只交给浏览器打开，不参与监听发现、图标抓取或进程控制。 */
+export function normalizeOpenUrl(value) {
+  if (typeof value !== 'string') return '';
+  const text = value.trim();
+  if (!text || text.length > 4096 || /[\s\\]/.test(text) || !/^https?:\/\//i.test(text)) return '';
+  try {
+    const url = new URL(text);
+    if (!['http:', 'https:'].includes(url.protocol) || !url.hostname
+        || url.username || url.password || url.port === '0') return '';
+    return text;
+  } catch (e) { return ''; }
+}
+
+export function appLinkUrl(app) {
+  return normalizeOpenUrl(app && app.openUrl) || localServiceUrl(app, preferredOpenPort(app));
+}
+
+export function appIsOpenable(app) {
+  return !!normalizeOpenUrl(app && app.openUrl) || portIsOpenable(app);
+}
+
 /* ============================================================
    ports.js — 端口归一化纯函数（无 DOM 依赖）
 

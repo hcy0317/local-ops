@@ -45,7 +45,7 @@
   "watched": [{"pid": 1, "name": "ffmpeg", "cmd": "...", "cpu": 0.0, "mem": 0.5, "uptimeSec": 60, "keyword": "ffmpeg"}],
   "apps": [{
     "id": "a1b2c3d4", "name": "我的博客", "command": "python3 -m http.server 8080",
-    "cwd": "/path", "port": 8080, "emoji": "🚀", "glyph": "rocket", "icon": "/icons/a1b2c3d4.png",
+    "cwd": "/path", "port": 8080, "openUrl": "https://example.ts.net/desktop.html#/", "emoji": "🚀", "glyph": "rocket", "icon": "/icons/a1b2c3d4.png",
     "kind": "service", "attached": false, "dockerResource": null, "elevated": false,
     "running": true, "pid": 1234, "uptimeSec": 120,
     "listening": true, "portOccupied": false, "portOccupiedPid": null,
@@ -69,6 +69,7 @@
 - `group`: `"mine"` | `"background"`；`icon`/`emoji`/`port`/`cwd`/`project`/`appId`/`appName`/`lastExit` 可为 `null`
 - `lastExit`：最近一次退出结果。任务状态为 `succeeded`（exit 0）/`canceled`（脚本主动 exit 130）/`failed`（其他自然退出）/`stopped`（总控台中止，code=null）；旧数据可能只有 `code/at`，API 输出时会兼容推导但不改写磁盘。批处理启动时保留上一次完成历史，自然退出或中止后覆盖
 - `health`：每次状态读取时只读检查配置，返回 `status: ok|error|unknown`、`blocking` 与 `issues[{kind,severity,title,detail,fix,action}]`。明确缺失的 cwd、脚本或运行时会阻止启动；复杂 Shell 命令无法静态判断时为 unknown，不阻止运行
+- `openUrl`：可选 HTTP(S) 浏览器地址，保留路径、查询与 hash；仅用于卡片打开/复制，不参与端口探测、favicon 抓取或进程身份。缺省/空值为 `null`，兼容 schema v5 的既有卡片；可在运行中修改，无需停止。
 - `kind`：`"service"`（长期服务，有端口语义）| `"task"`（批处理任务）| `"program"`（程序入口；具备完整进程证据时可停止）；task/program 强制 port=null。旧数据缺省视为 `service`，启动台按 kind 分三区渲染
 - `running`：仅表示存在通过本次启动 token、进程组与当前用户三重校验的受控进程；不再以“配置端口有任意监听者”作为运行依据
 - `attached`：用户从服务监控明确认领的外部服务身份。此类服务的监听子进程换 PID 后，可按配置端口 + 当前 UID + 真实 cwd 唯一重新关联；普通卡片仍不得仅凭端口自动认领
@@ -85,7 +86,7 @@
 - `GET /api/docker/resources` → `{ok, resources:[...]}`（按需调用本地 Docker CLI，返回 Compose 项目与任意单容器的精确身份；不修改 daemon）
 
 ### 启动台应用
-- `POST /api/apps` `{name, command, commandSpec?, cwd?, port?, emoji?, glyph?, kind?, attachPid?, dockerResource?, elevated?}` → app 对象（`kind` 缺省 `service`；task/program 强制 port=null；Docker 与计划任务/管理员启动互斥；`kind=task,elevated=true` 只接受选择器生成的 reviewed direct/structured cmd/PowerShell，不接受 raw shell；服务监控来源可带 `attachPid`，后端先校验 PID/端口/UID/cwd，再将卡片与运行身份一次写入，失败不创建半成品卡片）
+- `POST /api/apps` `{name, command, commandSpec?, cwd?, port?, openUrl?, emoji?, glyph?, kind?, attachPid?, dockerResource?, elevated?}` → app 对象（`kind` 缺省 `service`；task/program 强制 port=null；Docker 与计划任务/管理员启动互斥；`kind=task,elevated=true` 只接受选择器生成的 reviewed direct/structured cmd/PowerShell，不接受 raw shell；服务监控来源可带 `attachPid`，后端先校验 PID/端口/UID/cwd，再将卡片与运行身份一次写入，失败不创建半成品卡片）
 - `POST /api/pick` `{what: "dir"|"script"}` → `{ok, path}` / `{ok, canceled:true}`（osascript 弹 macOS 原生目录/文件选择框；取消不是错误）
 - `POST /api/project/detect` `{cwd}` → `{ok, cwd, name, files, candidates:[{command,label,source,port,kind,detail}]}`（只读分析项目根目录，不执行项目代码；识别 package.json scripts 与包管理器锁文件、Hexo/Hugo/Jekyll、Django/FastAPI/Flask/Streamlit、Docker Compose、Go、Rust、常用启动脚本及纯静态站点。Hexo 无 scripts 时仍返回 `hexo s` 服务与 `hexo cl` 任务）
 - `POST /api/apps/reorder` `{ids: [...]}` → `{ok}`（按 ids 重排 apps 数组；Python sort 稳定，未涉及的 id 相对顺序不变，服务/任务两区可独立拖拽排序互不干扰）
@@ -158,7 +159,7 @@
 ```json
 {
   "schemaVersion": 5,
-  "apps": [{"id": "8位hex", "name": "", "command": "", "commandSpec": null, "runtimeIdentity": null, "importStatus": null, "cwd": null, "port": null, "emoji": null, "icon": null, "favicon": null, "kind": "service", "dockerResource": null, "elevated": false, "lastPid": null, "lastPgid": null, "runToken": null, "attached": false, "lastExit": null, "keepAlive": false, "desiredRunning": false, "keepAliveGrant": null, "createdAt": 0}],
+  "apps": [{"id": "8位hex", "name": "", "command": "", "commandSpec": null, "runtimeIdentity": null, "importStatus": null, "cwd": null, "port": null, "openUrl": null, "emoji": null, "icon": null, "favicon": null, "kind": "service", "dockerResource": null, "elevated": false, "lastPid": null, "lastPgid": null, "runToken": null, "attached": false, "lastExit": null, "keepAlive": false, "desiredRunning": false, "keepAliveGrant": null, "createdAt": 0}],
   "hidden": ["name:port"], "pinned": ["name:port"], "promoted": ["name:port"],
   "watchedKeywords": [],
   "uiTheme": "ops"

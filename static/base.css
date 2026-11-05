@@ -445,6 +445,7 @@
 @media (max-width: 480px) {
   .topbar-inner { padding-inline: 12px; }
   .console-action-label { display: none; }
+  .console-control.broker-control { width: auto; padding-inline: 8px; }
   .console-control {
     width: 40px;
     padding-inline: 0;

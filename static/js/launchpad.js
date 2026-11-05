@@ -11,7 +11,8 @@ import { openConfirm, openAppModal, openLogs, getIconVer,
   refreshLifecycleState, offerForceStopAfterTimeout,
   openBrokerPassword } from './overlays.js';
 import { configuredPort, actualPorts, hasPortMismatch,
-  preferredOpenPort, displayedPorts, portIsOpenable } from './ports.js';
+  preferredOpenPort, displayedPorts, portIsOpenable,
+  appLinkUrl, appIsOpenable } from './ports.js';
 import { elevatedControlGate, lifecyclePayload, lifecycleSnapshot,
   runLifecycleMutation } from './lifecycle.js';
 import { normalizeHostCpuPercent } from './metrics.js';
@@ -172,6 +173,8 @@ function createAppCard() {
   const primary = el('button', 'btn app-primary');
   primary.type = 'button';
   const sub = el('div', 'app-sub-actions');
+  const bOpen = iconBtn('arrow-up-right', '打开页面', 'open');
+  bOpen.hidden = true;
   const bCopy = iconBtn('copy', '复制链接');
   const bLogs = iconBtn('file-text', '日志');
   const bDiag = iconBtn('activity', '启动诊断');
@@ -184,22 +187,25 @@ function createAppCard() {
   bSchedule.hidden = true;
   const bEdit = iconBtn('pencil', '编辑');
   const bDel = iconBtn('trash-2', '删除', 'danger');
-  sub.append(bCopy, bLogs, bDiag, bKeepAlive, bRestart, bSchedule, bEdit, bDel);
+  sub.append(bOpen, bCopy, bLogs, bDiag, bKeepAlive, bRestart, bSchedule, bEdit, bDel);
   actions.append(primary, sub);
 
   card.append(head, cmd, actions);
   card._r = { iconBox, iconImg, iconGlyph, iconTxt, name, runtimeBadge, status, dot,
-    stText, stPort, stUp, taskHistory, cmd, primary, copy: bCopy, logs: bLogs,
+    stText, stPort, stUp, taskHistory, cmd, primary, open: bOpen, copy: bCopy, logs: bLogs,
     diag: bDiag, keepAlive: bKeepAlive, restart: bRestart,
     schedule: bSchedule, edit: bEdit, del: bDel };
 
   const id = () => card.dataset.key;
   primary.addEventListener('click', () => toggleApp(id(), primary));
-  bCopy.addEventListener('click', async () => {
+  bOpen.addEventListener('click', () => {
     const a = findApp(id());
-    const p = preferredOpenPort(a);
-    if (!p) return;
-    const url = localServiceUrl(a, p);
+    const url = appLinkUrl(a);
+    if (appIsOpenable(a) && url) window.open(url, '_blank', 'noopener,noreferrer');
+  });
+  bCopy.addEventListener('click', async () => {
+    const url = appLinkUrl(findApp(id()));
+    if (!url) return;
     try {
       await navigator.clipboard.writeText(url);
       toast('已复制 ' + url);
@@ -474,15 +480,36 @@ function updateAppCard(card, app) {
   /* 运行中展示并打开实际监听端口；停止时才展示配置端口。 */
   const effPorts = displayedPorts(app);
   const effPort = preferredOpenPort(app);
-  r.copy.hidden = !effPort;
+  const pageUrl = appLinkUrl(app);
+  const pageOpenable = appIsOpenable(app);
+  r.copy.hidden = !pageUrl;
+  r.open.hidden = !pageOpenable;
   if (effPort) {
     r.stPort.hidden = false;
-    setText(r.stPort, portMismatch
+    const portText = portMismatch
       ? ':' + effPort + (effPorts.length > 1 ? ' +' + (effPorts.length - 1) : '') +
         ' ≠ :' + configuredPort(app)
-      : ':' + effPort + (effPorts.length > 1 ? ' +' + (effPorts.length - 1) : ''));
+      : ':' + effPort + (effPorts.length > 1 ? ' +' + (effPorts.length - 1) : '');
     const openable = portIsOpenable(app);
     const diagnostic = !!app.portConflict || !!app.portOccupied;
+    const portSig = [portText, openable && !diagnostic, diagnostic].join('|');
+    if (r.stPort._sig !== portSig) {
+      r.stPort._sig = portSig;
+      const text = document.createTextNode(portText);
+      if (openable && !diagnostic) {
+        const arrow = icon('arrow-up-right', 11);
+        arrow.classList.add('st-port-icon');
+        const label = el('span', 'st-port-act');
+        label.textContent = '打开';
+        setChildren(r.stPort, text, arrow, label);
+      } else if (diagnostic) {
+        const label = el('span', 'st-port-act');
+        label.textContent = '诊断';
+        setChildren(r.stPort, text, label);
+      } else {
+        setChildren(r.stPort, text);
+      }
+    }
     r.stPort.classList.toggle('clickable', openable && !diagnostic);
     r.stPort.classList.toggle('diagnostic', diagnostic);
     if (app.portConflict) {
@@ -507,6 +534,7 @@ function updateAppCard(card, app) {
         : (app.name || '应用') + ' 的端口 ' + effPort);
   } else {
     r.stPort.hidden = true;
+    r.stPort._sig = '';
     r.stPort.removeAttribute('aria-label');
   }
   if (app.running) {
@@ -532,6 +560,9 @@ function updateAppCard(card, app) {
         : app.running ? (isTask ? '中止' : '停止')
           : (isTask ? '运行' : '启动');
   r.primary.setAttribute('aria-label', primaryVerb + ' ' + appName);
+  r.open.setAttribute('aria-label', '打开 ' + appName + ' 的页面');
+  r.open.title = pageOpenable ? '打开 ' + pageUrl : '打开页面';
+  r.copy.title = '复制 ' + pageUrl;
   r.copy.setAttribute('aria-label', '复制 ' + appName + ' 的链接');
   r.logs.setAttribute('aria-label', (taskFailed ? '查看失败日志：' : '查看日志：') + appName);
   r.diag.setAttribute('aria-label',

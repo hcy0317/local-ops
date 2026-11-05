@@ -994,6 +994,31 @@ def migrate_config(raw):
     return migrated, source_version
 
 
+def validate_open_url(value):
+    """Validate a browser-only link; never fetch it or infer process ownership."""
+    if value is None:
+        return None, None
+    error = "打开网址必须是完整的 http:// 或 https:// 地址，且不能包含账号密码"
+    if not isinstance(value, str):
+        return None, error
+    value = value.strip()
+    if not value:
+        return None, None
+    if len(value) > 4096 or re.search(r"[\s\\]", value):
+        return None, error
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        if (parsed.scheme.lower() not in ("http", "https")
+                or not re.match(r"(?i)^https?://", value)
+                or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or parsed.port == 0):
+            return None, error
+    except ValueError:
+        return None, error
+    return value, None
+
+
 class Config:
     """配置读写：显式 schema 迁移 + 原子写 + 上一份良好备份。"""
 
@@ -1006,7 +1031,8 @@ class Config:
                    "scheduledTaskPath": None,
                    "dockerResource": None,
                    "elevated": False,
-                   "port": None, "emoji": None, "glyph": None, "icon": None,
+                   "port": None, "openUrl": None,
+                   "emoji": None, "glyph": None, "icon": None,
                    "favicon": None, "kind": "service", "lastPid": None,
                    "lastPgid": None, "runToken": None,
                    "attached": False, "lastExit": None,
@@ -1049,6 +1075,7 @@ class Config:
             for key in app:
                 if key in item:
                     app[key] = item[key]
+            app["openUrl"], _ = validate_open_url(app.get("openUrl"))
             invalid_external_resource = False
             try:
                 app["runtimeIdentity"] = normalize_runtime_identity(
@@ -2374,7 +2401,7 @@ def scheduled_task_app_row(app, task):
         "emoji": app.get("emoji"),
         "glyph": app.get("glyph"),
         "icon": app.get("icon"),
-        "favicon": app.get("favicon"),
+        "favicon": app.get("favicon"), "openUrl": app.get("openUrl"),
         "running": running,
         "pid": engine_pids[0] if engine_pids else None,
         "uptimeSec": uptime,
@@ -2500,7 +2527,7 @@ def elevated_task_app_row(app, broker_status, result=None):
         "platformCompatibility": {"status": "ready", "reasons": []},
         "cwd": app.get("cwd"), "port": None,
         "emoji": app.get("emoji"), "glyph": app.get("glyph"),
-        "icon": app.get("icon"), "favicon": app.get("favicon"),
+        "icon": app.get("icon"), "favicon": app.get("favicon"), "openUrl": app.get("openUrl"),
         "running": running,
         "pid": result.process_id if running else None,
         "uptimeSec": uptime,
@@ -2623,7 +2650,7 @@ def elevated_program_app_row(app, broker_status, program_processes=None):
         "platformCompatibility": {"status": "ready", "reasons": []},
         "cwd": app.get("cwd"), "port": None,
         "emoji": app.get("emoji"), "glyph": app.get("glyph"),
-        "icon": app.get("icon"), "favicon": app.get("favicon"),
+        "icon": app.get("icon"), "favicon": app.get("favicon"), "openUrl": app.get("openUrl"),
         "running": running,
         "pid": representative[0] if representative else None,
         "uptimeSec": (
@@ -2824,7 +2851,7 @@ def docker_app_row(app, snapshot):
         "cwd": resource.get("workingDir") if kind == "compose" else None,
         "port": None,
         "emoji": app.get("emoji"), "glyph": app.get("glyph"),
-        "icon": app.get("icon"), "favicon": app.get("favicon"),
+        "icon": app.get("icon"), "favicon": app.get("favicon"), "openUrl": app.get("openUrl"),
         "running": running, "pid": None, "uptimeSec": None,
         "kind": "service", "attached": False,
         "lastExit": app.get("lastExit"),
@@ -3020,7 +3047,7 @@ def build_apps(
             "platformCompatibility": compatibility,
             "cwd": app.get("cwd"), "port": port,
             "emoji": app.get("emoji"), "glyph": app.get("glyph"), "icon": app.get("icon"),
-            "favicon": app.get("favicon"),
+            "favicon": app.get("favicon"), "openUrl": app.get("openUrl"),
             "running": (
                 runtime_state["running"]
                 if runtime_state is not None else bool(live)
@@ -6108,6 +6135,10 @@ def validate_app_fields(data, partial):
         fields["cwd"] = (v or "").strip() or None if isinstance(v, str) else None
     elif not partial:
         fields["cwd"] = None
+    if "openUrl" in data or not partial:
+        fields["openUrl"], err = validate_open_url(data.get("openUrl"))
+        if err:
+            return None, err
     if "port" in data:
         port, err = validate_port(data["port"])
         if err:
@@ -7449,7 +7480,8 @@ class Handler(BaseHTTPRequestHandler):
                    ) else "needs_review" if fields["elevated"] else
                    command_import_status(fields["commandSpec"], fields["cwd"])
                ),
-               "port": fields["port"], "emoji": fields["emoji"],
+               "port": fields["port"], "openUrl": fields["openUrl"],
+               "emoji": fields["emoji"],
                "glyph": fields["glyph"], "kind": fields["kind"],
                "icon": None, "favicon": None, "lastPid": None,
                "lastPgid": None, "runToken": None,
